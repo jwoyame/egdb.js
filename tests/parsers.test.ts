@@ -1,0 +1,187 @@
+/**
+ * Unit tests for parsers (no database required)
+ */
+
+import { describe, it, expect } from 'vitest';
+import { parseWkb } from '../src/parsers/geometry-parser.js';
+import { parseDefinitionXml, parseGdbItems } from '../src/parsers/gdb-items-parser.js';
+
+describe('WKB Parser', () => {
+  describe('parseWkb', () => {
+    it('should parse a Point', () => {
+      // WKB for POINT(1 2) - little endian
+      const wkb = Buffer.from([
+        0x01, // Little endian
+        0x01, 0x00, 0x00, 0x00, // Type: Point (1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f, // X: 1.0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, // Y: 2.0
+      ]);
+
+      const geom = parseWkb(wkb, 4326);
+
+      expect(geom).not.toBeNull();
+      expect(geom!.type).toBe('Point');
+      expect(geom!.coordinates).toEqual([1, 2]);
+      expect(geom!.srid).toBe(4326);
+    });
+
+    it('should parse a LineString', () => {
+      // WKB for LINESTRING(0 0, 1 1, 2 2)
+      const wkb = Buffer.from([
+        0x01, // Little endian
+        0x02, 0x00, 0x00, 0x00, // Type: LineString (2)
+        0x03, 0x00, 0x00, 0x00, // 3 points
+        // Point 1: (0, 0)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // Point 2: (1, 1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f,
+        // Point 3: (2, 2)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+      ]);
+
+      const geom = parseWkb(wkb);
+
+      expect(geom).not.toBeNull();
+      expect(geom!.type).toBe('LineString');
+      expect(geom!.coordinates).toHaveLength(3);
+      expect(geom!.coordinates).toEqual([
+        [0, 0],
+        [1, 1],
+        [2, 2],
+      ]);
+    });
+
+    it('should return null for empty buffer', () => {
+      expect(parseWkb(Buffer.alloc(0))).toBeNull();
+    });
+
+    it('should return null for buffer too small', () => {
+      expect(parseWkb(Buffer.from([0x01, 0x01]))).toBeNull();
+    });
+  });
+});
+
+describe('GDB Items Parser', () => {
+  describe('parseDefinitionXml', () => {
+    it('should extract ShapeType as geometryType', () => {
+      const xml = `
+        <DEFeatureClassInfo>
+          <ShapeType>esriGeometryPolygon</ShapeType>
+        </DEFeatureClassInfo>
+      `;
+
+      const result = parseDefinitionXml(xml);
+
+      expect(result.geometryType).toBe('Polygon');
+    });
+
+    it('should parse GPFieldInfoEx format', () => {
+      const xml = `
+        <GPFieldInfoExs>
+          <GPFieldInfoEx>
+            <Name>OBJECTID</Name>
+            <AliasName>Object ID</AliasName>
+            <FieldType>esriFieldTypeOID</FieldType>
+            <IsNullable>false</IsNullable>
+          </GPFieldInfoEx>
+          <GPFieldInfoEx>
+            <Name>Name</Name>
+            <AliasName>Name</AliasName>
+            <FieldType>esriFieldTypeString</FieldType>
+            <IsNullable>true</IsNullable>
+          </GPFieldInfoEx>
+        </GPFieldInfoExs>
+      `;
+
+      const result = parseDefinitionXml(xml);
+
+      expect(result.fields).toHaveLength(2);
+      expect(result.fields[0]!.name).toBe('OBJECTID');
+      expect(result.fields[0]!.type).toBe(6); // OID
+      expect(result.fields[1]!.name).toBe('Name');
+      expect(result.fields[1]!.type).toBe(4); // STRING
+    });
+
+    it('should map ESRI geometry types correctly', () => {
+      const testCases = [
+        { esri: 'esriGeometryPoint', expected: 'Point' },
+        { esri: 'esriGeometryMultipoint', expected: 'MultiPoint' },
+        { esri: 'esriGeometryPolyline', expected: 'LineString' },
+        { esri: 'esriGeometryPolygon', expected: 'Polygon' },
+      ];
+
+      for (const { esri, expected } of testCases) {
+        const xml = `<ShapeType>${esri}</ShapeType>`;
+        const result = parseDefinitionXml(xml);
+        expect(result.geometryType).toBe(expected);
+      }
+    });
+  });
+
+  describe('parseGdbItems', () => {
+    it('should parse feature class rows', () => {
+      const rows = [
+        {
+          ObjectID: 1,
+          UUID: 'abc-123',
+          Type: 'CA1C6E90-7896-4692-AA21-F8BB7063C4AD', // Feature Class
+          Name: 'Parcels',
+          PhysicalName: 'mydb.dbo.Parcels',
+          Path: '\\Parcels',
+          DatasetSubtype1: 4, // Polygon
+          DatasetInfo1: 'Shape',
+        },
+      ];
+
+      const tables = parseGdbItems(rows);
+
+      expect(tables).toHaveLength(1);
+      expect(tables[0]!.name).toBe('Parcels');
+      expect(tables[0]!.schema).toBe('dbo');
+      expect(tables[0]!.isFeatureClass).toBe(true);
+      expect(tables[0]!.geometryType).toBe('Polygon');
+      expect(tables[0]!.shapeFieldName).toBe('Shape');
+    });
+
+    it('should parse table rows (non-feature class)', () => {
+      const rows = [
+        {
+          ObjectID: 2,
+          UUID: 'def-456',
+          Type: '77C1E6B3-9EB4-4A1D-B686-E1CADD1E3ADA', // Table
+          Name: 'Owners',
+          PhysicalName: 'mydb.dbo.Owners',
+          Path: '\\Owners',
+        },
+      ];
+
+      const tables = parseGdbItems(rows);
+
+      expect(tables).toHaveLength(1);
+      expect(tables[0]!.name).toBe('Owners');
+      expect(tables[0]!.isFeatureClass).toBe(false);
+      expect(tables[0]!.geometryType).toBeUndefined();
+    });
+
+    it('should extract schema from physical name', () => {
+      const rows = [
+        {
+          ObjectID: 1,
+          UUID: 'abc',
+          Type: '77C1E6B3-9EB4-4A1D-B686-E1CADD1E3ADA',
+          Name: 'Test',
+          PhysicalName: 'database.custom_schema.MyTable',
+          Path: '\\Test',
+        },
+      ];
+
+      const tables = parseGdbItems(rows);
+
+      expect(tables[0]!.schema).toBe('custom_schema');
+      expect(tables[0]!.name).toBe('MyTable');
+    });
+  });
+});
