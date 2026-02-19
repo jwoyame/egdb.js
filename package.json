@@ -1,0 +1,53 @@
+{
+  "name": "@etchgis/egdb.js",
+  "version": "0.1.0",
+  "description": "Read and write Enterprise Geodatabases (SQL Server, PostgreSQL) in Node.js",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "sideEffects": false,
+  "repository": "https://github.com/etchgis/egdb.js.git",
+  "author": "Etch Ltd <team@etchgis.com>",
+  "scripts": {
+    "build": "rollup -c",
+    "build:watch": "rollup -c -w",
+    "dev": "ts-node src/index.ts",
+    "lint": "prettier --check \"src/**/*.ts\"",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:integration": "EGDB_TEST=1 vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "mssql": "^12.2.0",
+    "pg": "^8.18.0"
+  },
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.0",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@types/geojson": "^7946.0.16",
+    "@types/mssql": "^9.1.8",
+    "@types/node": "^22.13.10",
+    "@types/pg": "^8.16.0",
+    "prettier": "^3.8.1",
+    "rollup": "^4.57.1",
+    "ts-node": "^10.9.2",
+    "tslib": "^2.8.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.0.0"
+  }
+}
