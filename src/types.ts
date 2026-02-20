@@ -3,9 +3,15 @@
  *
  * These types are structurally compatible with gdb.js types.
  * TypeScript's structural typing means they work interchangeably.
+ *
+ * Both libraries use the same enum values and interface shapes,
+ * allowing seamless data exchange between file and enterprise geodatabases.
  */
 
-/** Field types (matches gdb.js GDBFieldType enum values) */
+/**
+ * Field types (matches gdb.js GDBFieldType enum values)
+ * @see GDBFieldType alias for gdb.js compatibility
+ */
 export enum FieldType {
   SMALLINTEGER = 0,
   INTEGER = 1,
@@ -140,11 +146,35 @@ export interface VersionInfo {
   modifiedTime?: Date;
 }
 
-/** Query options */
+/**
+ * Query options for filtering and paginating results
+ *
+ * @warning The `where` clause is NOT parameterized and is vulnerable to SQL injection
+ * if user input is included directly. Only use with trusted/sanitized input or
+ * for internal queries. Future versions will add parameterized query support.
+ */
 export interface QueryOptions {
+  /**
+   * SQL WHERE clause (without the WHERE keyword).
+   * WARNING: Not parameterized - do not include untrusted user input directly.
+   * @example "Status = 'Active' AND Area > 1000"
+   */
   where?: string;
+  /** Fields to include in output (default: all fields) */
   outFields?: string[];
+  /**
+   * ORDER BY clause. Required when using `limit` with SQL Server,
+   * otherwise defaults to OBJECTID.
+   */
   orderBy?: string;
+  /** Maximum number of features to return */
   limit?: number;
+  /** Number of features to skip (for pagination) */
   offset?: number;
 }
+
+/**
+ * Alias for gdb.js compatibility
+ * @see FieldType
+ */
+export { FieldType as GDBFieldType };

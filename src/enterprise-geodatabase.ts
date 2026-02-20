@@ -79,11 +79,16 @@ export class EnterpriseGeodatabase {
    */
   private async verifyGeodatabase(): Promise<void> {
     try {
+      // PostgreSQL uses lowercase column names
+      const sql = this.config.driver === 'sqlserver'
+        ? 'SELECT MAJOR, MINOR, BUGFIX FROM sde.SDE_version'
+        : 'SELECT major as "MAJOR", minor as "MINOR", bugfix as "BUGFIX" FROM sde.sde_version';
+
       const rows = await this.connection.query<{
         MAJOR: number;
         MINOR: number;
         BUGFIX: number;
-      }>('SELECT MAJOR, MINOR, BUGFIX FROM sde.SDE_version');
+      }>(sql);
 
       if (rows.length > 0) {
         const row = rows[0]!;
@@ -103,23 +108,41 @@ export class EnterpriseGeodatabase {
   async listTables(): Promise<TableInfo[]> {
     if (this._tables) return this._tables;
 
-    const sql = `
-      SELECT
-        i.ObjectID,
-        i.UUID,
-        t.Name as TypeName,
-        i.Name,
-        i.PhysicalName,
-        i.Path,
-        i.DatasetSubtype1,
-        i.DatasetSubtype2,
-        i.DatasetInfo1,
-        i.DatasetInfo2
-      FROM sde.GDB_ITEMS i
-      JOIN sde.GDB_ITEMTYPES t ON i.Type = t.UUID
-      WHERE t.Name IN ('Table', 'Feature Class')
-      ORDER BY i.Name
-    `;
+    const sql = this.config.driver === 'sqlserver'
+      ? `
+        SELECT
+          i.ObjectID,
+          i.UUID,
+          t.Name as TypeName,
+          i.Name,
+          i.PhysicalName,
+          i.Path,
+          i.DatasetSubtype1,
+          i.DatasetSubtype2,
+          i.DatasetInfo1,
+          i.DatasetInfo2
+        FROM sde.GDB_ITEMS i
+        JOIN sde.GDB_ITEMTYPES t ON i.Type = t.UUID
+        WHERE t.Name IN ('Table', 'Feature Class')
+        ORDER BY i.Name
+      `
+      : `
+        SELECT
+          i.objectid as "ObjectID",
+          i.uuid as "UUID",
+          t.name as "TypeName",
+          i.name as "Name",
+          i.physicalname as "PhysicalName",
+          i.path as "Path",
+          i.datasetsubtype1 as "DatasetSubtype1",
+          i.datasetsubtype2 as "DatasetSubtype2",
+          i.datasetinfo1 as "DatasetInfo1",
+          i.datasetinfo2 as "DatasetInfo2"
+        FROM sde.gdb_items i
+        JOIN sde.gdb_itemtypes t ON i.type = t.uuid
+        WHERE t.name IN ('Table', 'Feature Class')
+        ORDER BY i.name
+      `;
 
     const rows = await this.connection.query<GdbItemRow & { TypeName: string }>(sql);
 
@@ -158,17 +181,29 @@ export class EnterpriseGeodatabase {
    * List geodatabase versions
    */
   async listVersions(): Promise<VersionInfo[]> {
-    const sql = `
-      SELECT
-        name,
-        owner,
-        description,
-        parent_name,
-        creation_time,
-        modified_time
-      FROM sde.SDE_versions
-      ORDER BY name
-    `;
+    const sql = this.config.driver === 'sqlserver'
+      ? `
+        SELECT
+          name,
+          owner,
+          description,
+          parent_name,
+          creation_time,
+          modified_time
+        FROM sde.SDE_versions
+        ORDER BY name
+      `
+      : `
+        SELECT
+          name,
+          owner,
+          description,
+          parent_name,
+          creation_time,
+          modified_time
+        FROM sde.sde_versions
+        ORDER BY name
+      `;
 
     try {
       const rows = await this.connection.query<{

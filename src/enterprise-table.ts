@@ -52,15 +52,27 @@ export class EnterpriseTable {
   }
 
   /**
+   * Quote identifier based on database driver
+   */
+  private quoteId(name: string): string {
+    return this.connection.driver === 'sqlserver' ? `[${name}]` : `"${name}"`;
+  }
+
+  /**
+   * Get fully qualified table name
+   */
+  private get qualifiedTableName(): string {
+    return `${this.quoteId(this.tableInfo.schema)}.${this.quoteId(this.tableInfo.name)}`;
+  }
+
+  /**
    * Load table metadata from GDB_ITEMS Definition XML
    */
   private async loadMetadata(): Promise<void> {
     // Get Definition XML from GDB_ITEMS
-    const sql = `
-      SELECT Definition, DatasetSubtype1
-      FROM sde.GDB_ITEMS
-      WHERE PhysicalName = @p0
-    `;
+    const sql = this.connection.driver === 'sqlserver'
+      ? `SELECT Definition, DatasetSubtype1 FROM sde.GDB_ITEMS WHERE PhysicalName = @p0`
+      : `SELECT "definition" as "Definition", "datasetsubtype1" as "DatasetSubtype1" FROM sde.gdb_items WHERE "physicalname" = $1`;
 
     const rows = await this.connection.query<{
       Definition: string;
@@ -85,7 +97,7 @@ export class EnterpriseTable {
     }
 
     // Get feature count
-    const countSql = `SELECT COUNT(*) as cnt FROM [${this.tableInfo.schema}].[${this.tableInfo.name}]`;
+    const countSql = `SELECT COUNT(*) as cnt FROM ${this.qualifiedTableName}`;
     const countResult = await this.connection.query<{ cnt: number }>(countSql);
     const featureCount = countResult[0]?.cnt ?? 0;
 
@@ -105,18 +117,31 @@ export class EnterpriseTable {
    * Get fields from INFORMATION_SCHEMA (fallback)
    */
   private async getFieldsFromSchema(): Promise<FieldDefinition[]> {
-    const sql = `
-      SELECT
-        COLUMN_NAME,
-        DATA_TYPE,
-        CHARACTER_MAXIMUM_LENGTH,
-        NUMERIC_PRECISION,
-        NUMERIC_SCALE,
-        IS_NULLABLE
-      FROM INFORMATION_SCHEMA.COLUMNS
-      WHERE TABLE_SCHEMA = @p0 AND TABLE_NAME = @p1
-      ORDER BY ORDINAL_POSITION
-    `;
+    const sql = this.connection.driver === 'sqlserver'
+      ? `
+        SELECT
+          COLUMN_NAME,
+          DATA_TYPE,
+          CHARACTER_MAXIMUM_LENGTH,
+          NUMERIC_PRECISION,
+          NUMERIC_SCALE,
+          IS_NULLABLE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = @p0 AND TABLE_NAME = @p1
+        ORDER BY ORDINAL_POSITION
+      `
+      : `
+        SELECT
+          column_name as "COLUMN_NAME",
+          data_type as "DATA_TYPE",
+          character_maximum_length as "CHARACTER_MAXIMUM_LENGTH",
+          numeric_precision as "NUMERIC_PRECISION",
+          numeric_scale as "NUMERIC_SCALE",
+          is_nullable as "IS_NULLABLE"
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2
+        ORDER BY ordinal_position
+      `;
 
     const rows = await this.connection.query<{
       COLUMN_NAME: string;
@@ -179,7 +204,7 @@ export class EnterpriseTable {
     if (!shapeField) {
       // No geometry - select all or specified fields
       if (outFields && outFields.length > 0) {
-        return outFields.map((f) => `[${f}]`).join(', ');
+        return outFields.map((f) => this.quoteId(f)).join(', ');
       }
       return '*';
     }
@@ -198,12 +223,12 @@ export class EnterpriseTable {
     if (outFields && outFields.length > 0) {
       columns = outFields
         .filter(isValidColumn)
-        .map((f) => `[${f}]`)
+        .map((f) => this.quoteId(f))
         .join(', ');
     } else if (this._metadata?.fields && this._metadata.fields.length > 0) {
       columns = this._metadata.fields
         .filter((f) => isValidColumn(f.name))
-        .map((f) => `[${f.name}]`)
+        .map((f) => this.quoteId(f.name))
         .join(', ');
     } else {
       // Fallback to * if no field info available
@@ -211,20 +236,17 @@ export class EnterpriseTable {
     }
 
     // Add geometry as WKB
+    const qShape = this.quoteId(shapeField);
+    const qWkb = this.quoteId(`${shapeField}_WKB`);
+    const qSrid = this.quoteId(`${shapeField}_SRID`);
+
     const geomColumns = driver === 'sqlserver'
-      ? `[${shapeField}].STAsBinary() as [${shapeField}_WKB], [${shapeField}].STSrid as [${shapeField}_SRID]`
-      : `ST_AsBinary("${shapeField}") as "${shapeField}_WKB", ST_SRID("${shapeField}") as "${shapeField}_SRID"`;
+      ? `${qShape}.STAsBinary() as ${qWkb}, ${qShape}.STSrid as ${qSrid}`
+      : `ST_AsBinary(${qShape}) as ${qWkb}, ST_SRID(${qShape}) as ${qSrid}`;
 
     // Handle case where columns is * (can't combine with explicit geometry columns easily)
     if (columns === '*') {
-      // Select all non-geometry columns by excluding the shape field
-      if (driver === 'sqlserver') {
-        // For SQL Server, we need to list columns explicitly when adding geometry functions
-        // For now, just select everything and add geometry columns
-        return `*, [${shapeField}].STAsBinary() as [${shapeField}_WKB], [${shapeField}].STSrid as [${shapeField}_SRID]`;
-      } else {
-        return `*, ST_AsBinary("${shapeField}") as "${shapeField}_WKB", ST_SRID("${shapeField}") as "${shapeField}_SRID"`;
-      }
+      return `*, ${geomColumns}`;
     }
 
     return `${columns}, ${geomColumns}`;
@@ -236,8 +258,9 @@ export class EnterpriseTable {
   async *stream(options?: QueryOptions): AsyncIterable<Feature> {
     const selectFields = this.buildSelectClause(options?.outFields);
     const shapeField = this.tableInfo.shapeFieldName;
+    const driver = this.connection.driver;
 
-    let sql = `SELECT ${selectFields} FROM [${this.tableInfo.schema}].[${this.tableInfo.name}]`;
+    let sql = `SELECT ${selectFields} FROM ${this.qualifiedTableName}`;
 
     if (options?.where) {
       // WARNING: This is vulnerable to SQL injection!
@@ -250,7 +273,20 @@ export class EnterpriseTable {
     }
 
     if (options?.limit) {
-      sql += ` OFFSET ${options.offset ?? 0} ROWS FETCH NEXT ${options.limit} ROWS ONLY`;
+      if (driver === 'sqlserver') {
+        // SQL Server requires ORDER BY for OFFSET/FETCH syntax
+        // If no orderBy specified, default to OBJECTID for deterministic results
+        if (!options?.orderBy) {
+          sql += ' ORDER BY OBJECTID';
+        }
+        sql += ` OFFSET ${options.offset ?? 0} ROWS FETCH NEXT ${options.limit} ROWS ONLY`;
+      } else {
+        // PostgreSQL uses LIMIT/OFFSET (ORDER BY optional but recommended)
+        sql += ` LIMIT ${options.limit}`;
+        if (options.offset) {
+          sql += ` OFFSET ${options.offset}`;
+        }
+      }
     }
 
     for await (const row of this.connection.stream(sql)) {
@@ -264,8 +300,10 @@ export class EnterpriseTable {
   async getFeature(id: number): Promise<Feature | null> {
     const selectFields = this.buildSelectClause();
     const shapeField = this.tableInfo.shapeFieldName;
+    const driver = this.connection.driver;
 
-    const sql = `SELECT ${selectFields} FROM [${this.tableInfo.schema}].[${this.tableInfo.name}] WHERE OBJECTID = @p0`;
+    const param = driver === 'sqlserver' ? '@p0' : '$1';
+    const sql = `SELECT ${selectFields} FROM ${this.qualifiedTableName} WHERE ${this.quoteId('OBJECTID')} = ${param}`;
 
     const rows = await this.connection.query(sql, [id]);
 
@@ -282,10 +320,11 @@ export class EnterpriseTable {
 
     const selectFields = this.buildSelectClause();
     const shapeField = this.tableInfo.shapeFieldName;
+    const driver = this.connection.driver;
 
     // Build parameterized query
-    const params = ids.map((_, i) => `@p${i}`).join(', ');
-    const sql = `SELECT ${selectFields} FROM [${this.tableInfo.schema}].[${this.tableInfo.name}] WHERE OBJECTID IN (${params})`;
+    const params = ids.map((_, i) => driver === 'sqlserver' ? `@p${i}` : `$${i + 1}`).join(', ');
+    const sql = `SELECT ${selectFields} FROM ${this.qualifiedTableName} WHERE ${this.quoteId('OBJECTID')} IN (${params})`;
 
     const rows = await this.connection.query(sql, ids);
 
@@ -296,7 +335,7 @@ export class EnterpriseTable {
    * Count features (optionally with WHERE clause)
    */
   async count(where?: string): Promise<number> {
-    let sql = `SELECT COUNT(*) as cnt FROM [${this.tableInfo.schema}].[${this.tableInfo.name}]`;
+    let sql = `SELECT COUNT(*) as cnt FROM ${this.qualifiedTableName}`;
 
     if (where) {
       sql += ` WHERE ${where}`;

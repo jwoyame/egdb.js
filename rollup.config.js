@@ -16,7 +16,7 @@ export default {
       sourcemap: true,
     },
   ],
-  external: ['mssql', 'pg'],
+  external: ['mssql', 'pg', '@etchgis/gdb.js'],
   plugins: [
     resolve(),
     commonjs(),

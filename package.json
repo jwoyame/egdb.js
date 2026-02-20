@@ -19,6 +19,8 @@
   "sideEffects": false,
   "repository": "https://github.com/etchgis/egdb.js.git",
   "author": "Etch Ltd <team@etchgis.com>",
+  "license": "UNLICENSED",
+  "private": true,
   "scripts": {
     "build": "rollup -c",
     "build:watch": "rollup -c -w",
@@ -33,6 +35,14 @@
   "dependencies": {
     "mssql": "^12.2.0",
     "pg": "^8.18.0"
+  },
+  "peerDependencies": {
+    "@etchgis/gdb.js": ">=0.2.0"
+  },
+  "peerDependenciesMeta": {
+    "@etchgis/gdb.js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@rollup/plugin-commonjs": "^29.0.0",

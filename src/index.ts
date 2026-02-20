@@ -34,3 +34,15 @@ export type { GdbItemRow } from './parsers/gdb-items-parser';
 
 // Connection interface (for custom implementations)
 export type { IDatabaseConnection } from './connections/connection';
+
+// Unified geodatabase access (works with both gdb.js and egdb.js)
+export {
+  openGeodatabase,
+  isFileGeodatabase,
+  parseConnectionString,
+} from './unified';
+export type {
+  UnifiedGeodatabaseConfig,
+  ITable,
+  IGeodatabase,
+} from './unified';
