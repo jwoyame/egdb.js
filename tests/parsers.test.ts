@@ -5,6 +5,8 @@
 import { describe, it, expect } from 'vitest';
 import { parseWkb } from '../src/parsers/geometry-parser.js';
 import { parseDefinitionXml, parseGdbItems } from '../src/parsers/gdb-items-parser.js';
+import { geometryToWkt, isValidGeometry, geometryToSqlExpression } from '../src/parsers/geometry-writer.js';
+import type { Geometry } from '../src/types.js';
 
 describe('WKB Parser', () => {
   describe('parseWkb', () => {
@@ -182,6 +184,123 @@ describe('GDB Items Parser', () => {
 
       expect(tables[0]!.schema).toBe('custom_schema');
       expect(tables[0]!.name).toBe('MyTable');
+    });
+  });
+});
+
+describe('Geometry Writer', () => {
+  describe('geometryToWkt', () => {
+    it('should convert a Point to WKT', () => {
+      const geom: Geometry = { type: 'Point', coordinates: [1, 2], srid: 4326 };
+      expect(geometryToWkt(geom)).toBe('POINT (1 2)');
+    });
+
+    it('should convert a MultiPoint to WKT', () => {
+      const geom: Geometry = { type: 'MultiPoint', coordinates: [[0, 0], [1, 1]], srid: 4326 };
+      expect(geometryToWkt(geom)).toBe('MULTIPOINT ((0 0), (1 1))');
+    });
+
+    it('should convert a LineString to WKT', () => {
+      const geom: Geometry = { type: 'LineString', coordinates: [[0, 0], [1, 1], [2, 0]], srid: 4326 };
+      expect(geometryToWkt(geom)).toBe('LINESTRING (0 0, 1 1, 2 0)');
+    });
+
+    it('should convert a MultiLineString to WKT', () => {
+      const geom: Geometry = {
+        type: 'MultiLineString',
+        coordinates: [[[0, 0], [1, 1]], [[2, 2], [3, 3]]],
+        srid: 4326
+      };
+      expect(geometryToWkt(geom)).toBe('MULTILINESTRING ((0 0, 1 1), (2 2, 3 3))');
+    });
+
+    it('should convert a Polygon to WKT', () => {
+      const geom: Geometry = {
+        type: 'Polygon',
+        coordinates: [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+        srid: 4326
+      };
+      expect(geometryToWkt(geom)).toBe('POLYGON ((0 0, 1 0, 1 1, 0 1, 0 0))');
+    });
+
+    it('should convert a Polygon with hole to WKT', () => {
+      const geom: Geometry = {
+        type: 'Polygon',
+        coordinates: [
+          [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]],
+          [[2, 2], [8, 2], [8, 8], [2, 8], [2, 2]]
+        ],
+        srid: 4326
+      };
+      expect(geometryToWkt(geom)).toBe('POLYGON ((0 0, 10 0, 10 10, 0 10, 0 0), (2 2, 8 2, 8 8, 2 8, 2 2))');
+    });
+
+    it('should convert a MultiPolygon to WKT', () => {
+      const geom: Geometry = {
+        type: 'MultiPolygon',
+        coordinates: [
+          [[[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]],
+          [[[2, 2], [3, 2], [3, 3], [2, 3], [2, 2]]]
+        ],
+        srid: 4326
+      };
+      expect(geometryToWkt(geom)).toBe('MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))');
+    });
+  });
+
+  describe('geometryToSqlExpression', () => {
+    it('should create SQL Server expression', () => {
+      const geom: Geometry = { type: 'Point', coordinates: [1, 2], srid: 2236 };
+      const sql = geometryToSqlExpression(geom, 'sqlserver');
+      expect(sql).toBe("geometry::STGeomFromText('POINT (1 2)', 2236)");
+    });
+
+    it('should create PostgreSQL expression', () => {
+      const geom: Geometry = { type: 'Point', coordinates: [1, 2], srid: 4326 };
+      const sql = geometryToSqlExpression(geom, 'postgresql');
+      expect(sql).toBe("ST_GeomFromText('POINT (1 2)', 4326)");
+    });
+
+    it('should use provided SRID over geometry SRID', () => {
+      const geom: Geometry = { type: 'Point', coordinates: [1, 2], srid: 4326 };
+      const sql = geometryToSqlExpression(geom, 'sqlserver', 2236);
+      expect(sql).toBe("geometry::STGeomFromText('POINT (1 2)', 2236)");
+    });
+  });
+
+  describe('isValidGeometry', () => {
+    it('should validate a Point', () => {
+      expect(isValidGeometry({ type: 'Point', coordinates: [1, 2] })).toBe(true);
+      expect(isValidGeometry({ type: 'Point', coordinates: [1] } as Geometry)).toBe(false);
+      expect(isValidGeometry({ type: 'Point', coordinates: ['a', 'b'] } as unknown as Geometry)).toBe(false);
+    });
+
+    it('should validate a LineString', () => {
+      expect(isValidGeometry({ type: 'LineString', coordinates: [[0, 0], [1, 1]] })).toBe(true);
+      expect(isValidGeometry({ type: 'LineString', coordinates: [[0, 0]] })).toBe(false); // min 2 points
+    });
+
+    it('should validate a Polygon', () => {
+      expect(isValidGeometry({
+        type: 'Polygon',
+        coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] // 4 points (closed ring)
+      })).toBe(true);
+
+      expect(isValidGeometry({
+        type: 'Polygon',
+        coordinates: [[[0, 0], [1, 0], [1, 1]]] // 3 points (not a valid ring)
+      })).toBe(false);
+    });
+
+    it('should reject invalid geometry', () => {
+      expect(isValidGeometry(null as unknown as Geometry)).toBe(false);
+      expect(isValidGeometry({} as Geometry)).toBe(false);
+      expect(isValidGeometry({ type: 'Point' } as Geometry)).toBe(false);
+    });
+
+    it('should validate Infinity coordinates as invalid', () => {
+      expect(isValidGeometry({ type: 'Point', coordinates: [Infinity, 0] })).toBe(false);
+      expect(isValidGeometry({ type: 'Point', coordinates: [0, NaN] })).toBe(false);
     });
   });
 });

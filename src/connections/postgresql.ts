@@ -1,14 +1,15 @@
 /**
  * PostgreSQL connection implementation
  */
-import { Pool, PoolConfig } from 'pg';
-import type { IDatabaseConnection } from './connection';
+import { Pool, PoolClient, PoolConfig } from 'pg';
+import type { IDatabaseConnection, ExecuteResult } from './connection';
 import type { PostgreSQLConfig } from '../types';
 
 export class PostgreSQLConnection implements IDatabaseConnection {
   private pool: Pool | null = null;
   private config: PoolConfig;
   private _isConnected = false;
+  private transactionClient: PoolClient | null = null;
 
   readonly driver = 'postgresql' as const;
 
@@ -44,7 +45,8 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     // Convert @p0, @p1 parameter syntax to $1, $2 for PostgreSQL
     const pgQuery = sqlQuery.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
 
-    const result = await this.pool.query(pgQuery, params);
+    const client = this.transactionClient ?? this.pool;
+    const result = await client.query(pgQuery, params);
     return result.rows as T[];
   }
 
@@ -103,5 +105,86 @@ export class PostgreSQLConnection implements IDatabaseConnection {
       this.pool = null;
       this._isConnected = false;
     }
+  }
+
+  /**
+   * Execute a statement (INSERT/UPDATE/DELETE) without returning rows
+   */
+  async execute(sqlStatement: string, params?: unknown[]): Promise<ExecuteResult> {
+    if (!this.pool) throw new Error('Not connected');
+
+    // Convert @p0, @p1 parameter syntax to $1, $2 for PostgreSQL
+    const pgQuery = sqlStatement.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
+
+    const client = this.transactionClient ?? this.pool;
+    const result = await client.query(pgQuery, params);
+
+    return {
+      rowsAffected: result.rowCount ?? 0,
+    };
+  }
+
+  /**
+   * Execute an INSERT statement and return the inserted ID(s)
+   * The SQL should include RETURNING objectid (or similar)
+   */
+  async executeInsert(sqlStatement: string, params?: unknown[]): Promise<number[]> {
+    if (!this.pool) throw new Error('Not connected');
+
+    // Convert parameter syntax
+    const pgQuery = sqlStatement.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
+
+    const client = this.transactionClient ?? this.pool;
+    const result = await client.query(pgQuery, params);
+
+    // Extract objectid from rows (RETURNING objectid)
+    if (result.rows && result.rows.length > 0) {
+      return result.rows.map((row: Record<string, unknown>) => {
+        const id = row.objectid ?? row.OBJECTID ?? row.id ?? row.ID;
+        return typeof id === 'number' ? id : parseInt(String(id), 10);
+      });
+    }
+
+    return [];
+  }
+
+  /**
+   * Begin a transaction
+   */
+  async beginTransaction(): Promise<void> {
+    if (!this.pool) throw new Error('Not connected');
+    if (this.transactionClient) throw new Error('Transaction already in progress');
+
+    this.transactionClient = await this.pool.connect();
+    await this.transactionClient.query('BEGIN');
+  }
+
+  /**
+   * Commit the current transaction
+   */
+  async commitTransaction(): Promise<void> {
+    if (!this.transactionClient) throw new Error('No transaction in progress');
+
+    await this.transactionClient.query('COMMIT');
+    this.transactionClient.release();
+    this.transactionClient = null;
+  }
+
+  /**
+   * Rollback the current transaction
+   */
+  async rollbackTransaction(): Promise<void> {
+    if (!this.transactionClient) throw new Error('No transaction in progress');
+
+    await this.transactionClient.query('ROLLBACK');
+    this.transactionClient.release();
+    this.transactionClient = null;
+  }
+
+  /**
+   * Check if currently in a transaction
+   */
+  inTransaction(): boolean {
+    return this.transactionClient !== null;
   }
 }

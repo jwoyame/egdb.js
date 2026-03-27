@@ -8,9 +8,37 @@ import type { IDatabaseConnection } from './connections/connection';
 import { SqlServerConnection } from './connections/sqlserver';
 import { PostgreSQLConnection } from './connections/postgresql';
 import { EnterpriseTable } from './enterprise-table';
+import { EditSession } from './edit-session';
 import { parseGdbItems } from './parsers/gdb-items-parser';
 import type { GdbItemRow } from './parsers/gdb-items-parser';
-import type { ConnectionConfig, TableInfo, VersionInfo } from './types';
+import type {
+  ConnectionConfig,
+  TableInfo,
+  VersionInfo,
+  ReconcileOptions,
+  ReconcileResult,
+  PostOptions,
+  PostResult,
+  CompressOptions,
+  CompressResult,
+} from './types';
+import {
+  findCommonAncestor,
+  getStatesInRange,
+  addStatesToLineage,
+  getAllChanges,
+  detectDetailedConflicts,
+  getConflictsSummary,
+  applyParentChanges,
+  isReconciled,
+  postChangesToParent,
+  updateVersionState,
+  deleteStates,
+  getChildUniqueStates,
+  compressStates,
+  removeOrphanedStates,
+  getVersionStats,
+} from './reconcile';
 
 export class EnterpriseGeodatabase {
   private connection: IDatabaseConnection;
@@ -108,6 +136,9 @@ export class EnterpriseGeodatabase {
   async listTables(): Promise<TableInfo[]> {
     if (this._tables) return this._tables;
 
+    // PhysicalName format: DATABASE.SCHEMA.TABLE (e.g., PARCEL_FABRIC.PA.PARCELFABRIC_PARCELS)
+    // SDE_table_registry uses: SCHEMA.TABLE (e.g., PA.PARCELFABRIC_PARCELS)
+    // We extract SCHEMA.TABLE from PhysicalName by removing the first segment (database name)
     const sql = this.config.driver === 'sqlserver'
       ? `
         SELECT
@@ -120,9 +151,14 @@ export class EnterpriseGeodatabase {
           i.DatasetSubtype1,
           i.DatasetSubtype2,
           i.DatasetInfo1,
-          i.DatasetInfo2
+          i.DatasetInfo2,
+          r.registration_id as RegistrationId,
+          CASE WHEN r.object_flags & 8 = 8 THEN 1 ELSE 0 END as IsVersioned
         FROM sde.GDB_ITEMS i
         JOIN sde.GDB_ITEMTYPES t ON i.Type = t.UUID
+        LEFT JOIN sde.SDE_table_registry r ON
+          UPPER(r.owner + '.' + r.table_name) =
+          UPPER(SUBSTRING(i.PhysicalName, CHARINDEX('.', i.PhysicalName) + 1, LEN(i.PhysicalName)))
         WHERE t.Name IN ('Table', 'Feature Class')
         ORDER BY i.Name
       `
@@ -137,16 +173,21 @@ export class EnterpriseGeodatabase {
           i.datasetsubtype1 as "DatasetSubtype1",
           i.datasetsubtype2 as "DatasetSubtype2",
           i.datasetinfo1 as "DatasetInfo1",
-          i.datasetinfo2 as "DatasetInfo2"
+          i.datasetinfo2 as "DatasetInfo2",
+          r.registration_id as "RegistrationId",
+          CASE WHEN r.object_flags & 8 = 8 THEN 1 ELSE 0 END as "IsVersioned"
         FROM sde.gdb_items i
         JOIN sde.gdb_itemtypes t ON i.type = t.uuid
+        LEFT JOIN sde.sde_table_registry r ON
+          UPPER(r.owner || '.' || r.table_name) =
+          UPPER(SUBSTRING(i.physicalname FROM POSITION('.' IN i.physicalname) + 1))
         WHERE t.name IN ('Table', 'Feature Class')
         ORDER BY i.name
       `;
 
-    const rows = await this.connection.query<GdbItemRow & { TypeName: string }>(sql);
+    const rows = await this.connection.query<GdbItemRow & { TypeName: string; RegistrationId?: number; IsVersioned?: number }>(sql);
 
-    // Convert TypeName to Type UUID for parser
+    // Convert TypeName to Type UUID for parser and include versioning info
     const itemRows: GdbItemRow[] = rows.map((row) => ({
       ...row,
       Type:
@@ -155,7 +196,15 @@ export class EnterpriseGeodatabase {
           : '77C1E6B3-9EB4-4A1D-B686-E1CADD1E3ADA',
     }));
 
-    this._tables = parseGdbItems(itemRows);
+    const tables = parseGdbItems(itemRows);
+
+    // Add registration ID and versioning info
+    this._tables = tables.map((table, i) => ({
+      ...table,
+      registrationId: rows[i]?.RegistrationId,
+      isVersioned: rows[i]?.IsVersioned === 1,
+    }));
+
     return this._tables;
   }
 
@@ -174,7 +223,22 @@ export class EnterpriseGeodatabase {
       throw new Error(`Table not found: ${name}`);
     }
 
-    return EnterpriseTable.open(this.connection, tableInfo);
+    // Check for enterprise versioned view if table is versioned
+    if (tableInfo.isVersioned && !tableInfo.evwViewName) {
+      tableInfo.evwViewName = await this.getEvwViewName(tableInfo.name) ?? undefined;
+    }
+
+    // Pass state lineage getter for versioned queries
+    const getStateLineage = tableInfo.isVersioned
+      ? (version: string) => this.getVersionStateLineage(version)
+      : undefined;
+
+    // Pass version setter for evw view queries
+    const setVersion = tableInfo.evwViewName
+      ? (version: string) => this.setCurrentVersion(version)
+      : undefined;
+
+    return EnterpriseTable.open(this.connection, tableInfo, getStateLineage, setVersion);
   }
 
   /**
@@ -189,7 +253,7 @@ export class EnterpriseGeodatabase {
           description,
           parent_name,
           creation_time,
-          modified_time
+          state_id
         FROM sde.SDE_versions
         ORDER BY name
       `
@@ -200,7 +264,7 @@ export class EnterpriseGeodatabase {
           description,
           parent_name,
           creation_time,
-          modified_time
+          state_id
         FROM sde.sde_versions
         ORDER BY name
       `;
@@ -212,7 +276,7 @@ export class EnterpriseGeodatabase {
         description?: string;
         parent_name?: string;
         creation_time?: Date;
-        modified_time?: Date;
+        state_id?: number;
       }>(sql);
 
       return rows.map((row) => ({
@@ -221,11 +285,821 @@ export class EnterpriseGeodatabase {
         description: row.description,
         parentName: row.parent_name,
         createTime: row.creation_time,
-        modifiedTime: row.modified_time,
+        stateId: row.state_id,
       }));
     } catch {
       // Not all geodatabases have versioning enabled
       return [];
+    }
+  }
+
+  /**
+   * Get version info by name
+   * @param versionName Version name in format "owner.name" or just "name"
+   */
+  async getVersion(versionName: string): Promise<VersionInfo | null> {
+    const versions = await this.listVersions();
+
+    // Parse version name (can be "owner.name" or just "name")
+    let owner: string;
+    let name: string;
+
+    const dotIndex = versionName.indexOf('.');
+    if (dotIndex !== -1) {
+      owner = versionName.substring(0, dotIndex);
+      name = versionName.substring(dotIndex + 1);
+    } else {
+      // Default to sde owner for unqualified names
+      owner = 'sde';
+      name = versionName;
+    }
+
+    return versions.find(
+      v => v.owner.toLowerCase() === owner.toLowerCase() &&
+           v.name.toLowerCase() === name.toLowerCase()
+    ) || null;
+  }
+
+  /**
+   * Get state lineage for a version (all state IDs that are ancestors of this version's state)
+   * Used internally for versioned queries.
+   * @param versionName Version name in format "owner.name" or just "name"
+   * @returns Array of state IDs in the lineage, or null if version not found
+   */
+  async getVersionStateLineage(versionName: string): Promise<number[] | null> {
+    const version = await this.getVersion(versionName);
+    if (!version?.stateId) return null;
+
+    const sql = this.config.driver === 'sqlserver'
+      ? `
+        SELECT DISTINCT sl.lineage_id
+        FROM sde.SDE_state_lineages sl
+        JOIN sde.SDE_states s ON s.state_id = @p0
+        WHERE sl.lineage_name = s.lineage_name
+          AND sl.lineage_id <= @p0
+        ORDER BY sl.lineage_id
+      `
+      : `
+        SELECT DISTINCT sl.lineage_id
+        FROM sde.sde_state_lineages sl
+        JOIN sde.sde_states s ON s.state_id = $1
+        WHERE sl.lineage_name = s.lineage_name
+          AND sl.lineage_id <= $1
+        ORDER BY sl.lineage_id
+      `;
+
+    const rows = await this.connection.query<{ lineage_id: number }>(sql, [version.stateId]);
+    return rows.map(r => r.lineage_id);
+  }
+
+  /**
+   * Set the current version context for the database session.
+   * This affects queries on enterprise versioned views (*_evw).
+   *
+   * @param versionName Version name (e.g., "sde.DEFAULT" or just "DEFAULT")
+   */
+  async setCurrentVersion(versionName: string): Promise<void> {
+    // Parse version name
+    let fullName = versionName;
+    if (!versionName.includes('.')) {
+      fullName = `sde.${versionName}`;
+    }
+
+    const sql = this.config.driver === 'sqlserver'
+      ? `EXEC sde.set_current_version @p0`
+      : `SELECT sde.set_current_version($1)`;
+
+    await this.connection.query(sql, [fullName]);
+  }
+
+  /**
+   * Get the current view state ID for the session.
+   * This is the state ID that versioned views will use.
+   */
+  async getCurrentViewState(): Promise<number | null> {
+    const sql = this.config.driver === 'sqlserver'
+      ? `SELECT sde.SDE_get_view_state() as state_id`
+      : `SELECT sde.sde_get_view_state() as state_id`;
+
+    try {
+      const rows = await this.connection.query<{ state_id: number }>(sql);
+      return rows[0]?.state_id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Check if an enterprise versioned view (*_evw) exists for a table.
+   *
+   * @param tableName Table name
+   * @returns The evw view name if it exists, null otherwise
+   */
+  async getEvwViewName(tableName: string): Promise<string | null> {
+    const evwName = `${tableName}_evw`;
+
+    const sql = this.config.driver === 'sqlserver'
+      ? `SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_NAME = @p0`
+      : `SELECT table_schema, table_name FROM information_schema.views WHERE table_name = $1`;
+
+    const rows = await this.connection.query<Record<string, string>>(
+      sql,
+      [evwName]
+    );
+
+    if (rows.length > 0) {
+      const row = rows[0]!;
+      // Handle both SQL Server (uppercase) and PostgreSQL (lowercase) column names
+      const schema = row.TABLE_SCHEMA ?? row.table_schema;
+      const name = row.TABLE_NAME ?? row.table_name;
+      return `${schema}.${name}`;
+    }
+
+    return null;
+  }
+
+  // ============================================================
+  // VERSION MANAGEMENT
+  // ============================================================
+
+  /**
+   * Version access levels
+   */
+  static readonly VersionAccess = {
+    /** Anyone can read and write */
+    PUBLIC: 0,
+    /** Anyone can read, only owner can write */
+    PROTECTED: 1,
+    /** Only owner can read and write */
+    PRIVATE: 2,
+  } as const;
+
+  /**
+   * Version naming rules
+   */
+  static readonly VersionNameRule = {
+    /** Use the exact name provided */
+    EXACT: 1,
+    /** Make name unique by appending a number if needed */
+    UNIQUE: 2,
+  } as const;
+
+  /**
+   * Create a new geodatabase version.
+   *
+   * @param name Version name (will be prefixed with current user)
+   * @param options Creation options
+   * @returns The created version info
+   *
+   * @example
+   * ```typescript
+   * const version = await egdb.createVersion('my_edits', {
+   *   parent: 'sde.DEFAULT',
+   *   access: EnterpriseGeodatabase.VersionAccess.PRIVATE,
+   *   description: 'My editing session'
+   * });
+   * ```
+   */
+  async createVersion(
+    name: string,
+    options?: {
+      /** Parent version (default: 'sde.DEFAULT') */
+      parent?: string;
+      /** Access level (default: PRIVATE) */
+      access?: 0 | 1 | 2;
+      /** Version description */
+      description?: string;
+      /** Naming rule (default: EXACT) */
+      nameRule?: 1 | 2;
+    }
+  ): Promise<VersionInfo> {
+    const parent = options?.parent ?? 'sde.DEFAULT';
+    const access = options?.access ?? EnterpriseGeodatabase.VersionAccess.PRIVATE;
+    const description = options?.description ?? '';
+    const nameRule = options?.nameRule ?? EnterpriseGeodatabase.VersionNameRule.EXACT;
+
+    if (this.config.driver === 'sqlserver') {
+      // SQL Server uses stored procedure with INOUT parameter for name
+      // The procedure may modify the name if nameRule is UNIQUE
+      await this.connection.query(
+        `EXEC sde.create_version @p0, @p1, @p2, @p3, @p4`,
+        [parent, name, nameRule, access, description]
+      );
+    } else {
+      // PostgreSQL
+      await this.connection.query(
+        `SELECT sde.create_version($1, $2, $3, $4, $5)`,
+        [parent, name, nameRule, access, description]
+      );
+    }
+
+    // Fetch the created version info
+    // The version owner will be the current database user (which may differ from login user)
+    // We need to search by name across all owners
+    const versions = await this.listVersions();
+    const createdVersion = versions.find(
+      v => v.name.toLowerCase() === name.toLowerCase()
+    );
+
+    if (!createdVersion) {
+      throw new Error(`Version created but not found: ${name}`);
+    }
+    return createdVersion;
+  }
+
+  /**
+   * Delete a geodatabase version.
+   *
+   * The version must have no child versions and must not be the DEFAULT version.
+   *
+   * @param versionName Version name (e.g., "user.version_name")
+   */
+  async deleteVersion(versionName: string): Promise<void> {
+    // Ensure full name format
+    let fullName = versionName;
+    if (!versionName.includes('.')) {
+      fullName = `${this.config.user}.${versionName}`;
+    }
+
+    if (this.config.driver === 'sqlserver') {
+      await this.connection.query(`EXEC sde.delete_version @p0`, [fullName]);
+    } else {
+      await this.connection.query(`SELECT sde.delete_version($1)`, [fullName]);
+    }
+  }
+
+  /**
+   * Start an editing session on a version.
+   *
+   * This locks the version for editing and creates a new state for changes.
+   * You must call stopEditing() when done.
+   *
+   * @param versionName Version name to edit
+   */
+  async startEditing(versionName: string): Promise<void> {
+    let fullName = versionName;
+    if (!versionName.includes('.')) {
+      fullName = `sde.${versionName}`;
+    }
+
+    if (this.config.driver === 'sqlserver') {
+      // edit_action: 1 = start editing
+      await this.connection.query(`EXEC sde.edit_version @p0, 1`, [fullName]);
+    } else {
+      await this.connection.query(`SELECT sde.edit_version($1, 1)`, [fullName]);
+    }
+  }
+
+  /**
+   * Stop an editing session on a version.
+   *
+   * The edit_version procedure only supports: 1 = start, 2 = end.
+   * To discard changes, rollback the transaction before calling this method.
+   *
+   * @param versionName Version name being edited
+   * @param _saveChanges Unused - discard requires transaction rollback before this call
+   */
+  async stopEditing(versionName: string, _saveChanges: boolean = true): Promise<void> {
+    let fullName = versionName;
+    if (!versionName.includes('.')) {
+      fullName = `sde.${versionName}`;
+    }
+
+    if (this.config.driver === 'sqlserver') {
+      // edit_action: 1 = start editing, 2 = end editing
+      await this.connection.query(`EXEC sde.edit_version @p0, @p1`, [fullName, 2]);
+    } else {
+      await this.connection.query(`SELECT sde.edit_version($1, 2)`, [fullName]);
+    }
+  }
+
+  /**
+   * Reconcile a version with its parent.
+   *
+   * This brings changes from the parent version into this version.
+   * Conflicts may occur if the same features were edited in both versions.
+   *
+   * @param versionName Version to reconcile
+   * @param options Reconcile options
+   * @returns Reconcile result with conflict information
+   *
+   * @example
+   * ```typescript
+   * // Basic reconcile with default settings (favor_edit)
+   * const result = await egdb.reconcileVersion('myuser.edit_version');
+   *
+   * // Reconcile with auto-merge enabled
+   * const result = await egdb.reconcileVersion('myuser.edit_version', {
+   *   autoMerge: true,
+   *   conflictResolution: 'favor_edit'
+   * });
+   *
+   * // Detect conflicts only without applying
+   * const result = await egdb.reconcileVersion('myuser.edit_version', {
+   *   detectOnly: true
+   * });
+   *
+   * // With custom conflict resolver
+   * const result = await egdb.reconcileVersion('myuser.edit_version', {
+   *   resolveConflict: async (conflict) => {
+   *     console.log(`Conflict on ${conflict.table} OID ${conflict.objectId}`);
+   *     return 'favor_edit'; // or 'favor_target' or 'merge'
+   *   }
+   * });
+   * ```
+   */
+  async reconcileVersion(
+    versionName: string,
+    options?: ReconcileOptions
+  ): Promise<ReconcileResult> {
+    const opts: ReconcileOptions = {
+      conflictResolution: 'favor_edit',
+      abortOnConflict: false,
+      detectOnly: false,
+      autoMerge: true,
+      ...options,
+    };
+
+    // Get version info
+    const version = await this.getVersion(versionName);
+    if (!version) {
+      throw new Error(`Version not found: ${versionName}`);
+    }
+    if (!version.stateId) {
+      throw new Error(`Version ${versionName} has no state ID`);
+    }
+
+    if (!version.parentName) {
+      throw new Error(`Version ${versionName} has no parent to reconcile with`);
+    }
+
+    // Get parent version info
+    const parentFullName = version.parentName.includes('.')
+      ? version.parentName
+      : `sde.${version.parentName}`;
+    const parent = await this.getVersion(parentFullName);
+    if (!parent) {
+      throw new Error(`Parent version not found: ${parentFullName}`);
+    }
+    if (!parent.stateId) {
+      throw new Error(`Parent version ${parentFullName} has no state ID`);
+    }
+
+    // 1. Find common ancestor state
+    const commonAncestor = await findCommonAncestor(
+      this.connection,
+      version.stateId,
+      parent.stateId
+    );
+
+    // 2. Get states in range for both versions
+    const childStates = await getStatesInRange(
+      this.connection,
+      version.stateId,
+      commonAncestor
+    );
+    const parentStates = await getStatesInRange(
+      this.connection,
+      parent.stateId,
+      commonAncestor
+    );
+
+    // Exclude the common ancestor from both lists
+    const childOnlyStates = childStates.filter(s => s > commonAncestor);
+    const parentOnlyStates = parentStates.filter(s => s > commonAncestor);
+
+    // 3. Get all tables
+    const tables = await this.listTables();
+    const versionedTables = tables.filter(t => t.isVersioned);
+
+    // 4. Get changes from both versions
+    const childChanges = await getAllChanges(this.connection, versionedTables, childOnlyStates);
+    const parentChanges = await getAllChanges(this.connection, versionedTables, parentOnlyStates);
+
+    // 5. Detect conflicts
+    const conflicts = await detectDetailedConflicts(
+      this.connection,
+      versionedTables,
+      childChanges,
+      parentChanges
+    );
+
+    const summary = getConflictsSummary(conflicts);
+
+    // Check if we should abort
+    if (opts.abortOnConflict && summary.totalConflicts > 0) {
+      return {
+        hasConflicts: true,
+        conflictCount: summary.totalConflicts,
+        conflicts,
+        applied: false,
+        commonAncestorStateId: commonAncestor,
+        parentChangesApplied: 0,
+        mergedCount: 0,
+      };
+    }
+
+    // If detectOnly, return without applying
+    if (opts.detectOnly) {
+      return {
+        hasConflicts: summary.totalConflicts > 0,
+        conflictCount: summary.totalConflicts,
+        conflicts,
+        applied: false,
+        commonAncestorStateId: commonAncestor,
+        parentChangesApplied: 0,
+        mergedCount: 0,
+      };
+    }
+
+    // 6. Apply parent changes to child version
+    const { appliedCount, mergedCount } = await applyParentChanges(
+      this.connection,
+      versionedTables,
+      parentChanges,
+      conflicts,
+      version.stateId,
+      opts
+    );
+
+    // 7. Update child's lineage to include parent's states
+    // This marks the reconcile as complete
+    const childLineageName = version.stateId; // Lineage name equals current state_id
+    await addStatesToLineage(this.connection, childLineageName, parentOnlyStates);
+
+    return {
+      hasConflicts: summary.totalConflicts > 0,
+      conflictCount: summary.totalConflicts,
+      conflicts,
+      applied: true,
+      commonAncestorStateId: commonAncestor,
+      parentChangesApplied: appliedCount,
+      mergedCount,
+    };
+  }
+
+  /**
+   * Post changes from a version to its parent.
+   *
+   * This pushes all changes from the child version into the parent.
+   * The version must be reconciled first (child's lineage must include parent's current state).
+   *
+   * @param versionName Version to post
+   * @param options Post options
+   * @returns Post result
+   *
+   * @example
+   * ```typescript
+   * // Reconcile first, then post
+   * await egdb.reconcileVersion('myuser.edit_version');
+   * const result = await egdb.postVersion('myuser.edit_version');
+   * console.log(`Posted ${result.changesPosted} changes`);
+   *
+   * // Post and delete the version after
+   * await egdb.postVersion('myuser.edit_version', {
+   *   deleteVersionAfterPost: true
+   * });
+   * ```
+   */
+  async postVersion(
+    versionName: string,
+    options?: PostOptions
+  ): Promise<PostResult> {
+    const version = await this.getVersion(versionName);
+    if (!version) {
+      throw new Error(`Version not found: ${versionName}`);
+    }
+    if (!version.stateId) {
+      throw new Error(`Version ${versionName} has no state ID`);
+    }
+
+    if (!version.parentName) {
+      throw new Error(`Cannot post DEFAULT version - it has no parent`);
+    }
+
+    // Get parent version info
+    const parentFullName = version.parentName.includes('.')
+      ? version.parentName
+      : `sde.${version.parentName}`;
+    const parent = await this.getVersion(parentFullName);
+    if (!parent) {
+      throw new Error(`Parent version not found: ${parentFullName}`);
+    }
+    if (!parent.stateId) {
+      throw new Error(`Parent version ${parentFullName} has no state ID`);
+    }
+
+    // Verify the version has been reconciled
+    const reconciled = await isReconciled(
+      this.connection,
+      version.stateId,
+      parent.stateId
+    );
+    if (!reconciled) {
+      throw new Error(
+        `Version ${versionName} has not been reconciled with ${parentFullName}. ` +
+        `Call reconcileVersion() first.`
+      );
+    }
+
+    // Get child's unique states (states not in parent's lineage)
+    const childUniqueStates = await getChildUniqueStates(
+      this.connection,
+      version.stateId,
+      parent.stateId
+    );
+
+    // Get all versioned tables
+    const tables = await this.listTables();
+    const versionedTables = tables.filter(t => t.isVersioned);
+
+    // Post changes within a transaction
+    await this.connection.beginTransaction();
+    try {
+      // Move A/D entries from child states to parent state
+      const changesPosted = await postChangesToParent(
+        this.connection,
+        versionedTables,
+        childUniqueStates,
+        parent.stateId
+      );
+
+      // Update child version to point to parent's state
+      // (After posting, child and parent are identical)
+      await updateVersionState(
+        this.connection,
+        version.owner,
+        version.name,
+        parent.stateId
+      );
+
+      // Clean up child's unique states
+      await deleteStates(this.connection, childUniqueStates);
+
+      await this.connection.commitTransaction();
+
+      // Optionally delete the version
+      if (options?.deleteVersionAfterPost) {
+        await this.deleteVersion(versionName);
+      }
+
+      return {
+        changesPosted,
+        newParentStateId: parent.stateId,
+      };
+    } catch (error) {
+      await this.connection.rollbackTransaction();
+      throw error;
+    }
+  }
+
+  /**
+   * Compress a specific version's states to reduce A/D table bloat.
+   *
+   * This removes redundant entries:
+   * - Insert + Delete pairs for the same OBJECTID (net effect: nothing)
+   * - Multiple updates to the same OBJECTID (keeps only latest)
+   *
+   * @param versionName Version to compress
+   * @param options Compression options
+   * @returns Compression result
+   *
+   * @example
+   * ```typescript
+   * const result = await egdb.compressVersion('myuser.edit_version');
+   * console.log(`Removed ${result.addsRemoved} adds, ${result.deletesRemoved} deletes`);
+   * ```
+   */
+  async compressVersion(
+    versionName: string,
+    options?: CompressOptions
+  ): Promise<CompressResult> {
+    const version = await this.getVersion(versionName);
+    if (!version) {
+      throw new Error(`Version not found: ${versionName}`);
+    }
+    if (!version.stateId) {
+      throw new Error(`Version ${versionName} has no state ID`);
+    }
+
+    // Get version's state lineage
+    const stateLineage = await this.getVersionStateLineage(versionName);
+    if (!stateLineage || stateLineage.length === 0) {
+      return { addsRemoved: 0, deletesRemoved: 0, statesRemoved: 0 };
+    }
+
+    // Get tables to compress
+    const allTables = await this.listTables();
+    let tables = allTables.filter(t => t.isVersioned);
+
+    // Filter to specific tables if requested
+    if (options?.tables && options.tables.length > 0) {
+      const tableNames = new Set(options.tables.map(t => t.toLowerCase()));
+      tables = tables.filter(t => tableNames.has(t.name.toLowerCase()));
+    }
+
+    // Compress the states
+    const result = await compressStates(this.connection, tables, stateLineage);
+
+    // Optionally remove orphaned states
+    if (options?.removeOrphanedStates) {
+      result.statesRemoved = await removeOrphanedStates(this.connection);
+    }
+
+    return result;
+  }
+
+  /**
+   * Compress the entire geodatabase by removing orphaned states
+   * and redundant A/D entries across all versions.
+   *
+   * WARNING: This is a heavy operation and should be run during maintenance windows.
+   *
+   * @param options Compression options
+   * @returns Compression result
+   *
+   * @example
+   * ```typescript
+   * const result = await egdb.compress();
+   * console.log(`Removed ${result.statesRemoved} orphaned states`);
+   * ```
+   */
+  async compress(options?: CompressOptions): Promise<CompressResult> {
+    // Get all versioned tables
+    const allTables = await this.listTables();
+    let tables = allTables.filter(t => t.isVersioned);
+
+    // Filter to specific tables if requested
+    if (options?.tables && options.tables.length > 0) {
+      const tableNames = new Set(options.tables.map(t => t.toLowerCase()));
+      tables = tables.filter(t => tableNames.has(t.name.toLowerCase()));
+    }
+
+    // Get all versions to find all active states
+    const versions = await this.listVersions();
+    const activeStates = new Set<number>();
+    for (const v of versions) {
+      if (v.stateId) {
+        const lineage = await this.getVersionStateLineage(`${v.owner}.${v.name}`);
+        if (lineage) {
+          lineage.forEach(s => activeStates.add(s));
+        }
+      }
+    }
+
+    // Compress each version's states
+    let totalAddsRemoved = 0;
+    let totalDeletesRemoved = 0;
+
+    for (const v of versions) {
+      if (v.stateId) {
+        const lineage = await this.getVersionStateLineage(`${v.owner}.${v.name}`);
+        if (lineage && lineage.length > 0) {
+          const result = await compressStates(this.connection, tables, lineage);
+          totalAddsRemoved += result.addsRemoved;
+          totalDeletesRemoved += result.deletesRemoved;
+        }
+      }
+    }
+
+    // Remove orphaned states (states not referenced by any version)
+    const statesRemoved = options?.removeOrphanedStates !== false
+      ? await removeOrphanedStates(this.connection)
+      : 0;
+
+    return {
+      addsRemoved: totalAddsRemoved,
+      deletesRemoved: totalDeletesRemoved,
+      statesRemoved,
+    };
+  }
+
+  /**
+   * Get statistics about A/D table sizes for a version.
+   *
+   * @param versionName Version to analyze
+   * @returns Map of table name to add/delete counts
+   *
+   * @example
+   * ```typescript
+   * const stats = await egdb.getVersionStats('myuser.edit_version');
+   * for (const [table, counts] of stats) {
+   *   console.log(`${table}: ${counts.adds} adds, ${counts.deletes} deletes`);
+   * }
+   * ```
+   */
+  async getVersionStatistics(
+    versionName: string
+  ): Promise<Map<string, { adds: number; deletes: number }>> {
+    const version = await this.getVersion(versionName);
+    if (!version) {
+      throw new Error(`Version not found: ${versionName}`);
+    }
+
+    const stateLineage = await this.getVersionStateLineage(versionName);
+    if (!stateLineage || stateLineage.length === 0) {
+      return new Map();
+    }
+
+    const tables = await this.listTables();
+    const versionedTables = tables.filter(t => t.isVersioned);
+
+    return getVersionStats(this.connection, versionedTables, stateLineage);
+  }
+
+  // ============================================================
+  // TRANSACTION SUPPORT
+  // ============================================================
+
+  /**
+   * Check if currently in a transaction
+   */
+  inTransaction(): boolean {
+    return this.connection.inTransaction();
+  }
+
+  /**
+   * Execute operations within a database transaction.
+   * Auto-commits on success, rolls back on error.
+   *
+   * @example
+   * ```typescript
+   * await egdb.transaction(async () => {
+   *   const parcels = await egdb.openTable('PARCELS');
+   *   await parcels.insert({ attributes: { Name: 'Parcel 1' } });
+   *   await parcels.insert({ attributes: { Name: 'Parcel 2' } });
+   *   // Both inserts committed together, or both rolled back on error
+   * });
+   * ```
+   */
+  async transaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.connection.inTransaction()) {
+      // Already in a transaction, just execute the function
+      return fn();
+    }
+
+    await this.connection.beginTransaction();
+    try {
+      const result = await fn();
+      await this.connection.commitTransaction();
+      return result;
+    } catch (error) {
+      await this.connection.rollbackTransaction();
+      throw error;
+    }
+  }
+
+  /**
+   * Execute versioned edits within a database transaction.
+   * Starts an edit session, executes the provided function, saves and closes the session.
+   * Auto-commits on success, rolls back on error.
+   *
+   * @param versionName Version to edit (e.g., "sde.DEFAULT")
+   * @param fn Function that receives an EditSession and performs edits
+   *
+   * @example
+   * ```typescript
+   * await egdb.editTransaction('sde.DEFAULT', async (session) => {
+   *   await session.insert('PARCELS', { attributes: { Name: 'New' } });
+   *   await session.update('PARCELS', 123, { Status: 'Active' });
+   *   // All edits committed atomically, or rolled back on error
+   * });
+   * ```
+   */
+  async editTransaction<T>(
+    versionName: string,
+    fn: (session: EditSession) => Promise<T>
+  ): Promise<T> {
+    const alreadyInTransaction = this.connection.inTransaction();
+
+    if (!alreadyInTransaction) {
+      await this.connection.beginTransaction();
+    }
+
+    try {
+      // Create edit session (writes directly to A/D tables)
+      // Note: We don't call startEditing/stopEditing here because:
+      // 1. EditSession writes directly to A/D tables without needing sde.edit_version
+      // 2. sde.edit_version may interfere with our explicit transaction management
+      const session = await EditSession.start(this, versionName);
+
+      // Execute user code
+      const result = await fn(session);
+
+      // Save and close session
+      await session.save();
+      await session.close();
+
+      if (!alreadyInTransaction) {
+        await this.connection.commitTransaction();
+      }
+
+      return result;
+    } catch (error) {
+      if (!alreadyInTransaction) {
+        await this.connection.rollbackTransaction();
+      }
+      throw error;
     }
   }
 

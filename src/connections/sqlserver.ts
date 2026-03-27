@@ -2,12 +2,13 @@
  * SQL Server connection implementation
  */
 import sql from 'mssql';
-import type { IDatabaseConnection } from './connection';
+import type { IDatabaseConnection, ExecuteResult } from './connection';
 import type { SqlServerConfig } from '../types';
 
 export class SqlServerConnection implements IDatabaseConnection {
   private pool: sql.ConnectionPool | null = null;
   private config: sql.config;
+  private transaction: sql.Transaction | null = null;
 
   readonly driver = 'sqlserver' as const;
 
@@ -38,7 +39,9 @@ export class SqlServerConnection implements IDatabaseConnection {
   async query<T>(sqlQuery: string, params?: unknown[]): Promise<T[]> {
     if (!this.pool) throw new Error('Not connected');
 
-    const request = this.pool.request();
+    const request = this.transaction
+      ? this.transaction.request()
+      : this.pool.request();
 
     // Add parameters
     if (params) {
@@ -57,7 +60,9 @@ export class SqlServerConnection implements IDatabaseConnection {
   ): AsyncIterable<Record<string, unknown>> {
     if (!this.pool) throw new Error('Not connected');
 
-    const request = this.pool.request();
+    const request = this.transaction
+      ? this.transaction.request()
+      : this.pool.request();
     request.stream = true;
 
     if (params) {
@@ -139,5 +144,95 @@ export class SqlServerConnection implements IDatabaseConnection {
       await this.pool.close();
       this.pool = null;
     }
+  }
+
+  /**
+   * Execute a statement (INSERT/UPDATE/DELETE) without returning rows
+   */
+  async execute(sqlStatement: string, params?: unknown[]): Promise<ExecuteResult> {
+    if (!this.pool) throw new Error('Not connected');
+
+    const request = this.transaction
+      ? this.transaction.request()
+      : this.pool.request();
+
+    if (params) {
+      params.forEach((param, index) => {
+        request.input(`p${index}`, param);
+      });
+    }
+
+    const result = await request.query(sqlStatement);
+    return {
+      rowsAffected: result.rowsAffected.reduce((sum, n) => sum + n, 0),
+    };
+  }
+
+  /**
+   * Execute an INSERT statement and return the inserted ID(s)
+   * The SQL should include OUTPUT INSERTED.OBJECTID (or similar)
+   */
+  async executeInsert(sqlStatement: string, params?: unknown[]): Promise<number[]> {
+    if (!this.pool) throw new Error('Not connected');
+
+    const request = this.transaction
+      ? this.transaction.request()
+      : this.pool.request();
+
+    if (params) {
+      params.forEach((param, index) => {
+        request.input(`p${index}`, param);
+      });
+    }
+
+    const result = await request.query(sqlStatement);
+
+    // Extract OBJECTID from recordset (OUTPUT INSERTED.OBJECTID)
+    if (result.recordset && result.recordset.length > 0) {
+      return result.recordset.map((row: Record<string, unknown>) => {
+        const id = row.OBJECTID ?? row.objectid ?? row.id ?? row.ID;
+        return typeof id === 'number' ? id : parseInt(String(id), 10);
+      });
+    }
+
+    return [];
+  }
+
+  /**
+   * Begin a transaction
+   */
+  async beginTransaction(): Promise<void> {
+    if (!this.pool) throw new Error('Not connected');
+    if (this.transaction) throw new Error('Transaction already in progress');
+
+    this.transaction = new sql.Transaction(this.pool);
+    await this.transaction.begin();
+  }
+
+  /**
+   * Commit the current transaction
+   */
+  async commitTransaction(): Promise<void> {
+    if (!this.transaction) throw new Error('No transaction in progress');
+
+    await this.transaction.commit();
+    this.transaction = null;
+  }
+
+  /**
+   * Rollback the current transaction
+   */
+  async rollbackTransaction(): Promise<void> {
+    if (!this.transaction) throw new Error('No transaction in progress');
+
+    await this.transaction.rollback();
+    this.transaction = null;
+  }
+
+  /**
+   * Check if currently in a transaction
+   */
+  inTransaction(): boolean {
+    return this.transaction !== null;
   }
 }

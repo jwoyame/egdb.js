@@ -17,6 +17,7 @@ Thumbs.db
 # Environment
 .env
 .env.local
+.env.prod
 .env.*.local
 
 # Logs
@@ -39,3 +40,9 @@ coverage/
 !.yarn/sdks
 !.yarn/versions
 .pnp.*
+
+# Docker database exports (contains real data - keep local only)
+docker/sqlserver/backup/*.sql
+docker/sqlserver/backup/*.sql.gz
+docker/sqlserver/backup/*.bak
+docker/sqlserver/backup/*.log

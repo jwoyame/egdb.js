@@ -1,10 +1,11 @@
 /**
- * EnterpriseTable - Read features from an enterprise geodatabase table
+ * EnterpriseTable - Read and write features from an enterprise geodatabase table
  */
 
 import type { IDatabaseConnection } from './connections/connection';
 import { parseDefinitionXml } from './parsers/gdb-items-parser';
 import { parseWkb } from './parsers/geometry-parser';
+import { geometryToWkt, isValidGeometry } from './parsers/geometry-writer';
 import type {
   TableInfo,
   TableMetadata,
@@ -13,23 +14,58 @@ import type {
   Geometry,
   FieldType,
   QueryOptions,
+  SpatialQueryOptions,
+  SpatialQueryGeometry,
+  SpatialRelationship,
 } from './types';
+
+/** Options for insert operations */
+export interface InsertOptions {
+  /** SRID to use for geometry (defaults to table's spatial reference) */
+  srid?: number;
+}
+
+/** Options for update operations */
+export interface UpdateOptions {
+  /** SRID to use for geometry updates */
+  srid?: number;
+}
+
+/** Function type for getting version state lineage */
+type StateLineageGetter = (versionName: string) => Promise<number[] | null>;
+
+/** Function type for setting version context */
+type VersionSetter = (versionName: string) => Promise<void>;
 
 export class EnterpriseTable {
   private connection: IDatabaseConnection;
   private tableInfo: TableInfo;
   private _metadata: TableMetadata | null = null;
+  private getStateLineage?: StateLineageGetter;
+  private setVersionContext?: VersionSetter;
 
-  private constructor(connection: IDatabaseConnection, tableInfo: TableInfo) {
+  private constructor(
+    connection: IDatabaseConnection,
+    tableInfo: TableInfo,
+    getStateLineage?: StateLineageGetter,
+    setVersionContext?: VersionSetter
+  ) {
     this.connection = connection;
     this.tableInfo = tableInfo;
+    this.getStateLineage = getStateLineage;
+    this.setVersionContext = setVersionContext;
   }
 
   /**
    * Open a table for reading
    */
-  static async open(connection: IDatabaseConnection, tableInfo: TableInfo): Promise<EnterpriseTable> {
-    const table = new EnterpriseTable(connection, tableInfo);
+  static async open(
+    connection: IDatabaseConnection,
+    tableInfo: TableInfo,
+    getStateLineage?: StateLineageGetter,
+    setVersionContext?: VersionSetter
+  ): Promise<EnterpriseTable> {
+    const table = new EnterpriseTable(connection, tableInfo, getStateLineage, setVersionContext);
     await table.loadMetadata();
     return table;
   }
@@ -49,6 +85,20 @@ export class EnterpriseTable {
       throw new Error('Metadata not loaded');
     }
     return this._metadata;
+  }
+
+  /**
+   * Check if table is versioned
+   */
+  get isVersioned(): boolean {
+    return this.tableInfo.isVersioned ?? false;
+  }
+
+  /**
+   * Get registration ID (for versioned tables)
+   */
+  get registrationId(): number | undefined {
+    return this.tableInfo.registrationId;
   }
 
   /**
@@ -196,26 +246,22 @@ export class EnterpriseTable {
 
   /**
    * Build SELECT clause with geometry as WKB
+   * @param outFields Specific fields to include (optional)
+   * @param forVersionedQuery If true, always uses explicit column names (no *)
    */
-  private buildSelectClause(outFields?: string[]): string {
+  private buildSelectClause(outFields?: string[], forVersionedQuery = false): string {
     const shapeField = this.tableInfo.shapeFieldName;
     const driver = this.connection.driver;
 
-    if (!shapeField) {
-      // No geometry - select all or specified fields
-      if (outFields && outFields.length > 0) {
-        return outFields.map((f) => this.quoteId(f)).join(', ');
-      }
-      return '*';
-    }
-
     // Get non-geometry columns, filtering out computed/virtual columns
     const isValidColumn = (name: string) => {
-      // Exclude geometry field
-      if (name.toLowerCase() === shapeField.toLowerCase()) return false;
+      // Exclude geometry field (handled separately)
+      if (shapeField && name.toLowerCase() === shapeField.toLowerCase()) return false;
       // Exclude computed columns (contain parentheses or dots followed by function names)
       if (name.includes('(') || name.includes(')')) return false;
       if (/\.\w+\(/.test(name)) return false;
+      // Exclude SDE_STATE_ID - only present in A tables, not base tables
+      if (name.toLowerCase() === 'sde_state_id') return false;
       return true;
     };
 
@@ -230,9 +276,18 @@ export class EnterpriseTable {
         .filter((f) => isValidColumn(f.name))
         .map((f) => this.quoteId(f.name))
         .join(', ');
+    } else if (forVersionedQuery) {
+      // For versioned queries, we MUST have explicit columns
+      // This should not happen if metadata is loaded properly
+      throw new Error('Cannot build versioned query without field metadata');
     } else {
-      // Fallback to * if no field info available
+      // Fallback to * if no field info available (non-versioned only)
       columns = '*';
+    }
+
+    if (!shapeField) {
+      // No geometry - return just the columns
+      return columns;
     }
 
     // Add geometry as WKB
@@ -253,19 +308,272 @@ export class EnterpriseTable {
   }
 
   /**
+   * Build a query using the enterprise versioned view (*_evw).
+   * Assumes setVersionContext has already been called.
+   */
+  private buildEvwQuery(whereClause?: string, outFields?: string[]): string {
+    const evwViewName = this.tableInfo.evwViewName!;
+    const selectFields = this.buildSelectClause(outFields);
+
+    let sql = `SELECT ${selectFields} FROM ${evwViewName}`;
+
+    if (whereClause) {
+      sql += ` WHERE ${whereClause}`;
+    }
+
+    return sql;
+  }
+
+  /**
+   * Build a versioned query that combines base table with A/D delta tables
+   */
+  private buildVersionedQuery(
+    stateIds: number[],
+    whereClause?: string,
+    outFields?: string[]
+  ): string {
+    const regId = this.tableInfo.registrationId;
+    const schema = this.quoteId(this.tableInfo.schema);
+    const driver = this.connection.driver;
+
+    // Build SELECT clause with explicit columns (required for UNION)
+    const selectFields = this.buildSelectClause(outFields, true);
+
+    // A and D table names (e.g., a18, D18)
+    const addsTable = `${schema}.${this.quoteId(`a${regId}`)}`;
+    const deletesTable = `${schema}.${this.quoteId(`D${regId}`)}`;
+
+    // Build state ID list for IN clause
+    const stateIdList = stateIds.join(',');
+
+    // Base WHERE clause
+    const baseWhere = whereClause ? ` AND (${whereClause})` : '';
+
+    // Quote OBJECTID based on driver
+    const qObjectId = driver === 'sqlserver' ? '[OBJECTID]' : '"objectid"';
+
+    // Query: Base table rows not in deletes UNION adds rows
+    // Base table contains rows at state 0 (initial state)
+    const sql = `
+      SELECT ${selectFields}
+      FROM ${this.qualifiedTableName} b
+      WHERE b.${qObjectId} NOT IN (
+        SELECT SDE_DELETES_ROW_ID FROM ${deletesTable}
+        WHERE SDE_STATE_ID IN (${stateIdList})
+      )${baseWhere}
+      UNION ALL
+      SELECT ${selectFields}
+      FROM ${addsTable}
+      WHERE SDE_STATE_ID IN (${stateIdList})${baseWhere}
+    `;
+
+    return sql;
+  }
+
+  // ============================================================
+  // SPATIAL QUERY SUPPORT
+  // ============================================================
+
+  /**
+   * Convert a spatial query geometry to SQL expression
+   */
+  private geometryToSqlExpr(geom: SpatialQueryGeometry): string {
+    const driver = this.connection.driver;
+
+    // Handle WKT input
+    if ('wkt' in geom) {
+      const srid = geom.srid ?? 0;
+      return driver === 'sqlserver'
+        ? `geometry::STGeomFromText('${geom.wkt}', ${srid})`
+        : `ST_GeomFromText('${geom.wkt}', ${srid})`;
+    }
+
+    // Handle envelope (bounding box) input
+    if ('envelope' in geom) {
+      const [minX, minY, maxX, maxY] = geom.envelope;
+      const srid = geom.srid ?? 0;
+      const wkt = `POLYGON((${minX} ${minY}, ${maxX} ${minY}, ${maxX} ${maxY}, ${minX} ${maxY}, ${minX} ${minY}))`;
+      return driver === 'sqlserver'
+        ? `geometry::STGeomFromText('${wkt}', ${srid})`
+        : `ST_GeomFromText('${wkt}', ${srid})`;
+    }
+
+    // Handle WKB input
+    if ('wkb' in geom) {
+      const srid = geom.srid ?? 0;
+      const hex = geom.wkb.toString('hex');
+      return driver === 'sqlserver'
+        ? `geometry::STGeomFromWKB(0x${hex}, ${srid})`
+        : `ST_GeomFromWKB('\\x${hex}', ${srid})`;
+    }
+
+    // Handle GeoJSON geometry
+    const srid = geom.srid ?? 0;
+    const wkt = geometryToWkt(geom);
+    return driver === 'sqlserver'
+      ? `geometry::STGeomFromText('${wkt}', ${srid})`
+      : `ST_GeomFromText('${wkt}', ${srid})`;
+  }
+
+  /**
+   * Build SQL Server spatial WHERE clause
+   */
+  private buildSqlServerSpatialClause(
+    shapeField: string,
+    geomExpr: string,
+    relationship: SpatialRelationship,
+    distance?: number
+  ): string {
+    const qShape = this.quoteId(shapeField);
+
+    // Distance query
+    if (distance !== undefined) {
+      return `${qShape}.STDistance(${geomExpr}) <= ${distance}`;
+    }
+
+    // Spatial relationship methods
+    const methods: Record<SpatialRelationship, string> = {
+      intersects: 'STIntersects',
+      contains: 'STContains',
+      within: 'STWithin',
+      touches: 'STTouches',
+      overlaps: 'STOverlaps',
+      crosses: 'STCrosses',
+      disjoint: 'STDisjoint',
+    };
+
+    const method = methods[relationship];
+    return `${qShape}.${method}(${geomExpr}) = 1`;
+  }
+
+  /**
+   * Build PostgreSQL/PostGIS spatial WHERE clause
+   */
+  private buildPostgreSpatialClause(
+    shapeField: string,
+    geomExpr: string,
+    relationship: SpatialRelationship,
+    distance?: number
+  ): string {
+    const qShape = this.quoteId(shapeField);
+
+    // Distance query (uses ST_DWithin for efficiency)
+    if (distance !== undefined) {
+      return `ST_DWithin(${qShape}, ${geomExpr}, ${distance})`;
+    }
+
+    // Spatial relationship functions
+    const functions: Record<SpatialRelationship, string> = {
+      intersects: 'ST_Intersects',
+      contains: 'ST_Contains',
+      within: 'ST_Within',
+      touches: 'ST_Touches',
+      overlaps: 'ST_Overlaps',
+      crosses: 'ST_Crosses',
+      disjoint: 'ST_Disjoint',
+    };
+
+    const func = functions[relationship];
+    return `${func}(${qShape}, ${geomExpr})`;
+  }
+
+  /**
+   * Build spatial WHERE clause based on query options
+   */
+  private buildSpatialClause(options: SpatialQueryOptions): string | null {
+    if (!options.geometry) return null;
+
+    const shapeField = this.tableInfo.shapeFieldName;
+    if (!shapeField) {
+      throw new Error(`Cannot perform spatial query on table ${this.name}: no geometry field`);
+    }
+
+    const geomExpr = this.geometryToSqlExpr(options.geometry);
+    const relationship = options.spatialRelationship ?? 'intersects';
+    const distance = options.distance;
+
+    if (this.connection.driver === 'sqlserver') {
+      return this.buildSqlServerSpatialClause(shapeField, geomExpr, relationship, distance);
+    } else {
+      return this.buildPostgreSpatialClause(shapeField, geomExpr, relationship, distance);
+    }
+  }
+
+  /**
+   * Build distance SELECT expression for returnDistance option
+   */
+  private buildDistanceSelect(options: SpatialQueryOptions): string | null {
+    if (!options.returnDistance || !options.geometry) return null;
+
+    const shapeField = this.tableInfo.shapeFieldName;
+    if (!shapeField) return null;
+
+    const geomExpr = this.geometryToSqlExpr(options.geometry);
+    const qShape = this.quoteId(shapeField);
+
+    if (this.connection.driver === 'sqlserver') {
+      return `${qShape}.STDistance(${geomExpr}) as _distance`;
+    } else {
+      return `ST_Distance(${qShape}, ${geomExpr}) as _distance`;
+    }
+  }
+
+  /**
    * Stream all features from the table
    */
-  async *stream(options?: QueryOptions): AsyncIterable<Feature> {
-    const selectFields = this.buildSelectClause(options?.outFields);
+  async *stream(options?: SpatialQueryOptions): AsyncIterable<Feature> {
     const shapeField = this.tableInfo.shapeFieldName;
     const driver = this.connection.driver;
 
-    let sql = `SELECT ${selectFields} FROM ${this.qualifiedTableName}`;
+    let sql: string;
 
-    if (options?.where) {
-      // WARNING: This is vulnerable to SQL injection!
-      // In production, use parameterized queries with a proper query builder
-      sql += ` WHERE ${options.where}`;
+    // Check if this is a versioned query
+    if (options?.version && this.tableInfo.isVersioned) {
+      // Prefer using enterprise versioned view (*_evw) if available
+      if (this.tableInfo.evwViewName && this.setVersionContext) {
+        // Set version context for the session, then query the evw view
+        await this.setVersionContext(options.version);
+        sql = this.buildEvwQuery(options.where, options.outFields);
+      } else if (this.tableInfo.registrationId && this.getStateLineage) {
+        // Fall back to manual UNION query using A/D tables
+        const stateIds = await this.getStateLineage(options.version);
+        if (!stateIds || stateIds.length === 0) {
+          throw new Error(`Version not found or has no state lineage: ${options.version}`);
+        }
+        sql = this.buildVersionedQuery(stateIds, options.where, options.outFields);
+      } else {
+        throw new Error(`Cannot query version: table ${this.name} missing evw view and state lineage`);
+      }
+    } else {
+      // Non-versioned query (base table only)
+      let selectFields = this.buildSelectClause(options?.outFields);
+
+      // Add distance column if requested
+      const distanceSelect = options ? this.buildDistanceSelect(options) : null;
+      if (distanceSelect) {
+        selectFields += `, ${distanceSelect}`;
+      }
+
+      sql = `SELECT ${selectFields} FROM ${this.qualifiedTableName}`;
+
+      // Build WHERE clause combining attribute and spatial filters
+      const whereParts: string[] = [];
+
+      if (options?.where) {
+        // WARNING: This is vulnerable to SQL injection!
+        // In production, use parameterized queries with a proper query builder
+        whereParts.push(`(${options.where})`);
+      }
+
+      // Add spatial filter
+      const spatialClause = options ? this.buildSpatialClause(options) : null;
+      if (spatialClause) {
+        whereParts.push(`(${spatialClause})`);
+      }
+
+      if (whereParts.length > 0) {
+        sql += ` WHERE ${whereParts.join(' AND ')}`;
+      }
     }
 
     if (options?.orderBy) {
@@ -380,6 +688,254 @@ export class EnterpriseTable {
    */
   async *query(where: string): AsyncIterable<Feature> {
     yield* this.stream({ where });
+  }
+
+  // ============================================================
+  // WRITE OPERATIONS
+  // ============================================================
+
+  /**
+   * Allocate the next OBJECTID from the i-table (index table)
+   * Enterprise geodatabases use i-tables to track OBJECTID sequences
+   */
+  private async allocateNextObjectId(): Promise<number> {
+    const regId = this.tableInfo.registrationId;
+    if (!regId) {
+      throw new Error(`Table ${this.name} is not registered (no registrationId)`);
+    }
+
+    const driver = this.connection.driver;
+    const schema = this.tableInfo.schema;
+    const iTable = `${this.quoteId(schema)}.${this.quoteId(`i${regId}`)}`;
+
+    if (driver === 'sqlserver') {
+      // Atomic update and return of next ID
+      // The i-table has: id_type, base_id, num_ids, last_id
+      // base_id is the next available ID to allocate
+      const sql = `
+        UPDATE ${iTable}
+        SET base_id = base_id + 1
+        OUTPUT DELETED.base_id
+        WHERE id_type = 2
+      `;
+      const result = await this.connection.query<{ base_id: number }>(sql);
+      if (result.length === 0 || result[0]?.base_id === undefined) {
+        throw new Error(`Failed to allocate OBJECTID from ${iTable}`);
+      }
+      return result[0].base_id;
+    } else {
+      // PostgreSQL version
+      const sql = `
+        UPDATE ${iTable}
+        SET base_id = base_id + 1
+        WHERE id_type = 2
+        RETURNING base_id - 1 as allocated_id
+      `;
+      const result = await this.connection.query<{ allocated_id: number }>(sql);
+      if (result.length === 0) {
+        throw new Error(`Failed to allocate OBJECTID from ${iTable}`);
+      }
+      return result[0]!.allocated_id;
+    }
+  }
+
+  /**
+   * Insert a new feature into the table
+   * @param feature Feature to insert (id is ignored, will be auto-generated)
+   * @param options Insert options
+   * @returns The new OBJECTID
+   */
+  async insert(
+    feature: Omit<Feature, 'id'> | { attributes: Record<string, unknown>; geometry?: Geometry | null },
+    options?: InsertOptions
+  ): Promise<number> {
+    if (!this._metadata) {
+      throw new Error('Metadata not loaded');
+    }
+
+    const driver = this.connection.driver;
+    const shapeField = this.tableInfo.shapeFieldName;
+
+    // Allocate next OBJECTID from i-table
+    const newObjectId = await this.allocateNextObjectId();
+
+    // Get writable fields (exclude OBJECTID and computed fields)
+    const writableFields = this._metadata.fields.filter(f =>
+      f.type !== 6 && // OID
+      f.name.toLowerCase() !== 'objectid' &&
+      f.name.toLowerCase() !== 'globalid' &&
+      f.type !== 7 // GEOMETRY (handled separately)
+    );
+
+    // Build column names and parameter placeholders
+    const columns: string[] = [this.quoteId('OBJECTID')];
+    const params: string[] = [driver === 'sqlserver' ? '@p0' : '$1'];
+    const values: unknown[] = [newObjectId];
+    let paramIndex = 1;
+
+    for (const field of writableFields) {
+      const value = feature.attributes[field.name];
+      if (value !== undefined) {
+        columns.push(this.quoteId(field.name));
+        params.push(driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`);
+        values.push(value);
+        paramIndex++;
+      }
+    }
+
+    // Handle geometry
+    if (shapeField && feature.geometry && isValidGeometry(feature.geometry)) {
+      const srid = options?.srid ?? feature.geometry.srid ?? 0;
+      const wkt = geometryToWkt(feature.geometry);
+
+      columns.push(this.quoteId(shapeField));
+      if (driver === 'sqlserver') {
+        params.push(`geometry::STGeomFromText(@p${paramIndex}, ${srid})`);
+        values.push(wkt);
+      } else {
+        params.push(`ST_GeomFromText($${paramIndex + 1}, ${srid})`);
+        values.push(wkt);
+      }
+      paramIndex++;
+    }
+
+    // Build INSERT statement
+    const sql = `
+      INSERT INTO ${this.qualifiedTableName} (${columns.join(', ')})
+      VALUES (${params.join(', ')})
+    `;
+
+    await this.connection.execute(sql, values);
+    return newObjectId;
+  }
+
+  /**
+   * Insert multiple features in a batch
+   * @param features Features to insert
+   * @param options Insert options
+   * @returns Array of new OBJECTIDs
+   */
+  async insertMany(
+    features: Array<Omit<Feature, 'id'> | { attributes: Record<string, unknown>; geometry?: Geometry | null }>,
+    options?: InsertOptions
+  ): Promise<number[]> {
+    const ids: number[] = [];
+
+    // For now, insert one at a time
+    // Future optimization: batch INSERT with multiple VALUE rows
+    for (const feature of features) {
+      const id = await this.insert(feature, options);
+      ids.push(id);
+    }
+
+    return ids;
+  }
+
+  /**
+   * Update an existing feature
+   * @param id OBJECTID of the feature to update
+   * @param attributes Attributes to update (partial update)
+   * @param options Update options
+   * @returns true if updated, false if not found
+   */
+  async update(
+    id: number,
+    attributes: Partial<Record<string, unknown>>,
+    options?: UpdateOptions
+  ): Promise<boolean> {
+    if (!this._metadata) {
+      throw new Error('Metadata not loaded');
+    }
+
+    const driver = this.connection.driver;
+    const shapeField = this.tableInfo.shapeFieldName;
+
+    // Build SET clauses
+    const setClauses: string[] = [];
+    const values: unknown[] = [];
+    let paramIndex = 0;
+
+    for (const [key, value] of Object.entries(attributes)) {
+      // Skip OBJECTID and geometry (geometry handled separately)
+      if (key.toLowerCase() === 'objectid') continue;
+      if (shapeField && key.toLowerCase() === shapeField.toLowerCase()) continue;
+
+      setClauses.push(
+        `${this.quoteId(key)} = ${driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`}`
+      );
+      values.push(value);
+      paramIndex++;
+    }
+
+    // Handle geometry update if present
+    if (shapeField && attributes[shapeField]) {
+      const geometry = attributes[shapeField] as Geometry;
+      if (isValidGeometry(geometry)) {
+        const srid = options?.srid ?? geometry.srid ?? 0;
+        const wkt = geometryToWkt(geometry);
+
+        if (driver === 'sqlserver') {
+          setClauses.push(`${this.quoteId(shapeField)} = geometry::STGeomFromText(@p${paramIndex}, ${srid})`);
+        } else {
+          setClauses.push(`${this.quoteId(shapeField)} = ST_GeomFromText($${paramIndex + 1}, ${srid})`);
+        }
+        values.push(wkt);
+        paramIndex++;
+      }
+    }
+
+    if (setClauses.length === 0) {
+      return false; // Nothing to update
+    }
+
+    // Add OBJECTID parameter
+    values.push(id);
+    const idParam = driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`;
+
+    const sql = `
+      UPDATE ${this.qualifiedTableName}
+      SET ${setClauses.join(', ')}
+      WHERE ${this.quoteId('OBJECTID')} = ${idParam}
+    `;
+
+    const result = await this.connection.execute(sql, values);
+    return result.rowsAffected > 0;
+  }
+
+  /**
+   * Delete a feature by OBJECTID
+   * @param id OBJECTID of the feature to delete
+   * @returns true if deleted, false if not found
+   */
+  async delete(id: number): Promise<boolean> {
+    const driver = this.connection.driver;
+    const param = driver === 'sqlserver' ? '@p0' : '$1';
+
+    const sql = `DELETE FROM ${this.qualifiedTableName} WHERE ${this.quoteId('OBJECTID')} = ${param}`;
+    const result = await this.connection.execute(sql, [id]);
+
+    return result.rowsAffected > 0;
+  }
+
+  /**
+   * Delete multiple features by OBJECTID
+   * @param ids OBJECTIDs of features to delete
+   * @returns Number of features deleted
+   */
+  async deleteMany(ids: number[]): Promise<number> {
+    if (ids.length === 0) return 0;
+
+    const driver = this.connection.driver;
+
+    // Build IN clause with parameters
+    const params = ids.map((_, i) =>
+      driver === 'sqlserver' ? `@p${i}` : `$${i + 1}`
+    ).join(', ');
+
+    const sql = `DELETE FROM ${this.qualifiedTableName} WHERE ${this.quoteId('OBJECTID')} IN (${params})`;
+    const result = await this.connection.execute(sql, ids);
+
+    return result.rowsAffected;
   }
 
   /**

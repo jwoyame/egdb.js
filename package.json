@@ -17,6 +17,10 @@
     }
   },
   "sideEffects": false,
+  "files": [
+    "dist",
+    "src"
+  ],
   "repository": "https://github.com/etchgis/egdb.js.git",
   "author": "Etch Ltd <team@etchgis.com>",
   "license": "UNLICENSED",
@@ -59,6 +63,6 @@
     "tslib": "^2.8.1",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3",
-    "vitest": "^3.0.0"
+    "vitest": "^4.0.18"
   }
 }
