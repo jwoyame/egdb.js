@@ -4,6 +4,7 @@
 
 import type { IDatabaseConnection } from '../connections/connection';
 import type { TableInfo, CompressResult } from '../types';
+import { buildIntegerList } from '../utils/sql-helpers';
 
 /**
  * Quote an identifier based on database driver.
@@ -35,7 +36,7 @@ export async function compressStates(
   }
 
   const driver = connection.driver;
-  const stateList = stateIds.join(',');
+  const stateList = buildIntegerList(stateIds, 'compressStates');
   let addsRemoved = 0;
   let deletesRemoved = 0;
 
@@ -151,7 +152,6 @@ export async function removeOrphanedStates(
   // 1. Are not the current state of any version
   // 2. Are not in any lineage
   // 3. Are not state 0 (initial state)
-
   const findOrphansSql = connection.driver === 'sqlserver'
     ? `
       SELECT state_id
@@ -175,7 +175,7 @@ export async function removeOrphanedStates(
   }
 
   const orphanIds = orphans.map(o => o.state_id);
-  const orphanList = orphanIds.join(',');
+  const orphanList = buildIntegerList(orphanIds, 'removeOrphanedStates');
 
   // Delete orphaned states
   const deleteSql = connection.driver === 'sqlserver'
@@ -205,7 +205,7 @@ export async function getVersionStats(
     return stats;
   }
 
-  const stateList = stateIds.join(',');
+  const stateList = buildIntegerList(stateIds, 'getVersionStats');
   const driver = connection.driver;
 
   for (const table of tables) {

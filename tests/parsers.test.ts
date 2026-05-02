@@ -303,4 +303,34 @@ describe('Geometry Writer', () => {
       expect(isValidGeometry({ type: 'Point', coordinates: [0, NaN] })).toBe(false);
     });
   });
+
+  describe('WKT validation (via geometryToSqlExpression)', () => {
+    it('should handle standard WKT correctly', () => {
+      const geom: Geometry = { type: 'Point', coordinates: [1, 2] };
+      // Should not throw
+      expect(() => geometryToSqlExpression(geom, 'sqlserver')).not.toThrow();
+    });
+
+    it('should handle coordinates with scientific notation', () => {
+      // Small coordinates that would be rendered with scientific notation
+      const geom: Geometry = { type: 'Point', coordinates: [1.5e-10, 2.5e10] };
+      expect(() => geometryToSqlExpression(geom, 'postgresql')).not.toThrow();
+    });
+
+    it('should handle negative coordinates', () => {
+      const geom: Geometry = { type: 'Point', coordinates: [-122.4194, 37.7749] };
+      expect(() => geometryToSqlExpression(geom, 'sqlserver')).not.toThrow();
+    });
+
+    it('should handle complex geometry types', () => {
+      const geom: Geometry = {
+        type: 'GeometryCollection',
+        geometries: [
+          { type: 'Point', coordinates: [0, 0] },
+          { type: 'LineString', coordinates: [[1, 1], [2, 2]] },
+        ],
+      };
+      expect(() => geometryToSqlExpression(geom, 'postgresql')).not.toThrow();
+    });
+  });
 });

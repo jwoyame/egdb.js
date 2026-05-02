@@ -4,6 +4,7 @@
 
 import type { IDatabaseConnection } from '../connections/connection';
 import type { TableInfo } from '../types';
+import { buildIntegerList } from '../utils/sql-helpers';
 
 /**
  * Quote an identifier based on database driver.
@@ -63,7 +64,7 @@ export async function postChangesToParent(
   }
 
   const driver = connection.driver;
-  const childStateList = childStateIds.join(',');
+  const childStateList = buildIntegerList(childStateIds, 'postChangesToParent');
   let postedCount = 0;
 
   for (const table of tables) {
@@ -129,7 +130,7 @@ export async function deleteStates(
 ): Promise<void> {
   if (stateIds.length === 0) return;
 
-  const stateList = stateIds.join(',');
+  const stateList = buildIntegerList(stateIds, 'deleteStates');
 
   // First remove from state_lineages
   const deleteLineagesSql = connection.driver === 'sqlserver'

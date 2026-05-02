@@ -18,6 +18,7 @@ import type {
   SpatialQueryGeometry,
   SpatialRelationship,
 } from './types';
+import { buildIntegerList } from './utils/sql-helpers';
 
 /** Options for insert operations */
 export interface InsertOptions {
@@ -344,7 +345,7 @@ export class EnterpriseTable {
     const deletesTable = `${schema}.${this.quoteId(`D${regId}`)}`;
 
     // Build state ID list for IN clause
-    const stateIdList = stateIds.join(',');
+    const stateIdList = buildIntegerList(stateIds, 'versionedQuery');
 
     // Base WHERE clause
     const baseWhere = whereClause ? ` AND (${whereClause})` : '';
@@ -408,6 +409,8 @@ export class EnterpriseTable {
     }
 
     // Handle GeoJSON geometry
+    // Note: WKT is safe to embed directly since geometryToWkt only outputs
+    // numeric coordinates - no user strings that could contain SQL injection
     const srid = geom.srid ?? 0;
     const wkt = geometryToWkt(geom);
     return driver === 'sqlserver'

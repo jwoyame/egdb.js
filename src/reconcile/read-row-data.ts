@@ -5,6 +5,7 @@
 
 import type { IDatabaseConnection } from '../connections/connection';
 import type { TableInfo } from '../types';
+import { requireRegistrationId } from '../utils/guards';
 
 /**
  * Quote an identifier based on database driver.
@@ -28,7 +29,7 @@ export async function readATableRow(
   objectId: number,
   stateId: number
 ): Promise<Record<string, unknown> | null> {
-  const regId = tableInfo.registrationId!;
+  const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
 
@@ -89,7 +90,7 @@ export async function readRowAtState(
   ancestorStateId: number,
   stateIds: number[]
 ): Promise<Record<string, unknown> | null> {
-  const regId = tableInfo.registrationId!;
+  const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
 

@@ -11,6 +11,7 @@ import type {
   ConflictResolution,
 } from '../types';
 import { readATableRow } from './read-row-data';
+import { requireRegistrationId } from '../utils/guards';
 
 /**
  * Quote an identifier based on database driver.
@@ -55,7 +56,7 @@ export async function copyATableRow(
   fromStateId: number,
   toStateId: number
 ): Promise<void> {
-  const regId = tableInfo.registrationId!;
+  const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
 
@@ -95,7 +96,7 @@ export async function insertDeleteMarker(
   objectId: number,
   stateId: number
 ): Promise<void> {
-  const regId = tableInfo.registrationId!;
+  const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
 
@@ -118,7 +119,7 @@ export async function removeFromATable(
   objectId: number,
   stateId: number
 ): Promise<void> {
-  const regId = tableInfo.registrationId!;
+  const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
 
@@ -141,7 +142,7 @@ export async function removeFromDTable(
   objectId: number,
   stateId: number
 ): Promise<void> {
-  const regId = tableInfo.registrationId!;
+  const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
 
@@ -165,7 +166,7 @@ export async function applyMergedRow(
   stateId: number,
   mergedValues: Record<string, unknown>
 ): Promise<void> {
-  const regId = tableInfo.registrationId!;
+  const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
 

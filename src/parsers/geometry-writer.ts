@@ -109,11 +109,39 @@ function multiPolygonToWkt(coords: [number, number][][][]): string {
 }
 
 /**
- * Escape single quotes in WKT for safe SQL embedding.
- * While WKT typically only contains numeric coordinates, this provides
- * defense-in-depth against potential injection if malformed input is passed.
+ * Validate and escape WKT for SQL embedding.
+ *
+ * WKT grammar allows:
+ * - Type names: A-Z (POINT, LINESTRING, POLYGON, etc.)
+ * - Dimension markers: Z, M, ZM
+ * - EMPTY keyword
+ * - Coordinates: digits, minus, period, scientific notation (e/E, +)
+ * - Structural: parentheses, commas, whitespace
+ *
+ * EWKT (Extended WKT with SRID prefix) is NOT supported:
+ *   SRID=4326;POINT(1 2)  -- NOT SUPPORTED
+ * Callers must strip the SRID prefix and pass it separately via the srid parameter.
+ *
+ * @throws Error if WKT contains unexpected characters
  */
-function escapeWktForSql(wkt: string): string {
+function validateAndEscapeWkt(wkt: string): string {
+  // Allow: letters, digits, parentheses, commas, periods, minus, plus,
+  // whitespace, and E/e for scientific notation
+  // Pattern explanation:
+  // - ^[A-Z\s]+ - starts with geometry type (POINT, MULTILINESTRING, etc.)
+  // - (?:EMPTY|\(...\))$ - followed by either EMPTY or parenthesized content
+  // - The content allows nested type names for GEOMETRYCOLLECTION
+  const validWktPattern = /^[A-Z\s]+(?:EMPTY|\([A-Z0-9.,\s\-+()eE]+\))$/i;
+
+  if (!validWktPattern.test(wkt)) {
+    // Provide helpful error message showing the problematic characters
+    const invalidChars = wkt.replace(/[A-Z0-9.,\s\-+()eE]/gi, '');
+    throw new Error(
+      `Invalid WKT format: contains unexpected characters: ${JSON.stringify(invalidChars)}`
+    );
+  }
+
+  // Escape single quotes (defensive - should never appear in valid WKT)
   return wkt.replace(/'/g, "''");
 }
 
@@ -127,7 +155,7 @@ export function geometryToSqlExpression(
   srid?: number
 ): string {
   const wkt = geometryToWkt(geometry);
-  const escapedWkt = escapeWktForSql(wkt);
+  const escapedWkt = validateAndEscapeWkt(wkt);
   const actualSrid = srid ?? geometry.srid ?? 0;
 
   if (driver === 'sqlserver') {
