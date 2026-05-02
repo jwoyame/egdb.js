@@ -40,7 +40,21 @@ import {
   getVersionStats,
 } from './reconcile';
 
+/**
+ * Error thrown when version locking times out.
+ * Indicates another operation is in progress on the target version.
+ */
+export class LockTimeoutError extends Error {
+  constructor(resource: string) {
+    super(`Lock timeout on resource: ${resource}`);
+    this.name = 'LockTimeoutError';
+  }
+}
+
 export class EnterpriseGeodatabase {
+  /** Version-lock acquisition timeout (milliseconds) */
+  private static readonly LOCK_TIMEOUT_MS = 30000;
+
   private connection: IDatabaseConnection;
   private config: ConnectionConfig;
   private _version: string | null = null;
@@ -777,46 +791,53 @@ export class EnterpriseGeodatabase {
       throw new Error(`Cannot post DEFAULT version - it has no parent`);
     }
 
-    // Get parent version info
     const parentFullName = version.parentName.includes('.')
       ? version.parentName
       : `sde.${version.parentName}`;
-    const parent = await this.getVersion(parentFullName);
-    if (!parent) {
-      throw new Error(`Parent version not found: ${parentFullName}`);
-    }
-    if (!parent.stateId) {
-      throw new Error(`Parent version ${parentFullName} has no state ID`);
-    }
 
-    // Verify the version has been reconciled
-    const reconciled = await isReconciled(
-      this.connection,
-      version.stateId,
-      parent.stateId
-    );
-    if (!reconciled) {
-      throw new Error(
-        `Version ${versionName} has not been reconciled with ${parentFullName}. ` +
-        `Call reconcileVersion() first.`
-      );
-    }
-
-    // Get child's unique states (states not in parent's lineage)
-    const childUniqueStates = await getChildUniqueStates(
-      this.connection,
-      version.stateId,
-      parent.stateId
-    );
-
-    // Get all versioned tables
-    const tables = await this.listTables();
-    const versionedTables = tables.filter(t => t.isVersioned);
-
-    // Post changes within a transaction
+    // Post is the only writer that mutates the parent's state pointer, so we
+    // serialize concurrent posts to the same parent with an exclusive lock.
+    // pg_advisory_xact_lock is transaction-scoped, so the lock + the work need
+    // to share a transaction. sp_getapplock with @LockOwner='Transaction' has
+    // the same property, so the same shape works for both drivers.
     await this.connection.beginTransaction();
     try {
-      // Move A/D entries from child states to parent state
+      await this.lockVersion(parentFullName);
+
+      // Re-fetch parent INSIDE the lock — its state_id may have advanced
+      // between getVersion above and lock acquisition.
+      const parent = await this.getVersion(parentFullName);
+      if (!parent) {
+        throw new Error(`Parent version not found: ${parentFullName}`);
+      }
+      if (!parent.stateId) {
+        throw new Error(`Parent version ${parentFullName} has no state ID`);
+      }
+
+      // Re-verify reconciliation under the lock. If another session posted
+      // to the parent after our caller's reconcile, child.stateId is no
+      // longer a descendant of parent.stateId and we must abort.
+      const reconciled = await isReconciled(
+        this.connection,
+        version.stateId,
+        parent.stateId
+      );
+      if (!reconciled) {
+        throw new Error(
+          `Version ${versionName} is no longer reconciled with ${parentFullName}. ` +
+            `Parent was modified by another post. Reconcile again before retrying.`
+        );
+      }
+
+      const childUniqueStates = await getChildUniqueStates(
+        this.connection,
+        version.stateId,
+        parent.stateId
+      );
+
+      const tables = await this.listTables();
+      const versionedTables = tables.filter(t => t.isVersioned);
+
       const changesPosted = await postChangesToParent(
         this.connection,
         versionedTables,
@@ -824,8 +845,6 @@ export class EnterpriseGeodatabase {
         parent.stateId
       );
 
-      // Update child version to point to parent's state
-      // (After posting, child and parent are identical)
       await updateVersionState(
         this.connection,
         version.owner,
@@ -833,12 +852,13 @@ export class EnterpriseGeodatabase {
         parent.stateId
       );
 
-      // Clean up child's unique states
       await deleteStates(this.connection, childUniqueStates);
 
+      // Lock auto-releases on commit for both drivers (Postgres:
+      // pg_advisory_xact_lock; SQL Server: sp_getapplock with @LockOwner =
+      // 'Transaction'). No explicit unlock needed on the success path.
       await this.connection.commitTransaction();
 
-      // Optionally delete the version
       if (options?.deleteVersionAfterPost) {
         await this.deleteVersion(versionName);
       }
@@ -1110,6 +1130,65 @@ export class EnterpriseGeodatabase {
    */
   async query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
     return this.connection.query<T>(sql, params);
+  }
+
+  // ============================================================
+  // VERSION LOCKING (used by postVersion to serialize concurrent posts)
+  // ============================================================
+
+  /**
+   * Acquire an exclusive transaction-scoped lock identifying a version.
+   *
+   * SQL Server: sp_getapplock with @LockOwner = 'Transaction'.
+   * PostgreSQL: pg_advisory_xact_lock + a per-transaction statement_timeout
+   * so the lock wait can't block forever. Postgres' SET LOCAL does NOT accept
+   * bind parameters in most drivers, so we inline the timeout constant — safe
+   * because LOCK_TIMEOUT_MS is a class constant, not user input.
+   *
+   * Caller must already be in a transaction; both flavors release at commit
+   * (Postgres automatically; SQL Server because the lock is transaction-owned),
+   * so there's no companion unlockVersion — commit/rollback ends the lock.
+   *
+   * @throws LockTimeoutError if the lock cannot be acquired within LOCK_TIMEOUT_MS
+   */
+  private async lockVersion(versionName: string): Promise<void> {
+    const resource = `egdb_version:${versionName}`;
+
+    if (this.config.driver === 'sqlserver') {
+      const sql = `
+        DECLARE @result int;
+        EXEC @result = sp_getapplock
+          @Resource = @p0,
+          @LockMode = 'Exclusive',
+          @LockOwner = 'Transaction',
+          @LockTimeout = @p1;
+        SELECT @result AS lock_result;
+      `;
+      const result = await this.connection.query<{ lock_result: number }>(sql, [
+        resource,
+        EnterpriseGeodatabase.LOCK_TIMEOUT_MS,
+      ]);
+      const code = result[0]?.lock_result ?? -999;
+      if (code < 0) {
+        if (code === -1) throw new LockTimeoutError(resource);
+        if (code === -3) throw new Error(`Deadlock while locking ${versionName}`);
+        throw new Error(`Failed to lock ${versionName}: sp_getapplock code ${code}`);
+      }
+    } else {
+      try {
+        // Inlined constant — see method doc for why this can't be a bind param.
+        await this.connection.query(
+          `SET LOCAL statement_timeout = ${EnterpriseGeodatabase.LOCK_TIMEOUT_MS}`
+        );
+        await this.connection.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [resource]);
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        if (msg.includes('statement timeout') || msg.includes('canceling statement')) {
+          throw new LockTimeoutError(resource);
+        }
+        throw error;
+      }
+    }
   }
 
   /**

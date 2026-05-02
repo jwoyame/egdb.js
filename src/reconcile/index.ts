@@ -66,3 +66,12 @@ export {
   removeOrphanedStates,
   getVersionStats,
 } from './compress';
+
+// State management (EditSession isolation)
+export {
+  createChildState,
+  deleteChildState,
+  acquireStateLock,
+  releaseStateLock,
+  getLockedStateIds,
+} from './state-management';

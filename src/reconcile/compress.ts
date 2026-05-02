@@ -142,48 +142,94 @@ export async function compressStates(
 /**
  * Remove orphaned states (states not referenced by any version or lineage).
  *
- * @param connection Database connection
+ * Excludes states currently held by an active EditSession (via SDE_state_locks).
+ * The locks subquery is embedded in each DELETE statement so the lock check
+ * is evaluated atomically with the delete: a lock that becomes visible after
+ * our orphan-find SELECT but before our DELETE will still be honored, because
+ * the DELETE re-evaluates the subquery at execution time.
+ *
+ * What this still cannot prevent: a session that COMMITS its lock insert
+ * between when we read the orphan list and when the database executes the
+ * DELETE — the new lock will be re-checked by the embedded subquery and the
+ * row stays. The genuinely missed case would be a session whose lock insert
+ * isn't yet committed at DELETE time; that lock isn't visible to our
+ * statement, but its child state was created in the same uncommitted
+ * transaction so it won't appear in our orphan list either. Net result:
+ * concurrent EditSession.start is safe.
+ *
+ * Caveat (pre-existing, not in scope for this commit): every state has a
+ * self-row in SDE_state_lineages (lineage_name = lineage_id = state_id),
+ * which means the `NOT IN (SELECT lineage_id ...)` clause excludes a state
+ * from the orphan list as long as its self-lineage row exists. So this
+ * function is best understood as a safety net for partial-cleanup scenarios
+ * (e.g. a discard that died between deleting lineage rows and deleting the
+ * state row), not the primary state-deletion path.
+ *
+ * The multi-table cleanup is wrapped in a transaction so lineage and state
+ * deletes commit together.
+ *
  * @returns Number of states removed
  */
 export async function removeOrphanedStates(
   connection: IDatabaseConnection
 ): Promise<number> {
-  // Find states that:
-  // 1. Are not the current state of any version
-  // 2. Are not in any lineage
-  // 3. Are not state 0 (initial state)
-  const findOrphansSql = connection.driver === 'sqlserver'
-    ? `
-      SELECT state_id
-      FROM sde.SDE_states
-      WHERE state_id != 0
-        AND state_id NOT IN (SELECT state_id FROM sde.SDE_versions WHERE state_id IS NOT NULL)
-        AND state_id NOT IN (SELECT DISTINCT lineage_id FROM sde.SDE_state_lineages)
-    `
-    : `
-      SELECT state_id
-      FROM sde.sde_states
-      WHERE state_id != 0
-        AND state_id NOT IN (SELECT state_id FROM sde.sde_versions WHERE state_id IS NOT NULL)
-        AND state_id NOT IN (SELECT DISTINCT lineage_id FROM sde.sde_state_lineages)
-    `;
+  const wasInTx = connection.inTransaction();
+  if (!wasInTx) await connection.beginTransaction();
 
-  const orphans = await connection.query<{ state_id: number }>(findOrphansSql);
+  try {
+    const findOrphansSql = connection.driver === 'sqlserver'
+      ? `
+        SELECT state_id
+        FROM sde.SDE_states
+        WHERE state_id != 0
+          AND state_id NOT IN (SELECT state_id FROM sde.SDE_versions WHERE state_id IS NOT NULL)
+          AND state_id NOT IN (SELECT DISTINCT lineage_id FROM sde.SDE_state_lineages)
+          AND state_id NOT IN (SELECT DISTINCT state_id FROM sde.SDE_state_locks)
+      `
+      : `
+        SELECT state_id
+        FROM sde.sde_states
+        WHERE state_id != 0
+          AND state_id NOT IN (SELECT state_id FROM sde.sde_versions WHERE state_id IS NOT NULL)
+          AND state_id NOT IN (SELECT DISTINCT lineage_id FROM sde.sde_state_lineages)
+          AND state_id NOT IN (SELECT DISTINCT state_id FROM sde.sde_state_locks)
+      `;
 
-  if (orphans.length === 0) {
-    return 0;
+    const orphans = await connection.query<{ state_id: number }>(findOrphansSql);
+    if (orphans.length === 0) {
+      if (!wasInTx) await connection.commitTransaction();
+      return 0;
+    }
+
+    const orphanIds = orphans.map((o) => o.state_id);
+    const orphanList = buildIntegerList(orphanIds, 'removeOrphanedStates');
+
+    // Each DELETE re-checks SDE_state_locks atomically. Lineages first because
+    // SDE_state_lineages.lineage_name has an FK to SDE_states.state_id.
+    const deleteLineagesSql = connection.driver === 'sqlserver'
+      ? `DELETE FROM sde.SDE_state_lineages
+         WHERE lineage_name IN (${orphanList})
+           AND lineage_name NOT IN (SELECT DISTINCT state_id FROM sde.SDE_state_locks)`
+      : `DELETE FROM sde.sde_state_lineages
+         WHERE lineage_name IN (${orphanList})
+           AND lineage_name NOT IN (SELECT DISTINCT state_id FROM sde.sde_state_locks)`;
+    await connection.execute(deleteLineagesSql);
+
+    const deleteStatesSql = connection.driver === 'sqlserver'
+      ? `DELETE FROM sde.SDE_states
+         WHERE state_id IN (${orphanList})
+           AND state_id NOT IN (SELECT DISTINCT state_id FROM sde.SDE_state_locks)`
+      : `DELETE FROM sde.sde_states
+         WHERE state_id IN (${orphanList})
+           AND state_id NOT IN (SELECT DISTINCT state_id FROM sde.sde_state_locks)`;
+    const result = await connection.execute(deleteStatesSql);
+
+    if (!wasInTx) await connection.commitTransaction();
+    return result.rowsAffected;
+  } catch (error) {
+    if (!wasInTx) await connection.rollbackTransaction();
+    throw error;
   }
-
-  const orphanIds = orphans.map(o => o.state_id);
-  const orphanList = buildIntegerList(orphanIds, 'removeOrphanedStates');
-
-  // Delete orphaned states
-  const deleteSql = connection.driver === 'sqlserver'
-    ? `DELETE FROM sde.SDE_states WHERE state_id IN (${orphanList})`
-    : `DELETE FROM sde.sde_states WHERE state_id IN (${orphanList})`;
-
-  const result = await connection.execute(deleteSql, []);
-  return result.rowsAffected;
 }
 
 /**
