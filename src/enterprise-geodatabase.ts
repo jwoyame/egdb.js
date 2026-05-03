@@ -9,6 +9,7 @@ import { SqlServerConnection } from './connections/sqlserver';
 import { PostgreSQLConnection } from './connections/postgresql';
 import { EnterpriseTable } from './enterprise-table';
 import { EditSession } from './edit-session';
+import { type Logger, consoleLogger } from './logger';
 import { parseGdbItems } from './parsers/gdb-items-parser';
 import type { GdbItemRow } from './parsers/gdb-items-parser';
 import type {
@@ -38,7 +39,9 @@ import {
   compressStates,
   removeOrphanedStates,
   getVersionStats,
+  cleanupStaleLocks,
 } from './reconcile';
+import type { StaleLockCleanupResult } from './reconcile';
 
 /**
  * Error thrown when version locking times out.
@@ -59,10 +62,21 @@ export class EnterpriseGeodatabase {
   private config: ConnectionConfig;
   private _version: string | null = null;
   private _tables: TableInfo[] | null = null;
+  private _logger: Logger;
 
   private constructor(config: ConnectionConfig, connection: IDatabaseConnection) {
     this.config = config;
     this.connection = connection;
+    this._logger = config.logger ?? consoleLogger;
+  }
+
+  /**
+   * Get the logger configured for this geodatabase.
+   * Used internally by EditSession etc. — exposed so consumers can also
+   * route library warnings through the same pipeline.
+   */
+  get logger(): Logger {
+    return this._logger;
   }
 
   /**
@@ -1130,6 +1144,25 @@ export class EnterpriseGeodatabase {
    */
   async query<T = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<T[]> {
     return this.connection.query<T>(sql, params);
+  }
+
+  /**
+   * Remove rows from `SDE_state_locks` whose owning database session no longer
+   * exists. Run as a periodic maintenance task to recover from EditSession
+   * processes that died before reaching `close()`.
+   *
+   * Cross-checks against `sys.dm_exec_sessions` (SQL Server) or
+   * `pg_stat_activity` (PostgreSQL). The current connection's own session is
+   * always considered live, so this is safe to call from a long-running
+   * service.
+   *
+   * Note: this only removes lock rows, not the orphaned child states they
+   * were protecting. Those states still hold a self-row in
+   * `SDE_state_lineages`, so a deeper cleanup pass would be needed to fully
+   * reclaim them. See CLAUDE.md "Known Limitations".
+   */
+  async cleanupStaleLocks(): Promise<StaleLockCleanupResult> {
+    return cleanupStaleLocks(this.connection);
   }
 
   // ============================================================

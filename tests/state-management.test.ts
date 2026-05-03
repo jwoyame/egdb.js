@@ -13,6 +13,7 @@ import {
   acquireStateLock,
   releaseStateLock,
   getLockedStateIds,
+  cleanupStaleLocks,
 } from '../src/reconcile/state-management';
 import type {
   IDatabaseConnection,
@@ -228,5 +229,128 @@ describe('getLockedStateIds', () => {
     });
     const ids = await getLockedStateIds(connection);
     expect(ids.size).toBe(0);
+  });
+});
+
+describe('cleanupStaleLocks', () => {
+  // Standard "permission granted" probe responses keyed by driver.
+  const sqlServerPermOk = { match: /HAS_PERMS_BY_NAME/, rows: [{ has_perm: 1 }] };
+  const postgresPermOk = { match: /pg_has_role|rolsuper/, rows: [{ has_perm: true }] };
+  const cutoffOk = { match: /AS cutoff/, rows: [{ cutoff: new Date('2026-01-01T00:00:00Z') }] };
+
+  it('throws InsufficientPrivilegeError when VIEW SERVER STATE is missing on SQL Server', async () => {
+    const { connection } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [{ match: /HAS_PERMS_BY_NAME/, rows: [{ has_perm: 0 }] }],
+    });
+    await expect(cleanupStaleLocks(connection)).rejects.toThrow(/VIEW SERVER STATE/);
+  });
+
+  it('throws InsufficientPrivilegeError when probe role check fails on Postgres', async () => {
+    const { connection } = makeMock({
+      driver: 'postgresql',
+      queryResponses: [{ match: /pg_has_role|rolsuper/, rows: [{ has_perm: false }] }],
+    });
+    await expect(cleanupStaleLocks(connection)).rejects.toThrow(/pg_read_all_stats/);
+  });
+
+  it('returns zero when SDE_state_locks is empty', async () => {
+    const { connection, calls } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        sqlServerPermOk,
+        cutoffOk,
+        { match: /DISTINCT sde_id/, rows: [] },
+      ],
+    });
+    const result = await cleanupStaleLocks(connection);
+    expect(result).toEqual({ staleSdeIds: [], removedLocks: 0 });
+    expect(calls.find((c) => /dm_exec_sessions|pg_stat_activity/.test(c.sql))).toBeUndefined();
+  });
+
+  it('returns zero when every locking sde_id has a live session', async () => {
+    const { connection, calls } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        sqlServerPermOk,
+        cutoffOk,
+        { match: /DISTINCT sde_id/, rows: [{ sde_id: 51 }, { sde_id: 52 }] },
+        { match: /dm_exec_sessions/, rows: [{ sde_id: 51 }, { sde_id: 52 }, { sde_id: 99 }] },
+      ],
+    });
+    const result = await cleanupStaleLocks(connection);
+    expect(result).toEqual({ staleSdeIds: [], removedLocks: 0 });
+    expect(calls.find((c) => c.kind === 'execute')).toBeUndefined();
+  });
+
+  it('deletes locks for sde_ids missing from live sessions', async () => {
+    const { connection, calls } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        sqlServerPermOk,
+        cutoffOk,
+        { match: /DISTINCT sde_id/, rows: [{ sde_id: 51 }, { sde_id: 52 }, { sde_id: 53 }] },
+        { match: /dm_exec_sessions/, rows: [{ sde_id: 51 }, { sde_id: 99 }] },
+      ],
+    });
+    const result = await cleanupStaleLocks(connection);
+    expect([...result.staleSdeIds].sort((a, b) => a - b)).toEqual([52, 53]);
+    expect(result.removedLocks).toBe(1);
+
+    const del = calls.find((c) => c.kind === 'execute' && /SDE_state_locks/.test(c.sql));
+    expect(del).toBeDefined();
+    expect(del!.sql).toMatch(/IN \((52,53|53,52)\)/);
+  });
+
+  it('constrains the DELETE with lock_time <= cutoff to survive sde_id recycling', async () => {
+    const cutoff = new Date('2026-01-01T00:00:00Z');
+    const { connection, calls } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        sqlServerPermOk,
+        { match: /AS cutoff/, rows: [{ cutoff }] },
+        { match: /DISTINCT sde_id/, rows: [{ sde_id: 99 }] },
+        { match: /dm_exec_sessions/, rows: [] },
+      ],
+    });
+    await cleanupStaleLocks(connection);
+
+    const del = calls.find((c) => c.kind === 'execute' && /SDE_state_locks/.test(c.sql));
+    expect(del).toBeDefined();
+    expect(del!.sql).toMatch(/lock_time <= @p0/);
+    expect(del!.params).toEqual([cutoff]);
+  });
+
+  it('also constrains the lock-snapshot SELECT by cutoff', async () => {
+    const cutoff = new Date('2026-01-01T00:00:00Z');
+    const { connection, calls } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        sqlServerPermOk,
+        { match: /AS cutoff/, rows: [{ cutoff }] },
+        { match: /DISTINCT sde_id/, rows: [] },
+      ],
+    });
+    await cleanupStaleLocks(connection);
+
+    const snapshot = calls.find((c) => /DISTINCT sde_id/.test(c.sql));
+    expect(snapshot).toBeDefined();
+    expect(snapshot!.sql).toMatch(/lock_time <= @p0/);
+    expect(snapshot!.params).toEqual([cutoff]);
+  });
+
+  it('uses pg_stat_activity on postgres', async () => {
+    const { connection, calls } = makeMock({
+      driver: 'postgresql',
+      queryResponses: [
+        postgresPermOk,
+        { match: /AS cutoff/, rows: [{ cutoff: new Date() }] },
+        { match: /DISTINCT sde_id/, rows: [{ sde_id: 100 }] },
+        { match: /pg_stat_activity/, rows: [] },
+      ],
+    });
+    await cleanupStaleLocks(connection);
+    expect(calls.find((c) => /pg_stat_activity/.test(c.sql))).toBeDefined();
+    expect(calls.find((c) => /dm_exec_sessions/.test(c.sql))).toBeUndefined();
   });
 });

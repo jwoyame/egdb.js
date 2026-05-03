@@ -56,6 +56,11 @@ export interface ConnectionConfig {
     connectionTimeout?: number;
     requestTimeout?: number;
   };
+  /**
+   * Logger for library warnings and errors. Defaults to `consoleLogger`.
+   * See `src/logger.ts`.
+   */
+  logger?: import('./logger').Logger;
 }
 
 /** SQL Server specific config */

@@ -74,4 +74,7 @@ export {
   acquireStateLock,
   releaseStateLock,
   getLockedStateIds,
+  cleanupStaleLocks,
+  InsufficientPrivilegeError,
 } from './state-management';
+export type { StaleLockCleanupResult } from './state-management';

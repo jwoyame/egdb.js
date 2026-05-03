@@ -7,6 +7,7 @@
  */
 
 import type { IDatabaseConnection } from '../connections/connection';
+import { buildIntegerList } from '../utils/sql-helpers';
 
 /**
  * Create a child state branching from parentStateId.
@@ -192,4 +193,155 @@ export async function getLockedStateIds(connection: IDatabaseConnection): Promis
       : `SELECT DISTINCT state_id FROM sde.sde_state_locks`;
   const result = await connection.query<{ state_id: number }>(sql);
   return new Set(result.map((r) => r.state_id));
+}
+
+export interface StaleLockCleanupResult {
+  /** sde_ids found in SDE_state_locks but not in any live database session */
+  staleSdeIds: number[];
+  /** number of lock rows deleted */
+  removedLocks: number;
+}
+
+export class InsufficientPrivilegeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InsufficientPrivilegeError';
+  }
+}
+
+/**
+ * Verify the connection can see all live database sessions.
+ *
+ * cleanupStaleLocks is dangerous without this: SQL Server's
+ * sys.dm_exec_sessions returns ONLY the calling session unless the user has
+ * VIEW SERVER STATE; PostgreSQL's pg_stat_activity hides other backends'
+ * pids unless the user is a superuser or member of pg_read_all_stats /
+ * pg_monitor. Without the right grants, every other live session's locks
+ * would be misclassified as stale and reaped.
+ */
+async function assertCanSeeAllSessions(connection: IDatabaseConnection): Promise<void> {
+  if (connection.driver === 'sqlserver') {
+    const result = await connection.query<{ has_perm: number | null }>(
+      `SELECT HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE') AS has_perm`
+    );
+    if (result[0]?.has_perm !== 1) {
+      throw new InsufficientPrivilegeError(
+        'cleanupStaleLocks requires VIEW SERVER STATE on SQL Server. ' +
+          'Without it, sys.dm_exec_sessions returns only the calling session, ' +
+          'so every other live session would be misclassified as stale. ' +
+          'Run: GRANT VIEW SERVER STATE TO [<your_login>]'
+      );
+    }
+  } else {
+    const result = await connection.query<{ has_perm: boolean }>(
+      `SELECT (
+        EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper)
+        OR pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER')
+        OR pg_has_role(current_user, 'pg_monitor', 'MEMBER')
+      ) AS has_perm`
+    );
+    if (result[0]?.has_perm !== true) {
+      throw new InsufficientPrivilegeError(
+        'cleanupStaleLocks requires permission to see all backends in pg_stat_activity. ' +
+          'Without superuser or pg_read_all_stats / pg_monitor membership, other backends\' ' +
+          'pids are hidden, so every other live session would be misclassified as stale. ' +
+          'Run: GRANT pg_read_all_stats TO <your_role>'
+      );
+    }
+  }
+}
+
+/**
+ * Remove lock rows whose owning session no longer exists.
+ *
+ * SDE_state_locks rows leak when a process holding a lock dies before
+ * EditSession.close() runs (e.g. crash, OOM, kill -9). The orphaned row
+ * keeps compress away from a state that nothing else references, so
+ * the state and its A/D entries linger forever. ArcGIS itself addresses
+ * this with SDE_process_information heartbeats; we cross-check the
+ * live session list instead, which works for the typical egdb.js
+ * deployment shape (one Node process per connection).
+ *
+ * Liveness is judged against:
+ *   SQL Server — sys.dm_exec_sessions.session_id (requires VIEW SERVER STATE)
+ *   PostgreSQL — pg_stat_activity.pid       (requires pg_read_all_stats /
+ *                                            pg_monitor / superuser)
+ *
+ * Without those grants this throws InsufficientPrivilegeError rather than
+ * doing damage — see assertCanSeeAllSessions for why.
+ *
+ * Race protection: a database SPID/pid can be recycled to a brand-new
+ * connection between when we read the lock list and when we run the DELETE.
+ * If that new connection is itself starting an EditSession, it will INSERT a
+ * fresh lock row under the recycled id. To avoid killing it, we capture a
+ * timestamp at the start and constrain the DELETE to lock_time <= cutoff.
+ *
+ * This only removes lock rows. Any orphaned child states they were
+ * protecting will still have their self-row in SDE_state_lineages, so
+ * removeOrphanedStates won't collect them either; a deeper cleanup would
+ * need to also drop those states' lineage and A/D rows. That's out of
+ * scope here — this function fixes the lock-leak symptom that blocks
+ * compress, not the full state-leak.
+ *
+ * Safe to call against an empty SDE_state_locks (returns 0).
+ *
+ * @throws InsufficientPrivilegeError if the connection lacks the grants
+ *         required to see all live sessions
+ */
+export async function cleanupStaleLocks(
+  connection: IDatabaseConnection
+): Promise<StaleLockCleanupResult> {
+  const driver = connection.driver;
+
+  await assertCanSeeAllSessions(connection);
+
+  // Capture a cutoff timestamp BEFORE reading locks. Any lock inserted
+  // after this point — including locks under a recycled sde_id — must not
+  // be deleted on this run.
+  const cutoffResult = await connection.query<{ cutoff: Date }>(
+    driver === 'sqlserver' ? `SELECT GETDATE() AS cutoff` : `SELECT now() AS cutoff`
+  );
+  const cutoff = cutoffResult[0]?.cutoff;
+  if (cutoff === undefined) {
+    throw new Error('Failed to read database server time for cleanupStaleLocks cutoff');
+  }
+
+  const lockSdeRows = await connection.query<{ sde_id: number }>(
+    driver === 'sqlserver'
+      ? `SELECT DISTINCT sde_id FROM sde.SDE_state_locks WHERE lock_time <= @p0`
+      : `SELECT DISTINCT sde_id FROM sde.sde_state_locks WHERE lock_time <= $1`,
+    [cutoff]
+  );
+  if (lockSdeRows.length === 0) {
+    return { staleSdeIds: [], removedLocks: 0 };
+  }
+
+  const liveRows = await connection.query<{ sde_id: number }>(
+    driver === 'sqlserver'
+      ? `SELECT session_id AS sde_id FROM sys.dm_exec_sessions`
+      : `SELECT pid AS sde_id FROM pg_stat_activity WHERE pid IS NOT NULL`
+  );
+  const liveSet = new Set(liveRows.map((r) => r.sde_id));
+
+  const staleSdeIds = lockSdeRows
+    .map((r) => r.sde_id)
+    .filter((id) => !liveSet.has(id));
+
+  if (staleSdeIds.length === 0) {
+    return { staleSdeIds: [], removedLocks: 0 };
+  }
+
+  const idList = buildIntegerList(staleSdeIds, 'cleanupStaleLocks');
+
+  // The lock_time predicate is critical for sde_id recycling: a brand-new
+  // session that grabs the recycled id between our snapshot and this DELETE
+  // will have lock_time > cutoff and so survives.
+  const result = await connection.execute(
+    driver === 'sqlserver'
+      ? `DELETE FROM sde.SDE_state_locks WHERE sde_id IN (${idList}) AND lock_time <= @p0`
+      : `DELETE FROM sde.sde_state_locks WHERE sde_id IN (${idList}) AND lock_time <= $1`,
+    [cutoff]
+  );
+
+  return { staleSdeIds, removedLocks: result.rowsAffected };
 }

@@ -886,12 +886,12 @@ export class EditSession {
       try {
         await releaseStateLock(this.connection, this.stateId, this.stateLockSdeId);
       } catch (e) {
-        // Library code emitting to console is awkward for consumers; an
-        // injectable logger is tracked in CLAUDE.md "Future Enhancements".
-        // Until then we surface this directly because a swallowed unlock
-        // failure leaves a row in SDE_state_locks that compress will respect
-        // forever, so the operator needs to see it.
-        console.warn(`Failed to release state lock for state ${this.stateId}: ${e}`);
+        // A swallowed unlock failure leaves a row in SDE_state_locks that
+        // compress will respect forever, so the operator needs to see this.
+        this.geodatabase.logger.warn(
+          `Failed to release state lock for state ${this.stateId}`,
+          e
+        );
       }
       this.stateLockSdeId = null;
     }

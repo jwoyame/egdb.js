@@ -56,6 +56,10 @@ export { geometryToWkt, geometryToSqlExpression, isValidGeometry } from './parse
 // Connection interface (for custom implementations)
 export type { IDatabaseConnection } from './connections/connection';
 
+// Logger (for routing library warnings/errors)
+export type { Logger } from './logger';
+export { consoleLogger } from './logger';
+
 // Reconcile module (for advanced usage)
 export {
   findCommonAncestor,
