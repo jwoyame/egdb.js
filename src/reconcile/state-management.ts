@@ -306,10 +306,14 @@ export async function cleanupStaleLocks(
     throw new Error('Failed to read database server time for cleanupStaleLocks cutoff');
   }
 
+  // Strict `<` (not `<=`) so locks inserted within the same database tick as
+  // our cutoff are excluded. SQL Server GETDATE() has ~3.33ms resolution, so
+  // a fresh insert can share a timestamp with our cutoff; with `<=` we'd
+  // misclassify it.
   const lockSdeRows = await connection.query<{ sde_id: number }>(
     driver === 'sqlserver'
-      ? `SELECT DISTINCT sde_id FROM sde.SDE_state_locks WHERE lock_time <= @p0`
-      : `SELECT DISTINCT sde_id FROM sde.sde_state_locks WHERE lock_time <= $1`,
+      ? `SELECT DISTINCT sde_id FROM sde.SDE_state_locks WHERE lock_time < @p0`
+      : `SELECT DISTINCT sde_id FROM sde.sde_state_locks WHERE lock_time < $1`,
     [cutoff]
   );
   if (lockSdeRows.length === 0) {
@@ -335,11 +339,11 @@ export async function cleanupStaleLocks(
 
   // The lock_time predicate is critical for sde_id recycling: a brand-new
   // session that grabs the recycled id between our snapshot and this DELETE
-  // will have lock_time > cutoff and so survives.
+  // will have lock_time >= cutoff and so survives.
   const result = await connection.execute(
     driver === 'sqlserver'
-      ? `DELETE FROM sde.SDE_state_locks WHERE sde_id IN (${idList}) AND lock_time <= @p0`
-      : `DELETE FROM sde.sde_state_locks WHERE sde_id IN (${idList}) AND lock_time <= $1`,
+      ? `DELETE FROM sde.SDE_state_locks WHERE sde_id IN (${idList}) AND lock_time < @p0`
+      : `DELETE FROM sde.sde_state_locks WHERE sde_id IN (${idList}) AND lock_time < $1`,
     [cutoff]
   );
 

@@ -5,7 +5,7 @@
  */
 
 // Main classes
-export { EnterpriseGeodatabase } from './enterprise-geodatabase';
+export { EnterpriseGeodatabase, LockTimeoutError } from './enterprise-geodatabase';
 export { EnterpriseTable } from './enterprise-table';
 export { EditSession } from './edit-session';
 export type { VersionedInsertOptions, VersionedUpdateOptions } from './edit-session';
@@ -48,7 +48,7 @@ export type {
 export { FieldType } from './types';
 
 // Parsers (for advanced usage)
-export { parseWkb, geometryToGeoJSON } from './parsers/geometry-parser';
+export { parseWkb, geometryToGeoJSON, setParserLogger } from './parsers/geometry-parser';
 export { parseGdbItems, parseDefinitionXml, ITEM_TYPE_UUIDS } from './parsers/gdb-items-parser';
 export type { GdbItemRow } from './parsers/gdb-items-parser';
 export { geometryToWkt, geometryToSqlExpression, isValidGeometry } from './parsers/geometry-writer';
@@ -72,7 +72,10 @@ export {
   compressStates,
   removeOrphanedStates,
   getVersionStats,
+  cleanupStaleLocks,
+  InsufficientPrivilegeError,
 } from './reconcile';
+export type { StaleLockCleanupResult } from './reconcile';
 
 // Unified geodatabase access (works with both gdb.js and egdb.js)
 export {

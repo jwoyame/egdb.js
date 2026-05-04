@@ -10,6 +10,7 @@ import { PostgreSQLConnection } from './connections/postgresql';
 import { EnterpriseTable } from './enterprise-table';
 import { EditSession } from './edit-session';
 import { type Logger, consoleLogger } from './logger';
+import { setParserLogger } from './parsers/geometry-parser';
 import { parseGdbItems } from './parsers/gdb-items-parser';
 import type { GdbItemRow } from './parsers/gdb-items-parser';
 import type {
@@ -68,6 +69,9 @@ export class EnterpriseGeodatabase {
     this.config = config;
     this.connection = connection;
     this._logger = config.logger ?? consoleLogger;
+    // Route the parser's "unsupported geometry" warnings through the same
+    // logger. Process-wide; see setParserLogger doc.
+    setParserLogger(this._logger);
   }
 
   /**

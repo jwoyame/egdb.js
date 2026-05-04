@@ -317,11 +317,13 @@ describe('cleanupStaleLocks', () => {
 
     const del = calls.find((c) => c.kind === 'execute' && /SDE_state_locks/.test(c.sql));
     expect(del).toBeDefined();
-    expect(del!.sql).toMatch(/lock_time <= @p0/);
+    // Strict `<` (not `<=`) avoids same-tick collisions with GETDATE()'s ~3.33ms resolution
+    expect(del!.sql).toMatch(/lock_time < @p0/);
+    expect(del!.sql).not.toMatch(/lock_time <=/);
     expect(del!.params).toEqual([cutoff]);
   });
 
-  it('also constrains the lock-snapshot SELECT by cutoff', async () => {
+  it('also constrains the lock-snapshot SELECT by cutoff (strict <)', async () => {
     const cutoff = new Date('2026-01-01T00:00:00Z');
     const { connection, calls } = makeMock({
       driver: 'sqlserver',
@@ -335,7 +337,8 @@ describe('cleanupStaleLocks', () => {
 
     const snapshot = calls.find((c) => /DISTINCT sde_id/.test(c.sql));
     expect(snapshot).toBeDefined();
-    expect(snapshot!.sql).toMatch(/lock_time <= @p0/);
+    expect(snapshot!.sql).toMatch(/lock_time < @p0/);
+    expect(snapshot!.sql).not.toMatch(/lock_time <=/);
     expect(snapshot!.params).toEqual([cutoff]);
   });
 
