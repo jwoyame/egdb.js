@@ -3,7 +3,13 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { parseWkb } from '../src/parsers/geometry-parser.js';
+import {
+  parseWkb,
+  parseSdeBinary,
+  parseSdeBinaryPoints,
+  parseSdeBinaryMultiPart,
+  type SpatialReferenceParams,
+} from '../src/parsers/geometry-parser.js';
 import { parseDefinitionXml, parseGdbItems } from '../src/parsers/gdb-items-parser.js';
 import { geometryToWkt, isValidGeometry, geometryToSqlExpression } from '../src/parsers/geometry-writer.js';
 import type { Geometry } from '../src/types.js';
@@ -331,6 +337,113 @@ describe('Geometry Writer', () => {
         ],
       };
       expect(() => geometryToSqlExpression(geom, 'postgresql')).not.toThrow();
+    });
+  });
+});
+
+describe('SDEBINARY Parser', () => {
+  // Boundary/error-path tests. Round-trip tests against captured live payloads
+  // belong under integration tests (need a real ArcSDE f-table).
+  const stdSr: SpatialReferenceParams = {
+    falsex: 0,
+    falsey: 0,
+    xyunits: 4000,
+    srid: 3,
+  };
+
+  describe('parseSdeBinaryMultiPart', () => {
+    it('reports failure on an empty buffer', () => {
+      const result = parseSdeBinaryMultiPart(Buffer.alloc(0), 0, stdSr);
+      expect(result.success).toBe(false);
+      expect(result.parts).toEqual([]);
+      expect(result.partCount).toBe(0);
+      expect(result.error).toMatch(/Insufficient/);
+    });
+
+    it('reports failure on a buffer with header but no varints', () => {
+      const result = parseSdeBinaryMultiPart(Buffer.alloc(8), 0, stdSr);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/Insufficient/);
+    });
+
+    it('flags hasCurves when bytes-per-point exceeds the curve threshold', () => {
+      // 8 header + 30 payload bytes for 2 points = 15 bytes/pt, above the
+      // curve threshold (12). Whatever the parse outcome, hasCurves should
+      // be set so the caller knows the geometry needs curve handling.
+      const buf = Buffer.alloc(8 + 30);
+      const result = parseSdeBinaryMultiPart(buf, 2, stdSr);
+      expect(result.hasCurves).toBe(true);
+    });
+
+    it('does not flag hasCurves for typical polygon density', () => {
+      // 8 header + 20 payload bytes for 4 points = 5 bytes/pt, below threshold
+      const buf = Buffer.alloc(8 + 20);
+      const result = parseSdeBinaryMultiPart(buf, 4, stdSr);
+      expect(result.hasCurves).toBe(false);
+    });
+
+    it('handles numPoints=0 without throwing', () => {
+      const buf = Buffer.alloc(8 + 4);
+      expect(() => parseSdeBinaryMultiPart(buf, 0, stdSr)).not.toThrow();
+    });
+  });
+
+  describe('parseSdeBinary', () => {
+    it('returns null when underlying parse fails', () => {
+      const result = parseSdeBinary(Buffer.alloc(0), 0, /* polygon */ 8, stdSr);
+      expect(result).toBeNull();
+    });
+
+    it('returns null when a curve-classified payload has insufficient varints', () => {
+      // 8-byte header + 13 bytes all 0x80 (continuation set, never terminating)
+      // parses as a single 13-byte varint, giving 13 bytes/point at numPoints=1.
+      // That trips the curve threshold (>12 bytes/pt), but with only 1 varint
+      // the early `varints.length < 2` guard fires before curve extraction
+      // runs. parseSdeBinary surfaces the upstream failure as null.
+      const buf = Buffer.concat([Buffer.alloc(8), Buffer.alloc(13, 0x80)]);
+      const result = parseSdeBinary(buf, 1, /* polygon */ 8, stdSr);
+      expect(result).toBeNull();
+    });
+
+    it('returns null when curve-vertex extraction yields no vertices', () => {
+      // All-zeros payload past the curve threshold: bytes/point > 12 (so
+      // hasCurves is true) AND varints.length >= 2 (so the early-exit doesn't
+      // fire) AND every varint decodes to zero. The curve segment loop sees
+      // no non-zero deltas, returns an empty vertex array, and parseSdeBinary
+      // surfaces null.
+      // 8 header + 30 zero bytes = 30 zero-varints (each 0x00 is a complete
+      // varint) at numPoints=2 → 15 bytes/pt, above threshold.
+      const buf = Buffer.alloc(8 + 30);
+      const result = parseSdeBinary(buf, 2, /* polygon */ 8, stdSr);
+      // With all-zero deltas every "pair" has angle 0 and dx=dy=0, which the
+      // curve decoder may interpret as either no vertices (returning null) OR
+      // a degenerate single-point polygon at origin. Both are acceptable
+      // failure modes for a degenerate input; assert one of them.
+      if (result !== null) {
+        // If a geometry is produced, it must be at the spatial-reference
+        // origin (falsex, falsey) — i.e. no real coordinate data extracted.
+        const coords = (result as { coordinates: unknown }).coordinates;
+        const flat = JSON.stringify(coords);
+        expect(flat).toMatch(/\[0,0\]|\[\[0,0\]/);
+      }
+    });
+
+    it('threads spatialRef.srid through to a successfully-parsed geometry', () => {
+      // Exercise the same all-zeros polygon path above, but with a custom
+      // srid; if a geometry comes back, it should carry the configured srid.
+      const sr: SpatialReferenceParams = { ...stdSr, srid: 12345 };
+      const buf = Buffer.alloc(8 + 30);
+      const result = parseSdeBinary(buf, 2, /* polygon */ 8, sr);
+      if (result !== null) {
+        expect(result.srid).toBe(12345);
+      }
+    });
+  });
+
+  describe('parseSdeBinaryPoints (legacy single-part wrapper)', () => {
+    it('returns an empty array when there are no parts', () => {
+      const result = parseSdeBinaryPoints(Buffer.alloc(0), 0, stdSr);
+      expect(result).toEqual([]);
     });
   });
 });

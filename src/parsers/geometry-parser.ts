@@ -606,8 +606,23 @@ export interface SdeBinaryParseResult {
   hasCurves: boolean;
   /** Number of parts detected */
   partCount: number;
-  /** Whether decoding was successful */
+  /**
+   * Whether decoding was successful.
+   *
+   * NOTE: `success: true` for curve geometries does not imply exact
+   * coordinates. The current curve decoder is empirically off by ~1.7% on
+   * the studied dataset (hundreds of feet at typical map scales). When the
+   * geometry contains curves AND parsing succeeded, `approximate` is set
+   * — consumers that need exact coordinates must check this flag and
+   * either reject or densify upstream.
+   */
   success: boolean;
+  /**
+   * True iff the returned coordinates are approximations rather than exact
+   * decodings. Currently set only for curve geometries (~1.7% error). Always
+   * undefined / false when `hasCurves` is false.
+   */
+  approximate?: boolean;
   /** Error message if parsing failed */
   error?: string;
 }
@@ -669,12 +684,15 @@ function sdeDecodeCurveVertices(varints: bigint[]): { x: bigint; y: bigint }[] {
         }
 
         if (pairs.length >= 2) {
-          // Pair 0 is the total chord - use its angle as reference
-          const baseAngle = pairs[0]!.angle;
+          // Pair 0 is the total chord - use its angle as reference.
+          // Optional-chain + ?? 0 is unreachable given the length guard above,
+          // but matches the project's anti-! posture.
+          const baseAngle = pairs[0]?.angle ?? 0;
 
           // Extract coordinate deltas (pairs with similar angle to chord)
           for (let p = 1; p < pairs.length; p++) {
-            const pair = pairs[p]!;
+            const pair = pairs[p];
+            if (pair === undefined) continue; // unreachable given loop bounds; matches anti-! posture
 
             // Skip metadata pairs: deltas with magnitude > 40 million storage units
             // are curve metadata (type indicators, flags), not coordinate deltas
@@ -897,11 +915,15 @@ export function parseSdeBinaryMultiPart(
 
     // Curve geometries are treated as single-part for now
     // TODO: Multi-part curve detection
+    // approximate: true because the curve decoder is empirically off by
+    // ~1.7% on the studied dataset. Consumers that need exact coordinates
+    // must reject or densify when this flag is set.
     return {
       parts: [realCoords],
       hasCurves: true,
       partCount: 1,
       success: true,
+      approximate: true,
     };
   }
 
@@ -974,13 +996,29 @@ export function parseSdeBinaryMultiPart(
  * - 1 = Point
  * - 2 = LineString/Polyline
  * - 3 = Polygon (simple, no multi-part)
- * - 4 = MultiPoint
+ * - 4 = MultiPoint (NOT YET HANDLED — falls through to the polygon branch)
  * - 6, 7 = LineString variants
  * - 8 = Polygon (may be simple or contain curves)
- * - 264 = Multi-part Polygon
+ * - 264 = Multi-part Polygon (= 8 | 256, where 256 is the "multi-part" bit)
  *
- * Note: Entity type 8 with high bytes-per-point ratio (~22 bytes/pt) indicates
- * curve/arc geometry which uses a different encoding not yet supported.
+ * KNOWN LIMITATIONS:
+ * - Polygons with holes are misclassified. Each part is treated as a separate
+ *   outer ring (MultiPolygon of overlapping outer rings) rather than
+ *   outer+inner rings of one Polygon. Spatial queries (containment, area)
+ *   over donut polygons will be incorrect.
+ * - Ring closure is not enforced. If SDEBINARY omits the closing point,
+ *   GeoJSON-strict consumers (turf.js, mapbox-gl) may reject the output.
+ * - Z and M coordinates are not handled; the parser returns 2D regardless.
+ * - Entity type 8 with high bytes-per-point ratio (~22 bytes/pt) indicates
+ *   curve/arc geometry. The current curve decoder returns coordinates with
+ *   ~1.7% error and sets `approximate: true` on the parse result.
+ * - Multi-part bit-flag handling is incomplete — only entityType === 264
+ *   triggers multi-part interpretation; other multi-part variants
+ *   (e.g. 2|256 = 258 for multi-linestring) are not detected.
+ *
+ * The function signature is provisional pending a real internal consumer.
+ * Callers should expect breaking changes to entity-type handling and the
+ * parts-shape return.
  */
 export function parseSdeBinary(
   pointsBuffer: Buffer,
