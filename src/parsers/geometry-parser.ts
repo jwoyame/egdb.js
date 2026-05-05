@@ -4,9 +4,9 @@
  * Converts WKB (Well-Known Binary) to our internal Geometry format.
  */
 
-import type { Geometry as InternalGeometry, GeometryType } from '../types';
-import type { Geometry as GeoJSONGeometry } from 'geojson';
-import { type Logger, consoleLogger } from '../logger';
+import type { Geometry as InternalGeometry, GeometryType } from "../types";
+import type { Geometry as GeoJSONGeometry } from "geojson";
+import { type Logger, consoleLogger } from "../logger";
 
 /**
  * Module-level logger used by the parser's "unsupported geometry" warnings.
@@ -69,7 +69,8 @@ export function parseWkb(wkb: Buffer, srid?: number): InternalGeometry | null {
   const hasEwkbSrid = (geomType & 0x20000000) !== 0;
   const baseType = geomType & 0xff;
   // EWKB Z flag OR ISO type 1xxx or 3xxx (odd thousands digit)
-  const hasZ = (geomType & 0x80000000) !== 0 || ((geomType / 1000) | 0) % 2 === 1;
+  const hasZ =
+    (geomType & 0x80000000) !== 0 || ((geomType / 1000) | 0) % 2 === 1;
   // EWKB M flag OR ISO type 2xxx or 3xxx (thousands digit >= 2)
   const hasM = (geomType & 0x40000000) !== 0 || ((geomType / 1000) | 0) >= 2;
 
@@ -88,15 +89,39 @@ export function parseWkb(wkb: Buffer, srid?: number): InternalGeometry | null {
     case 1: // Point
       return parsePoint(wkb, offset, isLittleEndian, coordDims, parsedSrid);
     case 2: // LineString
-      return parseLineString(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+      return parseLineString(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
     case 3: // Polygon
       return parsePolygon(wkb, offset, isLittleEndian, coordDims, parsedSrid);
     case 4: // MultiPoint
-      return parseMultiPoint(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+      return parseMultiPoint(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
     case 5: // MultiLineString
-      return parseMultiLineString(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+      return parseMultiLineString(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
     case 6: // MultiPolygon
-      return parseMultiPolygon(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+      return parseMultiPolygon(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
     case 7: // GeometryCollection
       return parseGeometryCollection(wkb, offset, isLittleEndian, parsedSrid);
     default:
@@ -105,11 +130,19 @@ export function parseWkb(wkb: Buffer, srid?: number): InternalGeometry | null {
   }
 }
 
-function readDouble(buf: Buffer, offset: number, littleEndian: boolean): number {
+function readDouble(
+  buf: Buffer,
+  offset: number,
+  littleEndian: boolean,
+): number {
   return littleEndian ? buf.readDoubleLE(offset) : buf.readDoubleBE(offset);
 }
 
-function readUInt32(buf: Buffer, offset: number, littleEndian: boolean): number {
+function readUInt32(
+  buf: Buffer,
+  offset: number,
+  littleEndian: boolean,
+): number {
   return littleEndian ? buf.readUInt32LE(offset) : buf.readUInt32BE(offset);
 }
 
@@ -117,7 +150,7 @@ function readCoordinate(
   buf: Buffer,
   offset: number,
   littleEndian: boolean,
-  dims: number
+  dims: number,
 ): { coord: number[]; newOffset: number } {
   const coord: number[] = [];
   for (let d = 0; d < dims; d++) {
@@ -131,12 +164,12 @@ function parsePoint(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): InternalGeometry {
   const { coord } = readCoordinate(wkb, offset, littleEndian, coordDims);
 
   return {
-    type: 'Point',
+    type: "Point",
     coordinates: coord.length === 2 ? coord : coord.slice(0, 2),
     srid,
   };
@@ -147,20 +180,25 @@ function parseLineString(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): InternalGeometry {
   const numPoints = readUInt32(wkb, offset, littleEndian);
   offset += 4;
 
   const coordinates: number[][] = [];
   for (let i = 0; i < numPoints; i++) {
-    const { coord, newOffset } = readCoordinate(wkb, offset, littleEndian, coordDims);
+    const { coord, newOffset } = readCoordinate(
+      wkb,
+      offset,
+      littleEndian,
+      coordDims,
+    );
     coordinates.push(coord.length === 2 ? coord : coord.slice(0, 2));
     offset = newOffset;
   }
 
   return {
-    type: 'LineString',
+    type: "LineString",
     coordinates,
     srid,
   };
@@ -171,7 +209,7 @@ function parsePolygon(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): InternalGeometry {
   const numRings = readUInt32(wkb, offset, littleEndian);
   offset += 4;
@@ -183,7 +221,12 @@ function parsePolygon(
 
     const ring: number[][] = [];
     for (let i = 0; i < numPoints; i++) {
-      const { coord, newOffset } = readCoordinate(wkb, offset, littleEndian, coordDims);
+      const { coord, newOffset } = readCoordinate(
+        wkb,
+        offset,
+        littleEndian,
+        coordDims,
+      );
       ring.push(coord.length === 2 ? coord : coord.slice(0, 2));
       offset = newOffset;
     }
@@ -191,7 +234,7 @@ function parsePolygon(
   }
 
   return {
-    type: 'Polygon',
+    type: "Polygon",
     coordinates,
     srid,
   };
@@ -202,7 +245,7 @@ function parseMultiPoint(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): InternalGeometry {
   const numPoints = readUInt32(wkb, offset, littleEndian);
   offset += 4;
@@ -211,13 +254,18 @@ function parseMultiPoint(
   for (let i = 0; i < numPoints; i++) {
     // Skip WKB header for each point (5 bytes: byte order + type)
     offset += 5;
-    const { coord, newOffset } = readCoordinate(wkb, offset, littleEndian, coordDims);
+    const { coord, newOffset } = readCoordinate(
+      wkb,
+      offset,
+      littleEndian,
+      coordDims,
+    );
     coordinates.push(coord.length === 2 ? coord : coord.slice(0, 2));
     offset = newOffset;
   }
 
   return {
-    type: 'MultiPoint',
+    type: "MultiPoint",
     coordinates,
     srid,
   };
@@ -228,7 +276,7 @@ function parseMultiLineString(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): InternalGeometry {
   const numLines = readUInt32(wkb, offset, littleEndian);
   offset += 4;
@@ -242,7 +290,12 @@ function parseMultiLineString(
 
     const line: number[][] = [];
     for (let i = 0; i < numPoints; i++) {
-      const { coord, newOffset } = readCoordinate(wkb, offset, littleEndian, coordDims);
+      const { coord, newOffset } = readCoordinate(
+        wkb,
+        offset,
+        littleEndian,
+        coordDims,
+      );
       line.push(coord.length === 2 ? coord : coord.slice(0, 2));
       offset = newOffset;
     }
@@ -250,7 +303,7 @@ function parseMultiLineString(
   }
 
   return {
-    type: 'MultiLineString',
+    type: "MultiLineString",
     coordinates,
     srid,
   };
@@ -261,7 +314,7 @@ function parseMultiPolygon(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): InternalGeometry {
   const numPolygons = readUInt32(wkb, offset, littleEndian);
   offset += 4;
@@ -280,7 +333,12 @@ function parseMultiPolygon(
 
       const ring: number[][] = [];
       for (let i = 0; i < numPoints; i++) {
-        const { coord, newOffset } = readCoordinate(wkb, offset, littleEndian, coordDims);
+        const { coord, newOffset } = readCoordinate(
+          wkb,
+          offset,
+          littleEndian,
+          coordDims,
+        );
         ring.push(coord.length === 2 ? coord : coord.slice(0, 2));
         offset = newOffset;
       }
@@ -290,7 +348,7 @@ function parseMultiPolygon(
   }
 
   return {
-    type: 'MultiPolygon',
+    type: "MultiPolygon",
     coordinates,
     srid,
   };
@@ -303,7 +361,7 @@ function parseMultiPolygon(
 function parseGeometryAtOffset(
   wkb: Buffer,
   offset: number,
-  srid?: number
+  srid?: number,
 ): { geometry: InternalGeometry | null; newOffset: number } {
   if (wkb.length < offset + 5) {
     return { geometry: null, newOffset: offset };
@@ -321,7 +379,8 @@ function parseGeometryAtOffset(
   // See parseWkb() for explanation of EWKB vs ISO WKB type encoding
   const hasEwkbSrid = (geomType & 0x20000000) !== 0;
   const baseType = geomType & 0xff;
-  const hasZ = (geomType & 0x80000000) !== 0 || ((geomType / 1000) | 0) % 2 === 1;
+  const hasZ =
+    (geomType & 0x80000000) !== 0 || ((geomType / 1000) | 0) % 2 === 1;
   const hasM = (geomType & 0x40000000) !== 0 || ((geomType / 1000) | 0) >= 2;
 
   let parsedSrid = srid;
@@ -335,38 +394,86 @@ function parseGeometryAtOffset(
   const coordDims = 2 + (hasZ ? 1 : 0) + (hasM ? 1 : 0);
 
   switch (baseType) {
-    case 1: { // Point
-      const geometry = parsePoint(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+    case 1: {
+      // Point
+      const geometry = parsePoint(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
       return { geometry, newOffset: offset + coordDims * 8 };
     }
-    case 2: { // LineString
+    case 2: {
+      // LineString
       const numPoints = readUInt32(wkb, offset, isLittleEndian);
-      const geometry = parseLineString(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+      const geometry = parseLineString(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
       return { geometry, newOffset: offset + 4 + numPoints * coordDims * 8 };
     }
-    case 3: { // Polygon
-      const result = parsePolygonWithOffset(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+    case 3: {
+      // Polygon
+      const result = parsePolygonWithOffset(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
       return result;
     }
-    case 4: { // MultiPoint
+    case 4: {
+      // MultiPoint
       const numPoints = readUInt32(wkb, offset, isLittleEndian);
       let newOffset = offset + 4;
       for (let i = 0; i < numPoints; i++) {
         newOffset += 5 + coordDims * 8; // header + point coords
       }
-      const geometry = parseMultiPoint(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+      const geometry = parseMultiPoint(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
       return { geometry, newOffset };
     }
-    case 5: { // MultiLineString
-      const result = parseMultiLineStringWithOffset(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+    case 5: {
+      // MultiLineString
+      const result = parseMultiLineStringWithOffset(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
       return result;
     }
-    case 6: { // MultiPolygon
-      const result = parseMultiPolygonWithOffset(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+    case 6: {
+      // MultiPolygon
+      const result = parseMultiPolygonWithOffset(
+        wkb,
+        offset,
+        isLittleEndian,
+        coordDims,
+        parsedSrid,
+      );
       return result;
     }
-    case 7: { // Nested GeometryCollection
-      const result = parseGeometryCollectionWithOffset(wkb, offset, isLittleEndian, parsedSrid);
+    case 7: {
+      // Nested GeometryCollection
+      const result = parseGeometryCollectionWithOffset(
+        wkb,
+        offset,
+        isLittleEndian,
+        parsedSrid,
+      );
       return result;
     }
     default:
@@ -380,7 +487,7 @@ function parsePolygonWithOffset(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): { geometry: InternalGeometry; newOffset: number } {
   const numRings = readUInt32(wkb, offset, littleEndian);
   let currentOffset = offset + 4;
@@ -392,7 +499,12 @@ function parsePolygonWithOffset(
 
     const ring: number[][] = [];
     for (let i = 0; i < numPoints; i++) {
-      const { coord, newOffset } = readCoordinate(wkb, currentOffset, littleEndian, coordDims);
+      const { coord, newOffset } = readCoordinate(
+        wkb,
+        currentOffset,
+        littleEndian,
+        coordDims,
+      );
       ring.push(coord.length === 2 ? coord : coord.slice(0, 2));
       currentOffset = newOffset;
     }
@@ -400,7 +512,7 @@ function parsePolygonWithOffset(
   }
 
   return {
-    geometry: { type: 'Polygon', coordinates, srid },
+    geometry: { type: "Polygon", coordinates, srid },
     newOffset: currentOffset,
   };
 }
@@ -410,7 +522,7 @@ function parseMultiLineStringWithOffset(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): { geometry: InternalGeometry; newOffset: number } {
   const numLines = readUInt32(wkb, offset, littleEndian);
   let currentOffset = offset + 4;
@@ -423,7 +535,12 @@ function parseMultiLineStringWithOffset(
 
     const line: number[][] = [];
     for (let i = 0; i < numPoints; i++) {
-      const { coord, newOffset } = readCoordinate(wkb, currentOffset, littleEndian, coordDims);
+      const { coord, newOffset } = readCoordinate(
+        wkb,
+        currentOffset,
+        littleEndian,
+        coordDims,
+      );
       line.push(coord.length === 2 ? coord : coord.slice(0, 2));
       currentOffset = newOffset;
     }
@@ -431,7 +548,7 @@ function parseMultiLineStringWithOffset(
   }
 
   return {
-    geometry: { type: 'MultiLineString', coordinates, srid },
+    geometry: { type: "MultiLineString", coordinates, srid },
     newOffset: currentOffset,
   };
 }
@@ -441,7 +558,7 @@ function parseMultiPolygonWithOffset(
   offset: number,
   littleEndian: boolean,
   coordDims: number,
-  srid?: number
+  srid?: number,
 ): { geometry: InternalGeometry; newOffset: number } {
   const numPolygons = readUInt32(wkb, offset, littleEndian);
   let currentOffset = offset + 4;
@@ -459,7 +576,12 @@ function parseMultiPolygonWithOffset(
 
       const ring: number[][] = [];
       for (let i = 0; i < numPoints; i++) {
-        const { coord, newOffset } = readCoordinate(wkb, currentOffset, littleEndian, coordDims);
+        const { coord, newOffset } = readCoordinate(
+          wkb,
+          currentOffset,
+          littleEndian,
+          coordDims,
+        );
         ring.push(coord.length === 2 ? coord : coord.slice(0, 2));
         currentOffset = newOffset;
       }
@@ -469,7 +591,7 @@ function parseMultiPolygonWithOffset(
   }
 
   return {
-    geometry: { type: 'MultiPolygon', coordinates, srid },
+    geometry: { type: "MultiPolygon", coordinates, srid },
     newOffset: currentOffset,
   };
 }
@@ -478,7 +600,7 @@ function parseGeometryCollectionWithOffset(
   wkb: Buffer,
   offset: number,
   littleEndian: boolean,
-  srid?: number
+  srid?: number,
 ): { geometry: InternalGeometry; newOffset: number } {
   const numGeometries = readUInt32(wkb, offset, littleEndian);
   let currentOffset = offset + 4;
@@ -493,7 +615,11 @@ function parseGeometryCollectionWithOffset(
   }
 
   return {
-    geometry: { type: 'GeometryCollection', geometries, srid } as InternalGeometry,
+    geometry: {
+      type: "GeometryCollection",
+      geometries,
+      srid,
+    } as InternalGeometry,
     newOffset: currentOffset,
   };
 }
@@ -502,9 +628,14 @@ function parseGeometryCollection(
   wkb: Buffer,
   offset: number,
   littleEndian: boolean,
-  srid?: number
+  srid?: number,
 ): InternalGeometry {
-  const { geometry } = parseGeometryCollectionWithOffset(wkb, offset, littleEndian, srid);
+  const { geometry } = parseGeometryCollectionWithOffset(
+    wkb,
+    offset,
+    littleEndian,
+    srid,
+  );
   return geometry;
 }
 
@@ -531,7 +662,10 @@ function parseGeometryCollection(
 /**
  * Read a LEB128 variable-length integer from a buffer
  */
-function readVarInt(buffer: Buffer, offset: number): { value: bigint; bytesRead: number } {
+function readVarInt(
+  buffer: Buffer,
+  offset: number,
+): { value: bigint; bytesRead: number } {
   let value = 0n;
   let shift = 0n;
   let bytesRead = 0;
@@ -584,515 +718,802 @@ export interface SpatialReferenceParams {
 }
 
 /**
- * Threshold for identifying absolute coordinates (vs deltas)
- * Values larger than this are likely absolute coordinates marking part boundaries
+ * Polygon envelope (bounding box) in real-world coordinates.
+ *
+ * Required for parsing multipart non-curved polygons (used for ring-boundary
+ * detection via the envelope test) and for locating the raw shape buffer in
+ * curved polygons (verified against the buffer's box at scan time).
  */
-const SDE_ABSOLUTE_COORD_THRESHOLD = 10000000n;
+export interface ParseEnvelope {
+  xMin: number;
+  yMin: number;
+  xMax: number;
+  yMax: number;
+}
 
 /**
- * Threshold for bytes-per-point ratio to detect curve geometries
- * Simple polygons: ~5-6 bytes/point
- * Curve polygons: ~20-25 bytes/point
+ * A curve segment modifier from the raw Extended Shape Buffer (Esri spec
+ * Table 3). Present only on curved polygons. Each modifier replaces the
+ * straight chord between source[startPointIndex] and source[startPointIndex+1]
+ * with a curved segment.
  */
-const SDE_CURVE_BYTES_PER_POINT_THRESHOLD = 12;
+export interface SegmentModifier {
+  startPointIndex: number;
+  /** 1 = circular arc, 3 = spiral, 4 = bezier, 5 = elliptic arc */
+  segmentType: number;
+  /** Arc center (segmentType=1, IsPoint=0) */
+  centerX?: number;
+  centerY?: number;
+  /** Arc start/central angles (segmentType=1, IsPoint=1) */
+  startAngle?: number;
+  centralAngle?: number;
+  /** Arc bit flags (segmentType=1) */
+  bits?: number;
+  isCCW?: boolean;
+  isMinor?: boolean;
+  isLine?: boolean;
+  isPoint?: boolean;
+  /** Bezier interior control points (segmentType=4) */
+  controlPoint1?: { x: number; y: number };
+  controlPoint2?: { x: number; y: number };
+  /** Elliptic arc parameters (segmentType=5) */
+  rotation?: number;
+  semiMajor?: number;
+  minorMajorRatio?: number;
+}
 
 /**
- * Result of parsing SDEBINARY - includes metadata about the parse
+ * Result of parsing SDEBINARY - includes metadata about the parse.
+ *
+ * For curved polygons, `parts` contains the source control points (not
+ * densified). The caller can densify the curves in the polygon by walking
+ * `curves` and replacing the chord between `source[startPointIndex]` and
+ * `source[startPointIndex+1]` with sampled points along the curve.
  */
 export interface SdeBinaryParseResult {
-  /** Parsed coordinate rings (for polygons) or coordinate arrays */
+  /** Parsed coordinate rings: outer array = parts/rings, inner = [x, y] pairs */
   parts: number[][][];
-  /** Whether this geometry contains curves/arcs (not fully decoded) */
+  /** Whether this geometry contains curves */
   hasCurves: boolean;
-  /** Number of parts detected */
+  /** Number of parts (rings) parsed */
   partCount: number;
-  /**
-   * Whether decoding was successful.
-   *
-   * NOTE: `success: true` for curve geometries does not imply exact
-   * coordinates. The current curve decoder is empirically off by ~1.7% on
-   * the studied dataset (hundreds of feet at typical map scales). When the
-   * geometry contains curves AND parsing succeeded, `approximate` is set
-   * — consumers that need exact coordinates must check this flag and
-   * either reject or densify upstream.
-   */
+  /** Curve segment modifiers (populated only when hasCurves and source data is from raw shape buffer) */
+  curves?: SegmentModifier[];
+  /** Whether decoding succeeded */
   success: boolean;
-  /**
-   * True iff the returned coordinates are approximations rather than exact
-   * decodings. Currently set only for curve geometries (~1.7% error). Always
-   * undefined / false when `hasCurves` is false.
-   */
-  approximate?: boolean;
   /** Error message if parsing failed */
   error?: string;
 }
 
 /**
- * Detect if SDEBINARY data contains curve/arc geometry based on data density
+ * Detect if SDEBINARY data contains curve geometry.
  *
- * @param pointsBuffer - Raw binary data
- * @param numPoints - Expected number of points
- * @returns true if this appears to be curve geometry
+ * Per Esri's ArcSDE 10.0 SDK docs, the 8-byte header has internal bitmask
+ * bytes after the length varint. The "has curves" flag for polygons appears
+ * in byte 5 with bit 0x08. Verified across 305 polygon layers in test data.
  */
-function sdeDetectCurveGeometry(pointsBuffer: Buffer, numPoints: number): boolean {
-  if (numPoints === 0) return false;
-  const bytesPerPoint = (pointsBuffer.length - 8) / numPoints; // Exclude 8-byte header
-  return bytesPerPoint > SDE_CURVE_BYTES_PER_POINT_THRESHOLD;
+function sdeDetectCurveGeometry(pointsBuffer: Buffer): boolean {
+  return pointsBuffer.length > 5 && (pointsBuffer[5]! & 0x08) !== 0;
+}
+
+// =============================================================================
+// SDEBINARY decoding — see SDE_CURVE_PARSING_FINDINGS.md for the full format
+// derivation. The short version:
+//
+//   Blob layout:
+//     bytes 0..7         8-byte header (length varint + internal bitmask bytes)
+//     bytes 8..N         varint coordinate stream (densified polygon)
+//     bytes N+1..end     raw Esri Extended Shape Buffer (curved polygons only)
+//
+//   Varint coordinate stream:
+//     - Total varints = 2 × numofpts (no marker varints).
+//     - First pair of every ring is sdeDecodeStorage-encoded (absolute).
+//     - All other pairs in the ring are sdeDecodeDelta-encoded.
+//     - Multipart polygons: each ring starts with another absolute pair.
+//     - Tiny rings ("stubs") may appear as 1-entry rings; these are SDE
+//       topology artifacts that the shapefile exporter collapses.
+//
+//   For curved polygons: the densified varint stream is approximate (curves
+//   become line segments). The raw shape buffer at the end of the blob
+//   contains the source control points + curve modifiers per Esri's spec
+//   (docs/extended_shape_buffer_format.pdf). Always prefer the raw buffer
+//   for curves.
+// =============================================================================
+
+interface RawShape {
+  shapeType: number;
+  basicType: number;
+  hasCurves: boolean;
+  hasZs: boolean;
+  hasMs: boolean;
+  numParts: number;
+  numPoints: number;
+  parts: number[];
+  points: { x: number; y: number }[];
+  numCurves: number;
+  curves: SegmentModifier[];
+}
+
+const ESRI_HAS_CURVES_FLAG = 0x20000000;
+const ESRI_HAS_ZS_FLAG = 0x80000000;
+const ESRI_HAS_MS_FLAG = 0x40000000;
+
+/**
+ * Locate Esri's raw uncompressed Extended Shape Buffer at the end of the
+ * SDEBINARY blob (curved polygons only). Returns the byte offset of the
+ * shape header, or -1 if not found.
+ *
+ * Strategy: scan for an offset where the next 4 bytes look like a valid
+ * ShapeType (basicType in {50..54}, middle bytes zero), the following 32
+ * bytes decode as a sane envelope matching the row's eminx/eminy/emaxx/emaxy,
+ * and the integer fields downstream (NumParts, NumPoints) are plausible.
+ */
+function findRawShapeBuffer(buf: Buffer, env: ParseEnvelope): number {
+  for (let off = 0; off + 44 <= buf.length; off++) {
+    const shapeType = buf.readUInt32LE(off);
+    const basicType = shapeType & 0xff;
+    if (basicType < 50 || basicType > 54) continue;
+    if ((shapeType & 0x00ffff00) !== 0) continue;
+
+    const xMin = buf.readDoubleLE(off + 4);
+    const yMin = buf.readDoubleLE(off + 12);
+    const xMax = buf.readDoubleLE(off + 20);
+    const yMax = buf.readDoubleLE(off + 28);
+    if (
+      !Number.isFinite(xMin) ||
+      !Number.isFinite(yMin) ||
+      !Number.isFinite(xMax) ||
+      !Number.isFinite(yMax)
+    )
+      continue;
+    if (xMin > xMax || yMin > yMax) continue;
+    if (Math.abs(xMin - env.xMin) > 1) continue;
+    if (Math.abs(yMin - env.yMin) > 1) continue;
+    if (Math.abs(xMax - env.xMax) > 1) continue;
+    if (Math.abs(yMax - env.yMax) > 1) continue;
+
+    const numParts = buf.readInt32LE(off + 36);
+    if (numParts < 1 || numParts > 1000) continue;
+    const numPoints = buf.readInt32LE(off + 40);
+    if (numPoints < 3 || numPoints > 1000000) continue;
+    if (off + 44 + 4 * numParts + 16 * numPoints > buf.length) continue;
+
+    return off;
+  }
+  return -1;
 }
 
 /**
- * Parse curve geometry by extracting curve vertices
- *
- * Curve geometries store segment-based data with zeros as separators.
- * Each segment contains:
- * - Pair 0: Total chord magnitude (SKIP - not a vertex)
- * - Pair 1+: Coordinate deltas with same angle as pair 0
- * - Perpendicular pairs: Curve shape parameters (skip for vertex extraction)
- *
- * VERIFIED: Pair 1 matches shapefile point with 1.7% error
- *
- * @param varints - All varints from the buffer (starting after header)
- * @returns Array of storage coordinates (curve vertices)
+ * Parse the raw Esri Extended Shape Buffer at the given offset into the blob.
+ * Layout per Esri spec Table 3 (`docs/extended_shape_buffer_format.pdf`).
  */
-function sdeDecodeCurveVertices(varints: bigint[]): { x: bigint; y: bigint }[] {
-  if (varints.length < 2) {
-    return [];
+function parseRawShape(buf: Buffer, startOff: number): RawShape | null {
+  let off = startOff;
+  if (off + 44 > buf.length) return null;
+
+  const shapeType = buf.readUInt32LE(off);
+  off += 4;
+  const basicType = shapeType & 0xff;
+  const hasCurves =
+    (shapeType & ESRI_HAS_CURVES_FLAG) !== 0 ||
+    ((basicType === 50 || basicType === 51) && (shapeType & 0xff000000) === 0);
+  const hasZs = (shapeType & ESRI_HAS_ZS_FLAG) !== 0;
+  const hasMs = (shapeType & ESRI_HAS_MS_FLAG) !== 0;
+
+  // Skip envelope (4 doubles, 32 bytes); already validated by findRawShapeBuffer.
+  off += 32;
+
+  const numParts = buf.readInt32LE(off);
+  off += 4;
+  const numPoints = buf.readInt32LE(off);
+  off += 4;
+
+  const parts: number[] = [];
+  for (let i = 0; i < numParts; i++) {
+    parts.push(buf.readInt32LE(off));
+    off += 4;
   }
 
-  // First coordinate is absolute
-  const firstX = sdeDecodeStorage(varints[0]!);
-  const firstY = sdeDecodeStorage(varints[1]!);
+  const points: { x: number; y: number }[] = [];
+  for (let i = 0; i < numPoints; i++) {
+    points.push({ x: buf.readDoubleLE(off), y: buf.readDoubleLE(off + 8) });
+    off += 16;
+  }
 
-  // Collect all coordinate deltas, then apply them cumulatively
-  // This approach is simpler and avoids tracking segment positions incorrectly
-  const deltas: { dx: bigint; dy: bigint }[] = [];
+  if (hasZs) off += 16 + 8 * numPoints;
+  if (hasMs) off += 16 + 8 * numPoints;
 
-  // Parse segments (separated by zeros)
-  let segStart = 2;
+  let numCurves = 0;
+  const curves: SegmentModifier[] = [];
+  if (hasCurves && off + 4 <= buf.length) {
+    numCurves = buf.readInt32LE(off);
+    off += 4;
+    for (let i = 0; i < numCurves; i++) {
+      if (off + 8 > buf.length) break;
+      const startPointIndex = buf.readInt32LE(off);
+      off += 4;
+      const segmentType = buf.readInt32LE(off);
+      off += 4;
+      const mod: SegmentModifier = { startPointIndex, segmentType };
 
-  for (let i = 2; i <= varints.length; i++) {
-    if (i === varints.length || varints[i] === 0n) {
-      if (i > segStart) {
-        const vals = varints.slice(segStart, i);
-
-        // Decode pairs in this segment
-        const pairs: { dx: bigint; dy: bigint; angle: number }[] = [];
-        for (let j = 0; j + 1 < vals.length; j += 2) {
-          const dx = sdeDecodeDelta(vals[j]!);
-          const dy = sdeDecodeDelta(vals[j + 1]!);
-          pairs.push({ dx, dy, angle: Math.atan2(Number(dy), Number(dx)) });
+      if (segmentType === 1) {
+        // Circular arc: 16 bytes (center or angles) + 4 bytes Bits
+        if (off + 20 > buf.length) break;
+        const f0 = buf.readDoubleLE(off);
+        const f1 = buf.readDoubleLE(off + 8);
+        const bits = buf.readInt32LE(off + 16);
+        off += 20;
+        mod.bits = bits;
+        mod.isCCW = (bits & 0x08) !== 0;
+        mod.isMinor = (bits & 0x10) !== 0;
+        mod.isLine = (bits & 0x20) !== 0;
+        mod.isPoint = (bits & 0x40) !== 0;
+        if (mod.isPoint) {
+          mod.startAngle = f0;
+          mod.centralAngle = f1;
+        } else {
+          mod.centerX = f0;
+          mod.centerY = f1;
         }
-
-        if (pairs.length >= 2) {
-          // Pair 0 is the total chord - use its angle as reference.
-          // Optional-chain + ?? 0 is unreachable given the length guard above,
-          // but matches the project's anti-! posture.
-          const baseAngle = pairs[0]?.angle ?? 0;
-
-          // Extract coordinate deltas (pairs with similar angle to chord)
-          for (let p = 1; p < pairs.length; p++) {
-            const pair = pairs[p];
-            if (pair === undefined) continue; // unreachable given loop bounds; matches anti-! posture
-
-            // Skip metadata pairs: deltas with magnitude > 40 million storage units
-            // are curve metadata (type indicators, flags), not coordinate deltas
-            // 40 million storage units = 10,000 feet at xyunits=4000 (~2 miles)
-            // This is generous - typical polygon segments are much smaller
-            const absDx = pair.dx < 0n ? -pair.dx : pair.dx;
-            const absDy = pair.dy < 0n ? -pair.dy : pair.dy;
-            if (absDx > 40000000n || absDy > 40000000n) {
-              continue;
-            }
-
-            const angleDiff = Math.abs(pair.angle - baseAngle);
-
-            // Same direction (within 45°) = coordinate delta
-            if (angleDiff < Math.PI / 4 || angleDiff > Math.PI * 7 / 4) {
-              deltas.push({ dx: pair.dx, dy: pair.dy });
-            }
-          }
-        }
+      } else if (segmentType === 4) {
+        // Bezier: 32 bytes (2 control points)
+        if (off + 32 > buf.length) break;
+        mod.controlPoint1 = {
+          x: buf.readDoubleLE(off),
+          y: buf.readDoubleLE(off + 8),
+        };
+        mod.controlPoint2 = {
+          x: buf.readDoubleLE(off + 16),
+          y: buf.readDoubleLE(off + 24),
+        };
+        off += 32;
+      } else if (segmentType === 5) {
+        // Elliptic arc: 44 bytes (center + rotation + semiMajor + ratio + bits)
+        if (off + 44 > buf.length) break;
+        mod.centerX = buf.readDoubleLE(off);
+        mod.centerY = buf.readDoubleLE(off + 8);
+        mod.rotation = buf.readDoubleLE(off + 16);
+        mod.semiMajor = buf.readDoubleLE(off + 24);
+        mod.minorMajorRatio = buf.readDoubleLE(off + 32);
+        mod.bits = buf.readInt32LE(off + 40);
+        off += 44;
+      } else {
+        // Spiral (3) or unknown — abort; we don't have a layout for these.
+        break;
       }
-      segStart = i + 1;
+
+      curves.push(mod);
     }
   }
 
-  // Build vertices by applying deltas cumulatively
-  const vertices: { x: bigint; y: bigint }[] = [{ x: firstX, y: firstY }];
-  let cx = firstX;
-  let cy = firstY;
-
-  for (const d of deltas) {
-    cx += d.dx;
-    cy += d.dy;
-    vertices.push({ x: cx, y: cy });
-  }
-
-  return vertices;
+  return {
+    shapeType,
+    basicType,
+    hasCurves,
+    hasZs,
+    hasMs,
+    numParts,
+    numPoints,
+    parts,
+    points,
+    numCurves,
+    curves,
+  };
 }
 
 /**
- * Parse a single part from varints starting at the given index
- *
- * @param varints - All varints from the buffer
- * @param startIdx - Starting index in varints array
- * @param numPoints - Number of points in this part
- * @returns Parsed storage coordinates and next varint index
+ * Read all varints from the blob's coordinate stream (after the 8-byte header)
+ * up to a maximum count.
  */
-function sdeDecodePart(
-  varints: bigint[],
-  startIdx: number,
-  numPoints: number
-): { coords: { x: bigint; y: bigint }[]; nextIdx: number } {
-  if (startIdx + 1 >= varints.length) {
-    return { coords: [], nextIdx: startIdx };
+function readVarints(
+  buf: Buffer,
+  maxVarints: number,
+): { value: bigint; bytesRead: number; byteOffset: number }[] {
+  const out: { value: bigint; bytesRead: number; byteOffset: number }[] = [];
+  let off = 8;
+  while (off < buf.length && out.length < maxVarints) {
+    const byteOffset = off;
+    const v = readVarInt(buf, off);
+    if (v.bytesRead === 0) break;
+    out.push({ value: v.value, bytesRead: v.bytesRead, byteOffset });
+    off += v.bytesRead;
   }
-
-  // First point uses absolute encoding
-  const firstX = sdeDecodeStorage(varints[startIdx]!);
-  const firstY = sdeDecodeStorage(varints[startIdx + 1]!);
-
-  // Decode deltas
-  const numDeltas = numPoints - 1;
-  const deltas: { dx: bigint; dy: bigint }[] = [];
-  for (let i = 0; i < numDeltas; i++) {
-    const idx = startIdx + 2 + i * 2;
-    if (idx + 1 >= varints.length) break;
-    deltas.push({
-      dx: sdeDecodeDelta(varints[idx]!),
-      dy: sdeDecodeDelta(varints[idx + 1]!),
-    });
-  }
-
-  // Reverse deltas for forward order
-  const forwardDeltas = deltas.slice().reverse();
-
-  // Reconstruct coordinates
-  const coords: { x: bigint; y: bigint }[] = [{ x: firstX, y: firstY }];
-  let cx = firstX;
-  let cy = firstY;
-  for (const d of forwardDeltas) {
-    cx += d.dx;
-    cy += d.dy;
-    coords.push({ x: cx, y: cy });
-  }
-
-  // Next index is after all varints for this part (abs + deltas)
-  const nextIdx = startIdx + 2 + numDeltas * 2;
-  return { coords, nextIdx };
+  return out;
 }
 
 /**
- * Detect part boundaries in multi-part geometry by finding large coordinate pairs
+ * Decode the varint coordinate stream of a non-curved polygon.
  *
- * Multi-part structure:
- * - Each part starts with absolute coordinates (large values)
- * - Each part ends with a closing point also stored as absolute coordinates
- * - Pattern: [abs_start, deltas..., abs_close?, abs_next_start, deltas...]
- *
- * When we see two consecutive large coordinate pairs:
- * - First pair = closing point of previous part
- * - Second pair = start of new part (this is the boundary)
- *
- * @param varints - All decoded varints
- * @returns Array of indices where new parts start (always includes 0)
+ * Single-ring (entity & 0x100 == 0): every pair after the first is a delta.
+ * Multipart (entity & 0x100 != 0): each ring starts with an absolute pair,
+ * detected via the envelope test (storage interpretation falls inside the
+ * polygon's envelope iff this is a ring start).
  */
-function sdeDetectPartBoundaries(varints: bigint[]): number[] {
-  const boundaries: number[] = [0];
+function decodeVarintStream(
+  buf: Buffer,
+  numofpts: number,
+  isMultipart: boolean,
+  envelope: ParseEnvelope,
+  spatialRef: SpatialReferenceParams,
+): number[][][] {
+  const { falsex, falsey, xyunits } = spatialRef;
+  const varints = readVarints(buf, 2 * numofpts);
+  if (varints.length < 2) return [];
 
-  // Find all large coordinate pairs
-  const largePairs: number[] = [];
-  for (let i = 0; i < varints.length - 1; i += 2) {
-    const decodedX = sdeDecodeStorage(varints[i]!);
-    const decodedY = sdeDecodeStorage(varints[i + 1]!);
-    if (decodedX > SDE_ABSOLUTE_COORD_THRESHOLD && decodedY > SDE_ABSOLUTE_COORD_THRESHOLD) {
-      largePairs.push(i);
+  const rings: number[][][] = [];
+  let cx = 0n,
+    cy = 0n;
+  let currentRing: number[][] = [];
+  let consumed = 0;
+
+  for (let i = 0; i + 1 < varints.length && consumed < numofpts; i += 2) {
+    const xv = varints[i]!;
+    const yv = varints[i + 1]!;
+
+    let isAbsolute = consumed === 0;
+    if (isMultipart && !isAbsolute) {
+      // Try the storage interpretation; if it lands inside the polygon's
+      // envelope, this is a ring start. If not, it's a delta.
+      const sx = sdeDecodeStorage(xv.value);
+      const sy = sdeDecodeStorage(yv.value);
+      const realX = Number(sx) / xyunits + falsex;
+      const realY = Number(sy) / xyunits + falsey;
+      isAbsolute =
+        realX >= envelope.xMin - 0.01 &&
+        realX <= envelope.xMax + 0.01 &&
+        realY >= envelope.yMin - 0.01 &&
+        realY <= envelope.yMax + 0.01;
     }
-  }
 
-  // Process large pairs to find actual part boundaries
-  // Skip index 0 (already in boundaries)
-  // When two large pairs are consecutive (differ by 2), the second is a boundary
-  for (let i = 1; i < largePairs.length; i++) {
-    const prev = largePairs[i - 1]!;
-    const curr = largePairs[i]!;
-
-    if (curr - prev === 2) {
-      // Consecutive large pairs: curr is the new part start
-      boundaries.push(curr);
-    } else if (i === largePairs.length - 1 || largePairs[i + 1]! - curr !== 2) {
-      // Isolated large pair (not followed by another large pair)
-      // This could be a single-part closing point at the end
-      // Only add as boundary if not the closing point of previous part
-      // Check if this is far enough from last boundary to be a real part
-      const lastBoundary = boundaries[boundaries.length - 1]!;
-      const varintsSinceLastBoundary = curr - lastBoundary;
-      // A real part should have at least a few points (6+ varints = 3+ points)
-      if (varintsSinceLastBoundary >= 6) {
-        boundaries.push(curr);
-      }
+    if (isAbsolute) {
+      if (currentRing.length > 0) rings.push(currentRing);
+      cx = sdeDecodeStorage(xv.value);
+      cy = sdeDecodeStorage(yv.value);
+      currentRing = [
+        [Number(cx) / xyunits + falsex, Number(cy) / xyunits + falsey],
+      ];
+    } else {
+      cx += sdeDecodeDelta(xv.value);
+      cy += sdeDecodeDelta(yv.value);
+      currentRing.push([
+        Number(cx) / xyunits + falsex,
+        Number(cy) / xyunits + falsey,
+      ]);
     }
+    consumed++;
   }
+  if (currentRing.length > 0) rings.push(currentRing);
 
-  return boundaries;
+  return rings;
 }
 
 /**
- * Parse SDEBINARY compressed geometry from f-table points column
+ * Drop "stub" rings: 1-entry rings produced by the SDE varint encoder for
+ * tiny degenerate features. These collapse out in the shapefile exporter and
+ * carry no meaningful geometry. Callers that want every entry SDE wrote can
+ * skip this filter.
+ */
+function dropStubRings(rings: number[][][]): number[][][] {
+  return rings.filter((r) => r.length >= 3);
+}
+
+/**
+ * Convert a parsed raw shape buffer into the SdeBinaryParseResult shape:
+ * one inner array per Parts[] entry, each containing the source control
+ * points (not densified) for that ring.
+ */
+function rawShapeToParts(shape: RawShape): number[][][] {
+  const parts: number[][][] = [];
+  for (let p = 0; p < shape.numParts; p++) {
+    const start = shape.parts[p]!;
+    const end = p + 1 < shape.numParts ? shape.parts[p + 1]! : shape.numPoints;
+    const ring: number[][] = [];
+    for (let i = start; i < end; i++) {
+      const pt = shape.points[i]!;
+      ring.push([pt.x, pt.y]);
+    }
+    parts.push(ring);
+  }
+  return parts;
+}
+
+/**
+ * Parse SDEBINARY compressed geometry from f-table points column.
  *
- * @param pointsBuffer - The binary points data from the f-table
- * @param numPoints - Number of points in the geometry
- * @param spatialRef - Spatial reference parameters for coordinate conversion
- * @returns Array of [x, y] coordinate pairs in real-world coordinates
+ * Returns the first ring as `[x, y]` pairs (legacy compat). Use
+ * `parseSdeBinaryMultiPart` for full multipart support.
+ *
+ * @param pointsBuffer - The points BLOB
+ * @param numPoints - The numofpts column value
+ * @param spatialRef - Spatial reference (falsex, falsey, xyunits)
+ * @param envelope - Polygon envelope from the row (eminx/eminy/emaxx/emaxy).
+ *                   Required for multipart and curved polygons; may be omitted
+ *                   for single-ring non-curved polygons.
  */
 export function parseSdeBinaryPoints(
   pointsBuffer: Buffer,
   numPoints: number,
-  spatialRef: SpatialReferenceParams
+  spatialRef: SpatialReferenceParams,
+  envelope?: ParseEnvelope,
 ): number[][] {
-  const result = parseSdeBinaryMultiPart(pointsBuffer, numPoints, spatialRef);
-  // Return first part for backwards compatibility
+  const result = parseSdeBinaryMultiPart(
+    pointsBuffer,
+    numPoints,
+    spatialRef,
+    envelope,
+  );
   return result.parts.length > 0 ? result.parts[0]! : [];
 }
 
 /**
- * Parse SDEBINARY with full support for multi-part geometries
+ * Parse SDEBINARY with full support for multipart polygons and curved geometry.
  *
- * @param pointsBuffer - The binary points data from the f-table
- * @param numPoints - Total number of points across all parts
- * @param spatialRef - Spatial reference parameters
- * @returns Parse result with all parts and metadata
+ * For curved polygons, returns the source control points (not densified) plus
+ * the parsed curve modifiers in `result.curves`. Densify externally if needed.
+ *
+ * @param pointsBuffer - The points BLOB
+ * @param numPoints - The numofpts column value
+ * @param spatialRef - Spatial reference (falsex, falsey, xyunits)
+ * @param envelope - Polygon envelope. Required when the blob contains
+ *                   curves OR when entity has the multipart bit (0x100). For
+ *                   simple single-ring polygons the envelope is unused but
+ *                   accepting it uniformly keeps the call site simple.
+ * @param entity - Optional entity column value. If provided, used to detect
+ *                 multipart (entity & 0x100). If omitted, we assume single-ring
+ *                 (which is correct for >99% of polygons in typical layers).
  */
 export function parseSdeBinaryMultiPart(
   pointsBuffer: Buffer,
   numPoints: number,
-  spatialRef: SpatialReferenceParams
+  spatialRef: SpatialReferenceParams,
+  envelope?: ParseEnvelope,
+  entity?: number,
 ): SdeBinaryParseResult {
-  const { falsex, falsey, xyunits } = spatialRef;
-
-  // Check for curve geometry
-  const hasCurves = sdeDetectCurveGeometry(pointsBuffer, numPoints);
-
-  // Read all varints
-  const varints: bigint[] = [];
-  let offset = 8;
-  while (offset < pointsBuffer.length) {
-    const v = readVarInt(pointsBuffer, offset);
-    if (v.bytesRead === 0) break;
-    varints.push(v.value);
-    offset += v.bytesRead;
-  }
-
-  if (varints.length < 2) {
+  if (pointsBuffer.length < 8 || numPoints < 1) {
     return {
       parts: [],
       hasCurves: false,
       partCount: 0,
       success: false,
-      error: 'Insufficient varint data',
+      error: "Insufficient buffer or zero points",
     };
   }
 
-  // Handle curve geometry using segment-based extraction
-  if (hasCurves) {
-    const curveVertices = sdeDecodeCurveVertices(varints);
+  const hasCurves = sdeDetectCurveGeometry(pointsBuffer);
 
-    if (curveVertices.length === 0) {
+  // Curved polygons: parse the raw shape buffer at the end of the blob.
+  // The varint stream is the densified approximation; the raw buffer holds
+  // the source control points + curve modifiers per Esri's spec.
+  if (hasCurves) {
+    if (!envelope) {
       return {
         parts: [],
         hasCurves: true,
         partCount: 0,
         success: false,
-        error: 'Failed to extract curve vertices',
+        error: "Curved polygon requires envelope to locate raw shape buffer",
       };
     }
-
-    // Convert to real coordinates
-    const realCoords: number[][] = curveVertices.map(({ x, y }) => [
-      Number(x) / xyunits + falsex,
-      Number(y) / xyunits + falsey,
-    ]);
-
-    // Curve geometries are treated as single-part for now
-    // TODO: Multi-part curve detection
-    // approximate: true because the curve decoder is empirically off by
-    // ~1.7% on the studied dataset. Consumers that need exact coordinates
-    // must reject or densify when this flag is set.
+    const rawOff = findRawShapeBuffer(pointsBuffer, envelope);
+    if (rawOff < 0) {
+      return {
+        parts: [],
+        hasCurves: true,
+        partCount: 0,
+        success: false,
+        error: "Curves flag set but raw shape buffer not located",
+      };
+    }
+    const shape = parseRawShape(pointsBuffer, rawOff);
+    if (!shape) {
+      return {
+        parts: [],
+        hasCurves: true,
+        partCount: 0,
+        success: false,
+        error: "Failed to parse raw shape buffer",
+      };
+    }
     return {
-      parts: [realCoords],
+      parts: rawShapeToParts(shape),
       hasCurves: true,
-      partCount: 1,
+      partCount: shape.numParts,
+      curves: shape.curves,
       success: true,
-      approximate: true,
     };
   }
 
-  // Detect part boundaries
-  const boundaries = sdeDetectPartBoundaries(varints);
-
-  // Calculate points per part based on varint distribution
-  // Each part has: 2 varints (abs) + 2*(numPts-1) varints (deltas)
-  // But may also have 2 varints for closing point (stored as absolute)
-  // So we need to check if the last 2 varints before next boundary are absolute
-  const partInfos: { startIdx: number; numPoints: number; hasClosingPoint: boolean }[] = [];
-
-  for (let i = 0; i < boundaries.length; i++) {
-    const startIdx = boundaries[i]!;
-    const endIdx = i + 1 < boundaries.length ? boundaries[i + 1]! : varints.length;
-    let numVarints = endIdx - startIdx;
-
-    // Check if this part has an explicit closing point (last 2 varints are large)
-    // This happens when there's a next boundary 2 positions after large coords
-    let hasClosingPoint = false;
-    if (i + 1 < boundaries.length && endIdx >= 2) {
-      const closingX = sdeDecodeStorage(varints[endIdx - 2]!);
-      const closingY = sdeDecodeStorage(varints[endIdx - 1]!);
-      if (closingX > SDE_ABSOLUTE_COORD_THRESHOLD && closingY > SDE_ABSOLUTE_COORD_THRESHOLD) {
-        // Last pair before next boundary is absolute - it's the closing point
-        hasClosingPoint = true;
-        numVarints -= 2; // Don't count closing point in point calculation
-      }
-    }
-
-    const partNumPoints = numVarints / 2;
-    partInfos.push({ startIdx, numPoints: partNumPoints, hasClosingPoint });
-  }
-
-  // Decode each part
-  const parts: number[][][] = [];
-
-  for (const partInfo of partInfos) {
-    const { coords } = sdeDecodePart(varints, partInfo.startIdx, partInfo.numPoints);
-
-    // Convert to real coordinates
-    const realCoords: number[][] = coords.map(({ x, y }) => [
-      Number(x) / xyunits + falsex,
-      Number(y) / xyunits + falsey,
-    ]);
-
-    if (realCoords.length > 0) {
-      parts.push(realCoords);
-    }
-  }
+  // Non-curved: decode the varint coordinate stream directly.
+  const isMultipart = (entity ?? 0) & 0x100 ? true : false;
+  const env: ParseEnvelope = envelope ?? {
+    xMin: -Infinity,
+    yMin: -Infinity,
+    xMax: Infinity,
+    yMax: Infinity,
+  };
+  const allRings = decodeVarintStream(
+    pointsBuffer,
+    numPoints,
+    isMultipart,
+    env,
+    spatialRef,
+  );
+  const rings = isMultipart ? dropStubRings(allRings) : allRings;
 
   return {
-    parts,
+    parts: rings,
     hasCurves: false,
-    partCount: parts.length,
-    success: parts.length > 0,
+    partCount: rings.length,
+    success: rings.length > 0,
   };
 }
 
 /**
- * Parse SDEBINARY geometry to our internal Geometry format
- *
- * @param pointsBuffer - The binary points data from the f-table
- * @param numPoints - Number of points in the geometry
- * @param entityType - Geometry entity type (from f-table entity column)
- * @param spatialRef - Spatial reference parameters
- * @returns Parsed geometry or null if parsing fails
+ * Parse SDEBINARY geometry to our internal Geometry format.
  *
  * Entity types in ArcSDE (observed):
- * - 1 = Point
- * - 2 = LineString/Polyline
- * - 3 = Polygon (simple, no multi-part)
- * - 4 = MultiPoint (NOT YET HANDLED — falls through to the polygon branch)
- * - 6, 7 = LineString variants
- * - 8 = Polygon (may be simple or contain curves)
- * - 264 = Multi-part Polygon (= 8 | 256, where 256 is the "multi-part" bit)
+ *   1   = Point
+ *   2   = LineString
+ *   3   = Polygon (simple)
+ *   6,7 = LineString variants
+ *   8   = Polygon (may contain curves; curves bit is in BLOB byte 5, not entity)
+ *   264 = Multipart Polygon (= 8 | 0x100, where 0x100 is the multipart bit)
  *
  * KNOWN LIMITATIONS:
- * - Polygons with holes are misclassified. Each part is treated as a separate
- *   outer ring (MultiPolygon of overlapping outer rings) rather than
- *   outer+inner rings of one Polygon. Spatial queries (containment, area)
- *   over donut polygons will be incorrect.
- * - Ring closure is not enforced. If SDEBINARY omits the closing point,
- *   GeoJSON-strict consumers (turf.js, mapbox-gl) may reject the output.
- * - Z and M coordinates are not handled; the parser returns 2D regardless.
- * - Entity type 8 with high bytes-per-point ratio (~22 bytes/pt) indicates
- *   curve/arc geometry. The current curve decoder returns coordinates with
- *   ~1.7% error and sets `approximate: true` on the parse result.
- * - Multi-part bit-flag handling is incomplete — only entityType === 264
- *   triggers multi-part interpretation; other multi-part variants
- *   (e.g. 2|256 = 258 for multi-linestring) are not detected.
+ * - Inner-ring (hole) detection is not implemented. Multipart polygons return
+ *   as MultiPolygon (each part = a separate outer ring). For polygons with
+ *   holes, callers must run their own ring-orientation analysis on the
+ *   returned parts.
+ * - Z and M coordinates are not handled; output is always 2D.
+ * - Curved polygons return source control points (not densified). Use the
+ *   `curves` field on `parseSdeBinaryMultiPart`'s result to densify externally.
  *
- * The function signature is provisional pending a real internal consumer.
- * Callers should expect breaking changes to entity-type handling and the
- * parts-shape return.
+ * @param pointsBuffer - Points BLOB from the f-table
+ * @param numPoints    - numofpts column value
+ * @param entityType   - entity column value
+ * @param spatialRef   - falsex/falsey/xyunits
+ * @param envelope     - eminx/eminy/emaxx/emaxy from the row. Required for
+ *                       multipart and curved polygons.
  */
 export function parseSdeBinary(
   pointsBuffer: Buffer,
   numPoints: number,
   entityType: number,
-  spatialRef: SpatialReferenceParams
+  spatialRef: SpatialReferenceParams,
+  envelope?: ParseEnvelope,
 ): InternalGeometry | null {
-  // Use multi-part parser for full support
-  const result = parseSdeBinaryMultiPart(pointsBuffer, numPoints, spatialRef);
-
+  const result = parseSdeBinaryMultiPart(
+    pointsBuffer,
+    numPoints,
+    spatialRef,
+    envelope,
+    entityType,
+  );
   if (!result.success) {
-    // If curve geometry, we can't decode it yet
-    if (result.hasCurves) {
-      parserLogger.warn(`SDEBINARY: ${result.error}`);
-    }
+    if (result.error) parserLogger.warn(`SDEBINARY: ${result.error}`);
     return null;
   }
 
   const { parts } = result;
+  if (parts.length === 0) return null;
 
-  if (parts.length === 0) {
-    return null;
-  }
+  const isMultiPart = parts.length > 1 || (entityType & 0x100) !== 0;
 
-  // Determine geometry type based on entity type and part count
-  const isMultiPart = parts.length > 1 || entityType === 264;
-
-  // Point
   if (entityType === 1) {
     const firstPart = parts[0]!;
-    if (firstPart.length > 0) {
-      return {
-        type: 'Point',
-        coordinates: firstPart[0]!,
-        srid: spatialRef.srid,
-      };
-    }
-    return null;
+    if (firstPart.length === 0) return null;
+    return { type: "Point", coordinates: firstPart[0]!, srid: spatialRef.srid };
   }
 
-  // LineString/Polyline
   if (entityType === 2 || entityType === 6 || entityType === 7) {
     if (isMultiPart) {
       return {
-        type: 'MultiLineString',
+        type: "MultiLineString",
         coordinates: parts,
         srid: spatialRef.srid,
       };
     }
     return {
-      type: 'LineString',
+      type: "LineString",
       coordinates: parts[0]!,
       srid: spatialRef.srid,
     };
   }
 
-  // Polygon types (3, 8, 264, and default)
   if (isMultiPart) {
-    // Multi-part polygon - each part is an outer ring
-    // Note: This treats each part as a separate polygon (MultiPolygon)
-    // For polygons with holes, rings would be in the same part array
     return {
-      type: 'MultiPolygon',
-      coordinates: parts.map(ring => [ring]),
+      type: "MultiPolygon",
+      coordinates: parts.map((ring) => [ring]),
       srid: spatialRef.srid,
     };
   }
 
-  // Single-part polygon
-  return {
-    type: 'Polygon',
-    coordinates: [parts[0]!],
-    srid: spatialRef.srid,
-  };
+  return { type: "Polygon", coordinates: [parts[0]!], srid: spatialRef.srid };
+}
+
+// =============================================================================
+// Curve densification — turn SegmentModifier records into sampled line segments
+//
+// `parseSdeBinaryMultiPart` returns the source control points (un-densified)
+// and the curve modifier records. To get GeoJSON-compatible polygons with
+// curves rendered as polylines, walk through the source points and replace
+// each chord that has an associated curve modifier with sampled points along
+// the curve. This is what `densifyCurves` does.
+// =============================================================================
+
+const TWO_PI = 2 * Math.PI;
+
+/**
+ * Sample points along a circular arc.
+ *
+ * Returns `segments + 1` points: start, intermediate samples, end.
+ *
+ * The arc goes from `start` to `end` around `(centerX, centerY)`. `isCCW`
+ * picks which of the two possible arcs to use (the counterclockwise or
+ * clockwise one). The IsMinor flag is redundant given start, end, center,
+ * and isCCW — we don't need it for densification.
+ */
+export function densifyArc(
+  start: readonly [number, number],
+  end: readonly [number, number],
+  centerX: number,
+  centerY: number,
+  isCCW: boolean,
+  segments = 32,
+): number[][] {
+  const startAngle = Math.atan2(start[1] - centerY, start[0] - centerX);
+  const endAngle = Math.atan2(end[1] - centerY, end[0] - centerX);
+
+  let sweep = endAngle - startAngle;
+  if (isCCW) {
+    // Counterclockwise: sweep is positive. If the raw difference is negative
+    // or zero, we need to wrap the long way around.
+    if (sweep <= 0) sweep += TWO_PI;
+  } else {
+    // Clockwise: sweep is negative. If the raw difference is positive or zero,
+    // wrap the long way the other direction.
+    if (sweep >= 0) sweep -= TWO_PI;
+  }
+
+  // Use the average of |start - center| and |end - center| as the radius.
+  // For a well-formed arc these are equal; averaging makes us robust to tiny
+  // numerical noise.
+  const r0 = Math.hypot(start[0] - centerX, start[1] - centerY);
+  const r1 = Math.hypot(end[0] - centerX, end[1] - centerY);
+  const radius = (r0 + r1) / 2;
+
+  const out: number[][] = [[start[0], start[1]]];
+  for (let i = 1; i < segments; i++) {
+    const angle = startAngle + (sweep * i) / segments;
+    out.push([centerX + radius * Math.cos(angle), centerY + radius * Math.sin(angle)]);
+  }
+  out.push([end[0], end[1]]);
+  return out;
+}
+
+/**
+ * Sample points along a cubic Bezier curve from `start` to `end` with two
+ * interior control points. Returns `segments + 1` points.
+ */
+export function densifyBezier(
+  start: readonly [number, number],
+  control1: readonly [number, number],
+  control2: readonly [number, number],
+  end: readonly [number, number],
+  segments = 32,
+): number[][] {
+  const out: number[][] = [];
+  for (let i = 0; i <= segments; i++) {
+    const t = i / segments;
+    const u = 1 - t;
+    const w0 = u * u * u;
+    const w1 = 3 * u * u * t;
+    const w2 = 3 * u * t * t;
+    const w3 = t * t * t;
+    out.push([
+      w0 * start[0] + w1 * control1[0] + w2 * control2[0] + w3 * end[0],
+      w0 * start[1] + w1 * control1[1] + w2 * control2[1] + w3 * end[1],
+    ]);
+  }
+  return out;
+}
+
+export interface DensifyOptions {
+  /** Segments to sample per curve (default 32) */
+  segmentsPerCurve?: number;
+}
+
+/**
+ * Densify a parsed curved polygon. Walks the source control points across
+ * all rings, and wherever a curve modifier attaches, replaces the chord
+ * with sampled curve points.
+ *
+ * `parts` is the per-ring source points returned by `parseSdeBinaryMultiPart`
+ * (when `hasCurves` is true). `curves` is the corresponding `result.curves`.
+ *
+ * Curve modifiers' `startPointIndex` is a global index into the concatenated
+ * point sequence across all rings (per Esri spec). This function reconstructs
+ * the (ring, local-index) mapping from the parts shape.
+ *
+ * Currently supports segmentType 1 (Arc) and 4 (Bezier). Other segment types
+ * (3 = Spiral, 5 = EllipticArc) fall through to the chord (no densification).
+ * Modifiers with `isLine` set are also left as straight chords per Esri spec.
+ */
+export function densifyCurves(
+  parts: number[][][],
+  curves: readonly SegmentModifier[],
+  options: DensifyOptions = {},
+): number[][][] {
+  const segmentsPerCurve = options.segmentsPerCurve ?? 32;
+  if (curves.length === 0) return parts.map((r) => r.map((p) => [...p]));
+
+  // Map global point index → SegmentModifier (the curve attached at that point).
+  const curveAt = new Map<number, SegmentModifier>();
+  for (const c of curves) curveAt.set(c.startPointIndex, c);
+
+  // Build per-ring start offsets so we can translate between global and local indices.
+  const ringStarts: number[] = [];
+  let total = 0;
+  for (const ring of parts) {
+    ringStarts.push(total);
+    total += ring.length;
+  }
+
+  const result: number[][][] = [];
+  for (let r = 0; r < parts.length; r++) {
+    const ring = parts[r]!;
+    const ringStart = ringStarts[r]!;
+    const newRing: number[][] = [];
+
+    for (let i = 0; i < ring.length; i++) {
+      const point = ring[i]!;
+      const globalIdx = ringStart + i;
+      const curve = curveAt.get(globalIdx);
+      const next = i + 1 < ring.length ? ring[i + 1]! : undefined;
+
+      // Always emit the current point.
+      newRing.push([point[0]!, point[1]!]);
+
+      if (!curve || !next) continue;
+      if (curve.isLine) continue;
+
+      let densified: number[][] | undefined;
+      if (
+        curve.segmentType === 1 &&
+        curve.centerX !== undefined &&
+        curve.centerY !== undefined &&
+        !curve.isPoint
+      ) {
+        densified = densifyArc(
+          [point[0]!, point[1]!],
+          [next[0]!, next[1]!],
+          curve.centerX,
+          curve.centerY,
+          curve.isCCW ?? false,
+          segmentsPerCurve,
+        );
+      } else if (curve.segmentType === 4 && curve.controlPoint1 && curve.controlPoint2) {
+        densified = densifyBezier(
+          [point[0]!, point[1]!],
+          [curve.controlPoint1.x, curve.controlPoint1.y],
+          [curve.controlPoint2.x, curve.controlPoint2.y],
+          [next[0]!, next[1]!],
+          segmentsPerCurve,
+        );
+      }
+
+      if (densified) {
+        // densified[0] === point (already pushed), densified[last] === next
+        // (will be pushed by the next loop iteration). Add the interior samples.
+        for (let j = 1; j < densified.length - 1; j++) {
+          newRing.push([densified[j]![0]!, densified[j]![1]!]);
+        }
+      }
+    }
+
+    result.push(newRing);
+  }
+  return result;
 }
 
 /**
@@ -1100,11 +1521,14 @@ export function parseSdeBinary(
  */
 export function geometryToGeoJSON(geometry: InternalGeometry): GeoJSONGeometry {
   // Handle GeometryCollection separately since it uses 'geometries' not 'coordinates'
-  if (geometry.type === 'GeometryCollection') {
-    const geomCollection = geometry as { type: 'GeometryCollection'; geometries: InternalGeometry[] };
+  if (geometry.type === "GeometryCollection") {
+    const geomCollection = geometry as {
+      type: "GeometryCollection";
+      geometries: InternalGeometry[];
+    };
     return {
-      type: 'GeometryCollection',
-      geometries: geomCollection.geometries.map(g => geometryToGeoJSON(g)),
+      type: "GeometryCollection",
+      geometries: geomCollection.geometries.map((g) => geometryToGeoJSON(g)),
     } as unknown as GeoJSONGeometry;
   }
 
