@@ -308,7 +308,7 @@ export class EnterpriseGeodatabase {
         description?: string;
         parent_name?: string;
         creation_time?: Date;
-        state_id?: number;
+        state_id?: number | bigint;
       }>(sql);
 
       return rows.map((row) => ({
@@ -317,7 +317,7 @@ export class EnterpriseGeodatabase {
         description: row.description,
         parentName: row.parent_name,
         createTime: row.creation_time,
-        stateId: row.state_id,
+        stateId: row.state_id != null ? Number(row.state_id) : undefined,
       }));
     } catch {
       // Not all geodatabases have versioning enabled
@@ -380,8 +380,8 @@ export class EnterpriseGeodatabase {
         ORDER BY sl.lineage_id
       `;
 
-    const rows = await this.connection.query<{ lineage_id: number }>(sql, [version.stateId]);
-    return rows.map(r => r.lineage_id);
+    const rows = await this.connection.query<{ lineage_id: number | bigint }>(sql, [version.stateId]);
+    return rows.map(r => Number(r.lineage_id));
   }
 
   /**
