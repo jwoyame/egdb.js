@@ -110,6 +110,15 @@ export class EnterpriseTable {
   }
 
   /**
+   * Whether the table's metadata advertises an OBJECTID column. Views
+   * may not have one; getFeature/getFeatures rely on it for the WHERE
+   * clause and surface a clear error when missing.
+   */
+  private hasObjectIdColumn(): boolean {
+    return !!this._metadata?.fields.some(f => f.name.toLowerCase() === 'objectid');
+  }
+
+  /**
    * Get fully qualified table name
    */
   private get qualifiedTableName(): string {
@@ -609,6 +618,9 @@ export class EnterpriseTable {
    * Get a single feature by ID
    */
   async getFeature(id: number): Promise<Feature | null> {
+    if (!this.hasObjectIdColumn()) {
+      throw new Error(`Table ${this.name} has no OBJECTID column; getFeature(id) is not supported. Use stream({ where: '...' }) to query by another key.`);
+    }
     const selectFields = this.buildSelectClause();
     const shapeField = this.tableInfo.shapeFieldName;
     const driver = this.connection.driver;
@@ -628,6 +640,9 @@ export class EnterpriseTable {
    */
   async getFeatures(ids: number[]): Promise<Feature[]> {
     if (ids.length === 0) return [];
+    if (!this.hasObjectIdColumn()) {
+      throw new Error(`Table ${this.name} has no OBJECTID column; getFeatures(ids) is not supported. Use stream({ where: '...' }) to query by another key.`);
+    }
 
     const selectFields = this.buildSelectClause();
     const shapeField = this.tableInfo.shapeFieldName;
@@ -755,6 +770,9 @@ export class EnterpriseTable {
     if (!this._metadata) {
       throw new Error('Metadata not loaded');
     }
+    if (this.tableInfo.readOnly) {
+      throw new Error(`Table ${this.name} is read-only (opened via openView); insert is not supported`);
+    }
 
     const driver = this.connection.driver;
     const shapeField = this.tableInfo.shapeFieldName;
@@ -849,6 +867,9 @@ export class EnterpriseTable {
     if (!this._metadata) {
       throw new Error('Metadata not loaded');
     }
+    if (this.tableInfo.readOnly) {
+      throw new Error(`Table ${this.name} is read-only (opened via openView); update is not supported`);
+    }
 
     const driver = this.connection.driver;
     const shapeField = this.tableInfo.shapeFieldName;
@@ -911,6 +932,9 @@ export class EnterpriseTable {
    * @returns true if deleted, false if not found
    */
   async delete(id: number): Promise<boolean> {
+    if (this.tableInfo.readOnly) {
+      throw new Error(`Table ${this.name} is read-only (opened via openView); delete is not supported`);
+    }
     const driver = this.connection.driver;
     const param = driver === 'sqlserver' ? '@p0' : '$1';
 
@@ -926,6 +950,9 @@ export class EnterpriseTable {
    * @returns Number of features deleted
    */
   async deleteMany(ids: number[]): Promise<number> {
+    if (this.tableInfo.readOnly) {
+      throw new Error(`Table ${this.name} is read-only (opened via openView); deleteMany is not supported`);
+    }
     if (ids.length === 0) return 0;
 
     const driver = this.connection.driver;

@@ -15,6 +15,7 @@ import { parseGdbItems } from './parsers/gdb-items-parser';
 import type { GdbItemRow } from './parsers/gdb-items-parser';
 import type {
   ConnectionConfig,
+  GeometryType,
   TableInfo,
   VersionInfo,
   ReconcileOptions,
@@ -271,6 +272,89 @@ export class EnterpriseGeodatabase {
       : undefined;
 
     return EnterpriseTable.open(this.connection, tableInfo, getStateLineage, setVersion);
+  }
+
+  /**
+   * Open a SQL view as a read-only EnterpriseTable. Views are not
+   * registered in `sde.GDB_ITEMS` / `sde.SDE_table_registry`, so
+   * `openTable` can't find them. Callers identify the view by
+   * schema-qualified name and supply the geometry column (since views
+   * don't carry SDE shape-column metadata).
+   *
+   * Returned handle is read-only: insert/update/delete throw rather
+   * than issuing SQL. Writes against an updatable view would silently
+   * bypass A/D tables, version bookkeeping, and editor tracking - a
+   * footgun avoided by refusing them at the library layer.
+   *
+   * @param qualifiedName Exactly two parts joined by a single dot:
+   *   `"<schema>.<name>"` (e.g. `"pa.CAMASALESview"`). Three-part
+   *   `db.schema.name` and bare names are rejected. **Postgres folds
+   *   unquoted identifiers to lower case** at create time, so a view
+   *   created as `MySchema.MyView` lives as `myschema.myview` - pass
+   *   the lower-cased form to `openView`.
+   * @param opts.shapeFieldName Geometry column name on the view (e.g.
+   *   `"Shape"`, `"shape"`). Omit for non-spatial views.
+   * @param opts.geometryType Optional ArcGIS geometry-type hint for
+   *   downstream consumers.
+   */
+  async openView(
+    qualifiedName: string,
+    opts: { shapeFieldName?: string; geometryType?: GeometryType } = {},
+  ): Promise<EnterpriseTable> {
+    const parts = qualifiedName.split('.');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) {
+      throw new Error(
+        `openView: expected exactly two-part name "<schema>.<name>", got "${qualifiedName}". `
+        + 'Three-part db.schema.name and bare names are not accepted.',
+      );
+    }
+    const [schema, name] = parts as [string, string];
+
+    // Existence check up front so the caller gets a clear error rather
+    // than an opaque COUNT(*) failure later inside loadMetadata().
+    const driver = this.config.driver;
+    const exists = await this.viewOrTableExists(driver === 'sqlserver' ? 'sqlserver' : 'postgres', schema, name);
+    if (!exists) {
+      throw new Error(`openView: view not found: ${schema}.${name}`);
+    }
+
+    // physicalName mirrors openTable's per-driver convention: SQL
+    // Server stores db.schema.name, Postgres stores schema.name. Not
+    // load-bearing here (no GDB_ITEMS lookup will succeed for a view),
+    // but consistent with the rest of the codebase.
+    const physicalName = driver === 'sqlserver'
+      ? `${this.config.database}.${schema}.${name}`
+      : `${schema}.${name}`;
+
+    const tableInfo: TableInfo = {
+      name,
+      physicalName,
+      schema,
+      isFeatureClass: !!opts.shapeFieldName,
+      shapeFieldName: opts.shapeFieldName,
+      geometryType: opts.geometryType,
+      isVersioned: false,
+      readOnly: true,
+    };
+    return EnterpriseTable.open(this.connection, tableInfo);
+  }
+
+  /**
+   * Existence probe for openView. Looks in INFORMATION_SCHEMA on both
+   * engines so we don't depend on SDE catalog rows that views lack.
+   */
+  private async viewOrTableExists(
+    driver: 'sqlserver' | 'postgres',
+    schema: string,
+    name: string,
+  ): Promise<boolean> {
+    const sql = driver === 'sqlserver'
+      ? `SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.VIEWS
+         WHERE TABLE_SCHEMA = @p0 AND TABLE_NAME = @p1`
+      : `SELECT COUNT(*) AS "n" FROM information_schema.views
+         WHERE table_schema = $1 AND table_name = $2`;
+    const rows = await this.connection.query<{ n: number | string }>(sql, [schema, name]);
+    return Number(rows[0]?.n ?? 0) > 0;
   }
 
   /**

@@ -88,6 +88,11 @@ export interface TableInfo {
   isVersioned?: boolean;
   /** Enterprise versioned view name (e.g., "pa.TableName_evw") if one exists */
   evwViewName?: string;
+  /** Read-only handle: writes (insert/update/delete) refuse instead of
+   * issuing SQL. Set by openView() since SQL views are read-only by
+   * contract here, and writes against an updatable view would silently
+   * bypass A/D tables, version bookkeeping, and editor tracking. */
+  readOnly?: boolean;
 }
 
 /** Field definition */
