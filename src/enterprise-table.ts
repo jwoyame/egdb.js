@@ -38,6 +38,65 @@ type StateLineageGetter = (versionName: string) => Promise<number[] | null>;
 /** Function type for setting version context */
 type VersionSetter = (versionName: string) => Promise<void>;
 
+// SDE-internal columns that appear in INFORMATION_SCHEMA but should
+// never be exposed as feature attributes. Definition XML omits them
+// for the same reason; we filter them at merge time so the
+// INFORMATION_SCHEMA augmentation doesn't reintroduce them.
+//
+//   sde_state_id        - versioning state pointer, only meaningful
+//                         to SDE itself
+//   gdb_geomattr_data   - varbinary side-table that ArcGIS uses for
+//                         supplemental geometry attributes (curves,
+//                         z/m where the WKT path doesn't carry them);
+//                         not a logical attribute of the row
+const SDE_INTERNAL_COLUMNS = new Set(['sde_state_id', 'gdb_geomattr_data']);
+
+/**
+ * Merge two field lists. The Definition XML in `sde.GDB_ITEMS` is rich
+ * (alias, domain, length, etc.) but frozen at SDE-registration time;
+ * any column added by `ALTER TABLE ... ADD COLUMN` after registration
+ * is invisible there. INFORMATION_SCHEMA.COLUMNS reflects the live
+ * schema. Trust XML where it has a field (richer metadata); for
+ * columns INFORMATION_SCHEMA reports but XML doesn't, append them as
+ * INFORMATION_SCHEMA-derived `FieldDefinition`s.
+ *
+ * Excluded from the result:
+ *   - the geometry column (`shapeFieldName`) - egdb.js exposes
+ *     geometry through `feature.geometry`, not via the field list.
+ *   - SDE-internal columns (`sde_state_id`, `gdb_geomattr_data`) -
+ *     present in INFORMATION_SCHEMA but never logical attributes.
+ *
+ * Exported for unit testing.
+ */
+export function mergeFieldDefinitions(
+  xml: FieldDefinition[],
+  live: FieldDefinition[],
+  shapeFieldName: string | undefined,
+): FieldDefinition[] {
+  const isShape = (name: string) =>
+    !!shapeFieldName && name.toLowerCase() === shapeFieldName.toLowerCase();
+  const isSdeInternal = (name: string) =>
+    SDE_INTERNAL_COLUMNS.has(name.toLowerCase());
+  const drop = (name: string) => isShape(name) || isSdeInternal(name);
+
+  // Single pass: emit the XML fields in order and remember their lower-
+  // cased names for membership lookup; then append any
+  // INFORMATION_SCHEMA-only columns at the end (ordinal order).
+  const out: FieldDefinition[] = [];
+  const xmlNamesLower = new Set<string>();
+  for (const f of xml) {
+    if (drop(f.name)) continue;
+    out.push(f);
+    xmlNamesLower.add(f.name.toLowerCase());
+  }
+  for (const f of live) {
+    if (drop(f.name)) continue;
+    if (xmlNamesLower.has(f.name.toLowerCase())) continue;
+    out.push(f);
+  }
+  return out;
+}
+
 export class EnterpriseTable {
   private connection: IDatabaseConnection;
   private tableInfo: TableInfo;
@@ -126,7 +185,24 @@ export class EnterpriseTable {
   }
 
   /**
-   * Load table metadata from GDB_ITEMS Definition XML
+   * Load table metadata. Builds the field list from the union of two
+   * sources:
+   *
+   *   - Definition XML in `sde.GDB_ITEMS`: rich field metadata (alias,
+   *     domain, geometry type, etc.) frozen at the moment the table
+   *     was SDE-registered. Authoritative for what the SDE catalog
+   *     thinks exists.
+   *   - INFORMATION_SCHEMA.COLUMNS: authoritative for what currently
+   *     exists in the table. Reflects post-registration `ALTER TABLE
+   *     ... ADD COLUMN` additions that the Definition XML never knew
+   *     about.
+   *
+   * Strategy: trust XML where it has a field, trust INFORMATION_SCHEMA
+   * for the rest. Without this union, columns added after SDE
+   * registration silently disappear from `feature.attributes` - we hit
+   * this on Putnam where `pa.TAXPARCEL.LOWPARCELID` and
+   * `pa.TAXPARCELLINES.Deed_Dimension` were added later and were
+   * dropping out of stream() output.
    */
   private async loadMetadata(): Promise<void> {
     // Get Definition XML from GDB_ITEMS
@@ -139,22 +215,48 @@ export class EnterpriseTable {
       DatasetSubtype1: number;
     }>(sql, [this.tableInfo.physicalName]);
 
-    let fields: FieldDefinition[] = [];
+    let xmlFields: FieldDefinition[] = [];
     let geometryType = this.tableInfo.geometryType;
 
     if (rows.length > 0 && rows[0]?.Definition) {
       const parsed = parseDefinitionXml(rows[0].Definition);
-      fields = parsed.fields;
+      xmlFields = parsed.fields;
       // Use geometry type from Definition XML if available (more accurate)
       if (parsed.geometryType) {
         geometryType = parsed.geometryType;
       }
     }
 
-    // Fallback to INFORMATION_SCHEMA if no fields from Definition XML
-    if (fields.length === 0) {
-      fields = await this.getFieldsFromSchema();
+    // INFORMATION_SCHEMA augmentation, three cases:
+    //
+    //   - non-versioned table with XML: union XML + INFORMATION_SCHEMA
+    //     so post-registration `ALTER TABLE ADD COLUMN` additions
+    //     appear in `feature.attributes`. (This is the bug we're
+    //     fixing: cf. pa.TAXPARCEL.LOWPARCELID, pa.TAXPARCELLINES
+    //     .Deed_Dimension on Putnam.)
+    //
+    //   - versioned table with XML: **skip** the union. ArcGIS does
+    //     not propagate post-registration columns to the SDE-managed
+    //     A/D delta tables or to `*_evw` views; injecting those
+    //     columns into `_metadata.fields` would cause
+    //     `buildVersionedQuery` and `buildEvwQuery` to emit SELECTs
+    //     referencing columns that don't exist on the versioned read
+    //     paths. Versioned tables stay XML-only; post-registration
+    //     additions on versioned tables require re-registration to
+    //     appear in feature attributes.
+    //
+    //   - no XML at all (e.g. SQL view opened via openView()):
+    //     INFORMATION_SCHEMA is the only source. Use it wholesale.
+    //     This is also a quiet behavior change vs the previous
+    //     fallback path: SDE-internal columns
+    //     (`gdb_geomattr_data`, `sde_state_id`) are now filtered
+    //     where the prior fallback would have surfaced them.
+    let liveFields: FieldDefinition[] = [];
+    if (xmlFields.length === 0 || !this.tableInfo.isVersioned) {
+      liveFields = await this.getFieldsFromSchema();
     }
+
+    const fields = mergeFieldDefinitions(xmlFields, liveFields, this.tableInfo.shapeFieldName);
 
     // Get feature count
     const countSql = `SELECT COUNT(*) as cnt FROM ${this.qualifiedTableName}`;
@@ -270,7 +372,12 @@ export class EnterpriseTable {
       // Exclude computed columns (contain parentheses or dots followed by function names)
       if (name.includes('(') || name.includes(')')) return false;
       if (/\.\w+\(/.test(name)) return false;
-      // Exclude SDE_STATE_ID - only present in A tables, not base tables
+      // Belt-and-suspenders: SDE-internal columns (sde_state_id,
+      // gdb_geomattr_data) are also filtered by mergeFieldDefinitions
+      // so they should never reach _metadata.fields. Kept here in case
+      // a future code path constructs the field list bypassing the
+      // merge - sde_state_id in particular only exists on A tables and
+      // would error against the base table.
       if (name.toLowerCase() === 'sde_state_id') return false;
       return true;
     };
