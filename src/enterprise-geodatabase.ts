@@ -828,20 +828,54 @@ export class EnterpriseGeodatabase {
       };
     }
 
-    // 6. Apply parent changes to child version
-    const { appliedCount, mergedCount } = await applyParentChanges(
-      this.connection,
-      versionedTables,
-      parentChanges,
-      conflicts,
-      version.stateId,
-      opts
-    );
+    // 6 + 7. Apply parent changes and extend the child's lineage inside
+    // a transaction so a mid-apply failure cannot leave the version
+    // half-reconciled (some A/D writes succeeded, lineage not extended,
+    // no rollback). Skip the wrap when the caller already started a
+    // transaction so we don't try to nest one — same shape as the
+    // existing `transaction()` helper.
+    // Capture narrowed values before the closure: TypeScript's narrowing
+    // from the early `!version.stateId` guard does not cross into nested
+    // arrow functions.
+    const childStateId = version.stateId;
+    const childLineageName = childStateId; // Lineage name equals current state_id
 
-    // 7. Update child's lineage to include parent's states
-    // This marks the reconcile as complete
-    const childLineageName = version.stateId; // Lineage name equals current state_id
-    await addStatesToLineage(this.connection, childLineageName, parentOnlyStates);
+    const runApply = async () => {
+      const result = await applyParentChanges(
+        this.connection,
+        versionedTables,
+        parentChanges,
+        conflicts,
+        childStateId,
+        opts
+      );
+      await addStatesToLineage(this.connection, childLineageName, parentOnlyStates);
+      return result;
+    };
+
+    let appliedCount: number;
+    let mergedCount: number;
+    if (this.connection.inTransaction()) {
+      const r = await runApply();
+      appliedCount = r.appliedCount;
+      mergedCount = r.mergedCount;
+    } else {
+      await this.connection.beginTransaction();
+      try {
+        const r = await runApply();
+        appliedCount = r.appliedCount;
+        mergedCount = r.mergedCount;
+        await this.connection.commitTransaction();
+      } catch (error) {
+        try {
+          await this.connection.rollbackTransaction();
+        } catch (rollbackError) {
+          // Surface the original cause but log the rollback failure too.
+          console.error('reconcile rollback failed:', rollbackError);
+        }
+        throw error;
+      }
+    }
 
     return {
       hasConflicts: summary.totalConflicts > 0,
