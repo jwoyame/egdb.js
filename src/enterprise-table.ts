@@ -765,6 +765,70 @@ export class EnterpriseTable {
   }
 
   /**
+   * Read a feature as it appeared at or before a specific ancestor
+   * state. Looks up the most recent A-table row whose SDE_STATE_ID is
+   * in the supplied state list; falls back to the base table when no
+   * A-table row matches.
+   *
+   * Useful for "before/after" displays: pass the common ancestor and
+   * the list of states from there back through the version's lineage
+   * to recover the pre-edit snapshot of a feature that was later
+   * updated or deleted.
+   *
+   * @param objectId OBJECTID to look up.
+   * @param ancestorStateId Ancestor state ID. A-table rows in states
+   *   strictly greater than this are ignored.
+   * @param stateIds All state IDs back through the lineage. Only those
+   *   <= ancestorStateId are scanned.
+   */
+  async readFeatureAtState(
+    objectId: number,
+    ancestorStateId: number,
+    stateIds: number[],
+  ): Promise<Feature | null> {
+    if (!this.hasObjectIdColumn()) {
+      throw new Error(
+        `Table ${this.name} has no OBJECTID column; readFeatureAtState is not supported.`,
+      );
+    }
+    const regId = this.tableInfo.registrationId;
+    if (!regId) {
+      throw new Error(`Table ${this.name} is not registered (no registrationId)`);
+    }
+
+    const driver = this.connection.driver;
+    const selectFields = this.buildSelectClause();
+    const shapeField = this.tableInfo.shapeFieldName;
+
+    // First, look for an A-table row at or before the ancestor state.
+    // Take the most recent one so updates that happened along the
+    // lineage are respected.
+    const statesUpToAncestor = stateIds.filter(s => s <= ancestorStateId);
+    if (statesUpToAncestor.length > 0) {
+      const stateList = statesUpToAncestor.join(',');
+      const schema = this.quoteId(this.tableInfo.schema);
+      const aTable = `${schema}.${this.quoteId(`a${regId}`)}`;
+      const oidCol = this.quoteId('OBJECTID');
+      const stateCol = this.quoteId('SDE_STATE_ID');
+      const param = driver === 'sqlserver' ? '@p0' : '$1';
+
+      const sql = driver === 'sqlserver'
+        ? `SELECT TOP 1 ${selectFields} FROM ${aTable} WHERE ${oidCol} = ${param} AND ${stateCol} IN (${stateList}) ORDER BY ${stateCol} DESC`
+        : `SELECT ${selectFields} FROM ${aTable} WHERE ${oidCol} = ${param} AND ${stateCol} IN (${stateList}) ORDER BY ${stateCol} DESC LIMIT 1`;
+
+      const rows = await this.connection.query<Record<string, unknown>>(sql, [objectId]);
+      if (rows.length > 0) {
+        return this.rowToFeature(rows[0]!, shapeField);
+      }
+    }
+
+    // Fall back to the base table. getFeature uses the same select
+    // clause and parsing pipeline so the returned shape stays
+    // consistent with the A-table path.
+    return this.getFeature(objectId);
+  }
+
+  /**
    * Count features (optionally with WHERE clause)
    */
   async count(where?: string): Promise<number> {
