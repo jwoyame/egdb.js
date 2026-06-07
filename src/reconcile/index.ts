@@ -22,7 +22,13 @@ export {
 export {
   getTableChanges,
   getAllChanges,
+  getAllChangedFeatures,
   getChangesSummary,
+} from './get-changes';
+export type {
+  ChangedFeatureRecord,
+  ChangedFeaturesResult,
+  FeatureReader,
 } from './get-changes';
 
 // Row data reading

@@ -65,6 +65,7 @@ export {
   findCommonAncestor,
   getStatesInRange,
   getAllChanges,
+  getAllChangedFeatures,
   getChangesSummary,
   detectConflicts,
   detectDetailedConflicts,
@@ -75,7 +76,12 @@ export {
   cleanupStaleLocks,
   InsufficientPrivilegeError,
 } from './reconcile';
-export type { StaleLockCleanupResult } from './reconcile';
+export type {
+  StaleLockCleanupResult,
+  ChangedFeatureRecord,
+  ChangedFeaturesResult,
+  FeatureReader,
+} from './reconcile';
 
 // Unified geodatabase access (works with both gdb.js and egdb.js)
 export {

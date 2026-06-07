@@ -3,7 +3,7 @@
  */
 
 import type { IDatabaseConnection } from '../connections/connection';
-import type { TableInfo, FeatureChange, VersionChanges } from '../types';
+import type { TableInfo, FeatureChange, VersionChanges, Feature } from '../types';
 
 /**
  * Quote an identifier based on database driver.
@@ -140,6 +140,153 @@ export async function getAllChanges(
   }
 
   return allChanges;
+}
+
+/**
+ * A change paired with the parsed feature row in the version's view.
+ * `feature` is null for deletes (the row no longer exists in the
+ * version view) and for any row that could not be fetched from the
+ * view (e.g. the version moved past the change in a concurrent
+ * reconcile). Callers that need the pre-delete or pre-update snapshot
+ * should pair this with a "read feature at state" helper.
+ */
+export interface ChangedFeatureRecord {
+  table: string;
+  registrationId: number;
+  objectId: number;
+  stateId: number;
+  changeType: 'insert' | 'update' | 'delete';
+  feature: Feature | null;
+}
+
+export interface ChangedFeaturesResult {
+  inserts: ChangedFeatureRecord[];
+  updates: ChangedFeatureRecord[];
+  deletes: ChangedFeatureRecord[];
+}
+
+/**
+ * A subset of EnterpriseTable that this helper needs. Declared as a
+ * minimal interface so callers can pass either a real EnterpriseTable
+ * or a test stub without dragging the whole class type in.
+ */
+export interface FeatureReader {
+  stream(options: { version?: string; where?: string }): AsyncIterable<Feature>;
+}
+
+/**
+ * Get every change across all versioned tables AND the parsed feature
+ * row for inserts and updates, in one batched query per table.
+ *
+ * This is the feature-paired sibling of `getAllChanges`. Today's
+ * `getAllChanges` returns OID/stateId/changeType metadata only, which
+ * leaves callers doing one stream() call per change to hydrate the
+ * geometry and attributes. For typical "show the user what they
+ * changed" use cases that is N+1 queries per table. This helper
+ * collapses them into one IN-list query per affected table.
+ *
+ * `versionName` is the view to read inserts/updates from. Pass the
+ * child version's qualified name to get the post-edit rows. Pass the
+ * parent's name to get a best-effort pre-delete snapshot for deletes
+ * (the row will appear in the parent view as long as the parent has
+ * not moved past the common ancestor for that row).
+ *
+ * Deletes return `feature: null` by design; the post-edit row does not
+ * exist in the version view. Callers that want the pre-delete snapshot
+ * should issue a second call with `versionName` set to the parent.
+ *
+ * @param connection Database connection (used only by `getAllChanges`
+ *   to detect changes; the feature reads go through `openTable`).
+ * @param openTable Resolver that returns a FeatureReader for a table
+ *   name. Typically `(name) => gdb.openTable(name)`.
+ * @param versionName Qualified version name whose view we read from.
+ * @param tables All tables in the geodatabase. Non-versioned tables
+ *   are skipped.
+ * @param stateIds State IDs to check for changes.
+ */
+export async function getAllChangedFeatures(
+  connection: IDatabaseConnection,
+  openTable: (name: string) => Promise<FeatureReader>,
+  versionName: string,
+  tables: TableInfo[],
+  stateIds: number[]
+): Promise<ChangedFeaturesResult> {
+  const base = await getAllChanges(connection, tables, stateIds);
+
+  const result: ChangedFeaturesResult = { inserts: [], updates: [], deletes: [] };
+
+  // Group inserts and updates by table so we issue one IN-list query
+  // per table instead of one per row. Deletes do not need a fetch.
+  type PerTable = { inserts: FeatureChange[]; updates: FeatureChange[] };
+  const byTable = new Map<string, PerTable>();
+  for (const c of base.inserts) {
+    let entry = byTable.get(c.table);
+    if (!entry) { entry = { inserts: [], updates: [] }; byTable.set(c.table, entry); }
+    entry.inserts.push(c);
+  }
+  for (const c of base.updates) {
+    let entry = byTable.get(c.table);
+    if (!entry) { entry = { inserts: [], updates: [] }; byTable.set(c.table, entry); }
+    entry.updates.push(c);
+  }
+
+  // Run one query per table to fetch every changed row at once. The
+  // versioned view stream returns the row at the current state, which
+  // is the post-edit snapshot for inserts and updates.
+  const featureByKey = new Map<string, Feature>();
+  for (const [tableName, entry] of byTable) {
+    const oids = uniqueOids([...entry.inserts, ...entry.updates]);
+    if (oids.length === 0) continue;
+    const table = await openTable(tableName);
+    for await (const f of table.stream({
+      version: versionName,
+      where: `OBJECTID IN (${oids.join(',')})`,
+    })) {
+      featureByKey.set(`${tableName}:${f.id}`, f);
+    }
+  }
+
+  const lookup = (table: string, objectId: number): Feature | null =>
+    featureByKey.get(`${table}:${objectId}`) ?? null;
+
+  for (const c of base.inserts) {
+    result.inserts.push({
+      table: c.table,
+      registrationId: c.registrationId,
+      objectId: c.objectId,
+      stateId: c.stateId,
+      changeType: 'insert',
+      feature: lookup(c.table, c.objectId),
+    });
+  }
+  for (const c of base.updates) {
+    result.updates.push({
+      table: c.table,
+      registrationId: c.registrationId,
+      objectId: c.objectId,
+      stateId: c.stateId,
+      changeType: 'update',
+      feature: lookup(c.table, c.objectId),
+    });
+  }
+  for (const c of base.deletes) {
+    result.deletes.push({
+      table: c.table,
+      registrationId: c.registrationId,
+      objectId: c.objectId,
+      stateId: c.stateId,
+      changeType: 'delete',
+      feature: null,
+    });
+  }
+
+  return result;
+}
+
+function uniqueOids(changes: FeatureChange[]): number[] {
+  const set = new Set<number>();
+  for (const c of changes) set.add(c.objectId);
+  return [...set];
 }
 
 /**
