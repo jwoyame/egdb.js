@@ -247,7 +247,18 @@ export async function applyParentChanges(
       // Handle conflict
       let resolution: ConflictResolution;
 
-      if (autoMerge && conflict.autoMergeable) {
+      if (options.resolveConflictAuthoritative) {
+        // Callback-first mode: the caller's resolveConflict is the
+        // single decision point for every conflict, including auto-
+        // mergeable ones. Without a callback this option is a
+        // misconfiguration because there is no resolution policy.
+        if (!options.resolveConflict) {
+          throw new Error(
+            'resolveConflictAuthoritative requires a resolveConflict callback'
+          );
+        }
+        resolution = await options.resolveConflict(conflict);
+      } else if (autoMerge && conflict.autoMergeable) {
         resolution = 'merge';
       } else if (options.resolveConflict) {
         resolution = await options.resolveConflict(conflict);
@@ -264,9 +275,15 @@ export async function applyParentChanges(
         await removeFromDTable(connection, tableInfo, change.objectId, childStateId);
         // Then apply parent's change (fall through to below)
       } else if (resolution === 'merge') {
-        // Get merged values
+        // Get merged values. In authoritative mode the caller's
+        // getMergedValues wins over the conflict's suggestedMerge, so
+        // a caller that wants to override an auto-mergeable suggestion
+        // can do so. In the default mode the suggestedMerge wins to
+        // preserve existing behaviour.
         let mergedValues: Record<string, unknown>;
-        if (conflict.suggestedMerge) {
+        if (options.resolveConflictAuthoritative && options.getMergedValues) {
+          mergedValues = await options.getMergedValues(conflict);
+        } else if (conflict.suggestedMerge) {
           mergedValues = conflict.suggestedMerge;
         } else if (options.getMergedValues) {
           mergedValues = await options.getMergedValues(conflict);

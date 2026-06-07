@@ -368,6 +368,25 @@ export interface ReconcileOptions {
   resolveConflict?: ConflictResolver;
   /** Provide merged values when resolution is 'merge' */
   getMergedValues?: MergeValueProvider;
+  /**
+   * When true, `resolveConflict` is consulted FIRST for every conflict,
+   * including auto-mergeable ones, and `getMergedValues` is consulted
+   * BEFORE the conflict's `suggestedMerge`. This lets callers that gate
+   * every conflict through a callback (validate-then-apply patterns)
+   * stay in full control.
+   *
+   * Default false to preserve existing behaviour: with `autoMerge: true`
+   * the auto-mergeable rows short-circuit to a merge using
+   * `suggestedMerge`, and `getMergedValues` is only consulted when no
+   * `suggestedMerge` exists on the conflict.
+   *
+   * When true:
+   *   - `resolveConflict` must be supplied. If not, applyParentChanges
+   *     throws on the first conflict.
+   *   - `autoMerge` is ignored for any conflict the callback handles.
+   *   - `getMergedValues` (when present) wins over `suggestedMerge`.
+   */
+  resolveConflictAuthoritative?: boolean;
 }
 
 /** Reconcile result */
