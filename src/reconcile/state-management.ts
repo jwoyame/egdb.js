@@ -134,12 +134,15 @@ export async function acquireStateLock(
   const driver = connection.driver;
   const sdeId = await getConnectionSdeId(connection);
 
+  // `autolock` is a NOT NULL column in some SDE schema versions (no
+  // default). Always emit 'N' (manual lock) so the INSERT works on
+  // every variant we have seen.
   const sql =
     driver === 'sqlserver'
-      ? `INSERT INTO sde.SDE_state_locks (sde_id, state_id, lock_type, lock_time)
-         VALUES (@p0, @p1, 'E', GETDATE())`
-      : `INSERT INTO sde.sde_state_locks (sde_id, state_id, lock_type, lock_time)
-         VALUES ($1, $2, 'E', now())`;
+      ? `INSERT INTO sde.SDE_state_locks (sde_id, state_id, lock_type, autolock, lock_time)
+         VALUES (@p0, @p1, 'E', 'N', GETDATE())`
+      : `INSERT INTO sde.sde_state_locks (sde_id, state_id, lock_type, autolock, lock_time)
+         VALUES ($1, $2, 'E', 'N', now())`;
 
   await connection.execute(sql, [sdeId, stateId]);
   return sdeId;
