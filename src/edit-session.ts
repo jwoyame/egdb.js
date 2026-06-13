@@ -11,6 +11,7 @@ import type { IDatabaseConnection } from './connections/connection';
 import type { EnterpriseGeodatabase } from './enterprise-geodatabase';
 import { EnterpriseTable } from './enterprise-table';
 import { geometryToWkt, isValidGeometry } from './parsers/geometry-writer';
+import { FieldType } from './types';
 import type { Feature, Geometry, VersionInfo, TableInfo } from './types';
 import { validatePositiveInteger } from './utils/sql-helpers';
 import { requireRegistrationId } from './utils/guards';
@@ -77,6 +78,19 @@ interface EditOperation {
  * await session.close();
  * ```
  */
+
+function findAttrCaseInsensitive(
+  attributes: Record<string, unknown> | Partial<Record<string, unknown>>,
+  fieldName: string
+): unknown {
+  if (fieldName in attributes) return (attributes as Record<string, unknown>)[fieldName];
+  const lower = fieldName.toLowerCase();
+  for (const key of Object.keys(attributes)) {
+    if (key.toLowerCase() === lower) return (attributes as Record<string, unknown>)[key];
+  }
+  return undefined;
+}
+
 export class EditSession {
   private geodatabase: EnterpriseGeodatabase;
   private connection: IDatabaseConnection;
@@ -356,12 +370,12 @@ export class EditSession {
 
     for (const field of writableFields) {
       const value = feature.attributes[field.name];
-      if (value !== undefined) {
-        columns.push(this.quoteId(field.name));
-        params.push(driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`);
-        values.push(value);
-        paramIndex++;
-      }
+      if (value === undefined) continue;
+      if (value === null && field.type === FieldType.BLOB) continue;
+      columns.push(this.quoteId(field.name));
+      params.push(driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`);
+      values.push(value);
+      paramIndex++;
     }
 
     // Handle geometry
@@ -448,12 +462,18 @@ export class EditSession {
     const setClauses: string[] = [];
     const values: unknown[] = [];
     let paramIndex = 0;
+    const fieldByName = new Map(table.metadata.fields.map(f => [f.name.toLowerCase(), f]));
 
     for (const [key, value] of Object.entries(attributes)) {
       // Skip OBJECTID, GLOBALID, SDE_STATE_ID and geometry (handled separately)
       const keyLower = key.toLowerCase();
       if (keyLower === 'objectid' || keyLower === 'globalid' || keyLower === 'sde_state_id') continue;
       if (shapeField && keyLower === shapeField.toLowerCase()) continue;
+
+      if (value === null && fieldByName.get(keyLower)?.type === FieldType.BLOB) {
+        setClauses.push(`${this.quoteId(key)} = NULL`);
+        continue;
+      }
 
       setClauses.push(
         `${this.quoteId(key)} = ${driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`}`
@@ -462,9 +482,11 @@ export class EditSession {
       paramIndex++;
     }
 
-    // Handle geometry update if present
-    if (shapeField && attributes[shapeField]) {
-      const geometry = attributes[shapeField] as Geometry;
+    // Handle geometry update if present. Lookup is case-insensitive so callers
+    // can pass SHAPE/Shape/shape without knowing the on-disk column casing.
+    const shapeAttrValue = shapeField ? findAttrCaseInsensitive(attributes, shapeField) : undefined;
+    if (shapeField && shapeAttrValue) {
+      const geometry = shapeAttrValue as Geometry;
       if (isValidGeometry(geometry)) {
         const srid = options?.srid ?? geometry.srid ?? 0;
         const wkt = geometryToWkt(geometry);
@@ -611,16 +633,21 @@ export class EditSession {
 
     for (const field of writableFields) {
       const value = mergedAttributes[field.name];
-      if (value !== undefined) {
-        columns.push(this.quoteId(field.name));
-        params.push(driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`);
-        values.push(value);
-        paramIndex++;
-      }
+      if (value === undefined) continue;
+      // BLOB nulls would bind as nvarchar and fail varbinary(max) coercion - let the column default to NULL.
+      if (value === null && field.type === FieldType.BLOB) continue;
+      columns.push(this.quoteId(field.name));
+      params.push(driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`);
+      values.push(value);
+      paramIndex++;
     }
 
-    // Handle geometry (use updated or existing)
-    const geometry = attributes[shapeField!] as Geometry | undefined ?? current.geometry;
+    // Handle geometry (use updated or existing). Case-insensitive lookup so
+    // a caller passing SHAPE for column Shape still overrides current.geometry.
+    const shapeOverride = shapeField
+      ? (findAttrCaseInsensitive(attributes, shapeField) as Geometry | undefined)
+      : undefined;
+    const geometry = shapeOverride ?? current.geometry;
     if (shapeField && geometry && isValidGeometry(geometry)) {
       const srid = options?.srid ?? geometry.srid ?? 0;
       const wkt = geometryToWkt(geometry);
@@ -1223,12 +1250,12 @@ export class EditSession {
 
     for (const field of writableFields) {
       const value = attributes[field.name];
-      if (value !== undefined) {
-        columns.push(this.quoteId(field.name));
-        params.push(driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`);
-        values.push(value);
-        paramIndex++;
-      }
+      if (value === undefined) continue;
+      if (value === null && field.type === FieldType.BLOB) continue;
+      columns.push(this.quoteId(field.name));
+      params.push(driver === 'sqlserver' ? `@p${paramIndex}` : `$${paramIndex + 1}`);
+      values.push(value);
+      paramIndex++;
     }
 
     // Handle geometry
