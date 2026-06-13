@@ -62,12 +62,13 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     // Use cursor for streaming
     const client = await this.pool.connect();
 
+    const cursorName = `egdb_cursor_${Date.now()}`;
+    let cursorOpen = false;
+    let exhausted = false;
     try {
-      // Use a cursor name based on timestamp to avoid conflicts
-      const cursorName = `egdb_cursor_${Date.now()}`;
-
       await client.query('BEGIN');
       await client.query(`DECLARE ${cursorName} CURSOR FOR ${pgQuery}`, params);
+      cursorOpen = true;
 
       const batchSize = 100;
 
@@ -75,6 +76,7 @@ export class PostgreSQLConnection implements IDatabaseConnection {
         const result = await client.query(`FETCH ${batchSize} FROM ${cursorName}`);
 
         if (result.rows.length === 0) {
+          exhausted = true;
           break;
         }
 
@@ -84,8 +86,22 @@ export class PostgreSQLConnection implements IDatabaseConnection {
       }
 
       await client.query(`CLOSE ${cursorName}`);
+      cursorOpen = false;
       await client.query('COMMIT');
     } finally {
+      // If the consumer broke out early (return/throw mid-stream), the cursor
+      // and transaction are still open on this client. Close the cursor and
+      // ROLLBACK before release - leaving the client dirty would poison the
+      // pool and a follow-up rollback on the outer connection would surface
+      // weird state.
+      if (!exhausted) {
+        try {
+          if (cursorOpen) await client.query(`CLOSE ${cursorName}`);
+          await client.query('ROLLBACK');
+        } catch {
+          // Best-effort cleanup; ignore.
+        }
+      }
       client.release();
     }
   }

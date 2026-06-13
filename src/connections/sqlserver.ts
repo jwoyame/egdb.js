@@ -80,6 +80,7 @@ export class SqlServerConnection implements IDatabaseConnection {
     const queue: QueueItem[] = [];
     let resolveWait: (() => void) | null = null;
     let waitPromise: Promise<void> | null = null;
+    let streamFinished = false;
 
     const push = (item: QueueItem) => {
       queue.push(item);
@@ -95,38 +96,54 @@ export class SqlServerConnection implements IDatabaseConnection {
     });
 
     request.on('error', (err: Error) => {
+      streamFinished = true;
       push({ type: 'error', error: err });
     });
 
     request.on('done', () => {
+      streamFinished = true;
       push({ type: 'done' });
     });
 
     // Start the query
     request.query(sqlQuery);
 
-    // Yield results as they come
-    while (true) {
-      if (queue.length === 0) {
-        // Wait for more items
-        waitPromise = new Promise<void>((resolve) => {
-          resolveWait = resolve;
+    try {
+      // Yield results as they come
+      while (true) {
+        if (queue.length === 0) {
+          // Wait for more items
+          waitPromise = new Promise<void>((resolve) => {
+            resolveWait = resolve;
+          });
+          await waitPromise;
+        }
+
+        const item = queue.shift();
+        if (!item) continue;
+
+        if (item.type === 'error') {
+          throw item.error;
+        }
+
+        if (item.type === 'done') {
+          return;
+        }
+
+        yield item.value;
+      }
+    } finally {
+      // If the consumer broke out early (return/throw mid-stream), the
+      // underlying TDS request is still busy. A follow-up statement on
+      // the same connection (e.g. transaction.rollback() after an apply
+      // throws) would queue behind it and hang forever. Wait for done/error
+      // before returning so the connection is idle for the next caller.
+      if (!streamFinished) {
+        await new Promise<void>((resolve) => {
+          request.once('done', () => resolve());
+          request.once('error', () => resolve());
         });
-        await waitPromise;
       }
-
-      const item = queue.shift();
-      if (!item) continue;
-
-      if (item.type === 'error') {
-        throw item.error;
-      }
-
-      if (item.type === 'done') {
-        return;
-      }
-
-      yield item.value;
     }
   }
 
