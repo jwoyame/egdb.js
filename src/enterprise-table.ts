@@ -646,20 +646,35 @@ export class EnterpriseTable {
 
     let sql: string;
 
+    // Spatial predicate (envelope / geometry intersects, etc). It references
+    // the shape column, which exists on the base table, the evw view, and the
+    // A/D delta tables alike - so it MUST be applied to versioned reads too,
+    // not just the non-versioned path. Otherwise a versioned bbox query drops
+    // the spatial filter and returns unfiltered rows up to the limit.
+    const spatialClause = options ? this.buildSpatialClause(options) : null;
+
+    // Caller's attribute WHERE combined with the spatial predicate.
+    // WARNING: options.where is embedded directly - vulnerable to SQL
+    // injection. In production use parameterized queries.
+    const combinedWhere = [options?.where, spatialClause]
+      .filter((c): c is string => !!c)
+      .map(c => `(${c})`)
+      .join(' AND ') || undefined;
+
     // Check if this is a versioned query
     if (options?.version && this.tableInfo.isVersioned) {
       // Prefer using enterprise versioned view (*_evw) if available
       if (this.tableInfo.evwViewName && this.setVersionContext) {
         // Set version context for the session, then query the evw view
         await this.setVersionContext(options.version);
-        sql = this.buildEvwQuery(options.where, options.outFields);
+        sql = this.buildEvwQuery(combinedWhere, options.outFields);
       } else if (this.tableInfo.registrationId && this.getStateLineage) {
         // Fall back to manual UNION query using A/D tables
         const stateIds = await this.getStateLineage(options.version);
         if (!stateIds || stateIds.length === 0) {
           throw new Error(`Version not found or has no state lineage: ${options.version}`);
         }
-        sql = this.buildVersionedQuery(stateIds, options.where, options.outFields);
+        sql = this.buildVersionedQuery(stateIds, combinedWhere, options.outFields);
       } else {
         throw new Error(`Cannot query version: table ${this.name} missing evw view and state lineage`);
       }
@@ -674,24 +689,8 @@ export class EnterpriseTable {
       }
 
       sql = `SELECT ${selectFields} FROM ${this.qualifiedTableName}`;
-
-      // Build WHERE clause combining attribute and spatial filters
-      const whereParts: string[] = [];
-
-      if (options?.where) {
-        // WARNING: This is vulnerable to SQL injection!
-        // In production, use parameterized queries with a proper query builder
-        whereParts.push(`(${options.where})`);
-      }
-
-      // Add spatial filter
-      const spatialClause = options ? this.buildSpatialClause(options) : null;
-      if (spatialClause) {
-        whereParts.push(`(${spatialClause})`);
-      }
-
-      if (whereParts.length > 0) {
-        sql += ` WHERE ${whereParts.join(' AND ')}`;
+      if (combinedWhere) {
+        sql += ` WHERE ${combinedWhere}`;
       }
     }
 
