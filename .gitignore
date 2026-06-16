@@ -46,3 +46,6 @@ docker/sqlserver/backup/*.sql
 docker/sqlserver/backup/*.sql.gz
 docker/sqlserver/backup/*.bak
 docker/sqlserver/backup/*.log
+
+# Temporary EC2 documentation (contains credentials)
+TEMP_EC2_ENVIRONMENT.md
