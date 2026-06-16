@@ -17,6 +17,23 @@ function quoteId(driver: 'sqlserver' | 'postgresql', name: string): string {
  * Check if a child version has been reconciled with its parent.
  * The child's lineage must include the parent's current state.
  *
+ * Semantics (CONFIRMED 2026-06-15):
+ *   "Reconciled" here means "parentStateId has been added to the child's
+ *   closure under the child's lineage_name." This is the same closure-
+ *   table lookup used by `getStatesInRange`, `getVersionStateLineage`, and
+ *   `computeGraduablePrefix`. Returns true iff the row
+ *   `(lineage_name = child.lineage_name, lineage_id = parentStateId)`
+ *   exists in `SDE_state_lineages`. Reconcile (`reconcileVersion` →
+ *   `addStatesToLineage`) is the only operation that writes this row.
+ *
+ * Mixed-writer caveat:
+ *   If parent's tip has been advanced by an external tool (ArcGIS Pro,
+ *   another egdb.js process) WITHOUT us reconciling, this returns false —
+ *   which is correct: the child is no longer reconciled and posting would
+ *   silently skip parent's intervening edits. Callers must re-reconcile
+ *   when this returns false. `postVersion` in EnterpriseGeodatabase
+ *   already enforces this by aborting with a clear error.
+ *
  * @param connection Database connection
  * @param childStateId Child version's state ID
  * @param parentStateId Parent version's state ID
@@ -121,30 +138,81 @@ export async function updateVersionState(
  * Delete states from the states table.
  * Used after posting to clean up child-only states.
  *
+ * Strategy (CONFIRMED 2026-06-15):
+ *   1. Per-state lineage cleanup: `WHERE lineage_name = stateId` removes
+ *      the deleted state's own closure tree. Matches the
+ *      `deleteChildState` pattern in state-management.ts.
+ *   2. Probe for cross-tree dangling references and emit telemetry. A
+ *      sibling version that previously reconciled with the child (or
+ *      indirectly inherited the child's state via DEFAULT) may still have
+ *      a closure row `(lineage_name = sibling, lineage_id = stateId)`. We
+ *      DO NOT delete those rows blindly — that would corrupt the
+ *      sibling's closure if `stateId` was a real ancestor. Instead we
+ *      surface the count via the returned `dangling` field so the caller
+ *      can warn / log / surface in CompressResult. Callers must reconcile
+ *      siblings BEFORE posting; this matches Pro's documented post
+ *      precondition.
+ *   3. Delete the SDE_states rows themselves.
+ *
+ * The dangling rows accumulate slowly (one per (sibling, post) pair) and
+ * are cleaned up automatically when the sibling is itself deleted via
+ * the same per-state pattern.
+ *
  * @param connection Database connection
  * @param stateIds State IDs to delete
+ * @returns Telemetry on cleanup work performed.
  */
+export interface DeleteStatesResult {
+  /** Number of states removed from SDE_states */
+  statesRemoved: number;
+  /** Number of `lineage_name = stateId` closure rows removed */
+  ownClosureRowsRemoved: number;
+  /** Number of closure rows in OTHER versions still pointing at these
+   *  states as `lineage_id`. These rows become dangling references after
+   *  the SDE_states rows are dropped. Operator should reconcile any
+   *  affected sibling versions to clear them on the next compress. */
+  danglingCrossTreeRows: number;
+}
+
 export async function deleteStates(
   connection: IDatabaseConnection,
   stateIds: number[]
-): Promise<void> {
-  if (stateIds.length === 0) return;
+): Promise<DeleteStatesResult> {
+  if (stateIds.length === 0) {
+    return { statesRemoved: 0, ownClosureRowsRemoved: 0, danglingCrossTreeRows: 0 };
+  }
 
+  const driver = connection.driver;
   const stateList = buildIntegerList(stateIds, 'deleteStates');
 
-  // First remove from state_lineages
-  const deleteLineagesSql = connection.driver === 'sqlserver'
-    ? `DELETE FROM sde.SDE_state_lineages WHERE lineage_id IN (${stateList})`
-    : `DELETE FROM sde.sde_state_lineages WHERE lineage_id IN (${stateList})`;
+  // 1. Per-state lineage cleanup, scoped to each state's own closure tree.
+  let ownClosureRowsRemoved = 0;
+  for (const stateId of stateIds) {
+    const deleteLineageSql = driver === 'sqlserver'
+      ? `DELETE FROM sde.SDE_state_lineages WHERE lineage_name = @p0`
+      : `DELETE FROM sde.sde_state_lineages WHERE lineage_name = $1`;
+    const r = await connection.execute(deleteLineageSql, [stateId]);
+    ownClosureRowsRemoved += r.rowsAffected;
+  }
 
-  await connection.execute(deleteLineagesSql, []);
+  // 2. Probe for cross-tree dangling references.
+  const countDanglingSql = driver === 'sqlserver'
+    ? `SELECT COUNT(*) AS cnt FROM sde.SDE_state_lineages WHERE lineage_id IN (${stateList})`
+    : `SELECT COUNT(*) AS cnt FROM sde.sde_state_lineages WHERE lineage_id IN (${stateList})`;
+  const danglingRows = await connection.query<{ cnt: number | bigint }>(countDanglingSql);
+  const danglingCrossTreeRows = Number(danglingRows[0]?.cnt ?? 0);
 
-  // Then remove from states
-  const deleteStatesSql = connection.driver === 'sqlserver'
+  // 3. Delete the SDE_states rows themselves.
+  const deleteStatesSql = driver === 'sqlserver'
     ? `DELETE FROM sde.SDE_states WHERE state_id IN (${stateList})`
     : `DELETE FROM sde.sde_states WHERE state_id IN (${stateList})`;
+  const dr = await connection.execute(deleteStatesSql, []);
 
-  await connection.execute(deleteStatesSql, []);
+  return {
+    statesRemoved: dr.rowsAffected,
+    ownClosureRowsRemoved,
+    danglingCrossTreeRows,
+  };
 }
 
 /**
@@ -160,26 +228,46 @@ export async function getChildUniqueStates(
   childStateId: number,
   parentStateId: number
 ): Promise<number[]> {
+  // The child tip itself (@p0 / $1) is UNIONed into the closure because
+  // ArcGIS-Pro-authored states do NOT have self-rows in SDE_state_lineages
+  // (empirically: 161/163 Putnam states had none). Without the UNION, the
+  // child tip's own state_id is dropped from the result; postChangesToParent
+  // then never rewrites SDE_STATE_ID for delta rows tagged with the child
+  // tip, and those rows become unreachable orphans after deleteStates runs.
+  // Symmetric to getStatesInRange / getVersionStateLineage / the closure
+  // pattern in compress-impl.ts.
   const sql = connection.driver === 'sqlserver'
     ? `
-      SELECT lineage_id as state_id
-      FROM sde.SDE_state_lineages
-      WHERE lineage_name = (SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p0)
-        AND lineage_id NOT IN (
-          SELECT lineage_id FROM sde.SDE_state_lineages
-          WHERE lineage_name = (SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p1)
-        )
-      ORDER BY lineage_id
+      SELECT DISTINCT state_id FROM (
+        SELECT lineage_id AS state_id
+        FROM sde.SDE_state_lineages
+        WHERE lineage_name = (SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p0)
+        UNION
+        SELECT @p0 AS state_id
+      ) child_closure
+      WHERE state_id NOT IN (
+        SELECT lineage_id FROM sde.SDE_state_lineages
+        WHERE lineage_name = (SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p1)
+        UNION
+        SELECT @p1 AS lineage_id
+      )
+      ORDER BY state_id
     `
     : `
-      SELECT lineage_id as state_id
-      FROM sde.sde_state_lineages
-      WHERE lineage_name = (SELECT lineage_name FROM sde.sde_states WHERE state_id = $1)
-        AND lineage_id NOT IN (
-          SELECT lineage_id FROM sde.sde_state_lineages
-          WHERE lineage_name = (SELECT lineage_name FROM sde.sde_states WHERE state_id = $2)
-        )
-      ORDER BY lineage_id
+      SELECT DISTINCT state_id FROM (
+        SELECT lineage_id AS state_id
+        FROM sde.sde_state_lineages
+        WHERE lineage_name = (SELECT lineage_name FROM sde.sde_states WHERE state_id = $1)
+        UNION
+        SELECT $1 AS state_id
+      ) AS child_closure
+      WHERE state_id NOT IN (
+        SELECT lineage_id FROM sde.sde_state_lineages
+        WHERE lineage_name = (SELECT lineage_name FROM sde.sde_states WHERE state_id = $2)
+        UNION
+        SELECT $2 AS lineage_id
+      )
+      ORDER BY state_id
     `;
 
   const result = await connection.query<{ state_id: number }>(sql, [childStateId, parentStateId]);

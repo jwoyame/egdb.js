@@ -66,12 +66,24 @@ export {
   getChildUniqueStates,
 } from './post';
 
-// Compression
+// Compression statistics (read-only)
+export { getVersionStats } from './compress';
 export {
-  compressStates,
-  removeOrphanedStates,
-  getVersionStats,
-} from './compress';
+  assertSelfRowInvariant,
+  countMissingSelfRows,
+  readLockedBranches,
+  computeGraduablePrefix,
+  graduateTable,
+  compressProgressHook,
+  pruneStates,
+  collapseLineages,
+  InconsistentLineageError,
+} from './compress-impl';
+export type {
+  GraduateTableResult,
+  PruneResult,
+  CollapseResult,
+} from './compress-impl';
 
 // State management (EditSession isolation)
 export {

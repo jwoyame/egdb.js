@@ -218,12 +218,19 @@ export class SqlServerConnection implements IDatabaseConnection {
   /**
    * Begin a transaction
    */
-  async beginTransaction(): Promise<void> {
+  async beginTransaction(options?: { isolation?: 'serializable' }): Promise<void> {
     if (!this.pool) throw new Error('Not connected');
     if (this.transaction) throw new Error('Transaction already in progress');
 
     this.transaction = new sql.Transaction(this.pool);
-    await this.transaction.begin();
+    const isoLevel = options?.isolation === 'serializable'
+      ? sql.ISOLATION_LEVEL.SERIALIZABLE
+      : undefined;
+    if (isoLevel !== undefined) {
+      await this.transaction.begin(isoLevel);
+    } else {
+      await this.transaction.begin();
+    }
   }
 
   /**

@@ -75,6 +75,11 @@ export async function getStatesInRange(
   versionStateId: number,
   ancestorStateId: number
 ): Promise<number[]> {
+  // The tip itself (versionStateId) must be UNIONed in: ArcGIS-authored
+  // states don't have self-rows in SDE_state_lineages, so the tip's own
+  // A/D rows would be missed by the closure-table-only query. Verified
+  // empirically against Putnam parcel_fabric_test where 161/163 states
+  // had no self-row. See SDE_COMPRESS_SPEC.md Section 4.1.
   const sql = connection.driver === 'sqlserver'
     ? `
       SELECT lineage_id as state_id
@@ -84,7 +89,9 @@ export async function getStatesInRange(
       )
       AND lineage_id > @p1
       AND lineage_id <= @p0
-      ORDER BY lineage_id
+      UNION
+      SELECT @p0 AS state_id WHERE @p0 > @p1
+      ORDER BY state_id
     `
     : `
       SELECT lineage_id as state_id
@@ -94,7 +101,9 @@ export async function getStatesInRange(
       )
       AND lineage_id > $2
       AND lineage_id <= $1
-      ORDER BY lineage_id
+      UNION
+      SELECT $1 AS state_id WHERE $1 > $2
+      ORDER BY state_id
     `;
 
   const result = await connection.query<{ state_id: number }>(
@@ -141,19 +150,48 @@ export async function addStatesToLineage(
   lineageName: number,
   stateIds: number[]
 ): Promise<void> {
+  // Race semantics by driver:
+  //   PostgreSQL — ON CONFLICT DO NOTHING is atomic at the row level, so
+  //     two concurrent reconciles inserting the same (lineage_name,
+  //     state_id) pair both succeed without error.
+  //   SQL Server — `INSERT ... SELECT ... WHERE NOT EXISTS (...)` is NOT
+  //     atomic under READ COMMITTED (the default). Two concurrent
+  //     statements can both pass the NOT EXISTS check and then race in the
+  //     INSERT; the loser raises a PK-violation error. We swallow that
+  //     specific error (2627 / 2601) as "another reconcile already inserted
+  //     it" — the desired post-condition holds either way. Callers who
+  //     want strict isolation should wrap reconcile in SERIALIZABLE.
   for (const stateId of stateIds) {
-    // Check if already exists
-    const checkSql = connection.driver === 'sqlserver'
-      ? `SELECT 1 FROM sde.SDE_state_lineages WHERE lineage_name = @p0 AND lineage_id = @p1`
-      : `SELECT 1 FROM sde.sde_state_lineages WHERE lineage_name = $1 AND lineage_id = $2`;
-
-    const exists = await connection.query(checkSql, [lineageName, stateId]);
-
-    if (exists.length === 0) {
-      const insertSql = connection.driver === 'sqlserver'
-        ? `INSERT INTO sde.SDE_state_lineages (lineage_name, lineage_id) VALUES (@p0, @p1)`
-        : `INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id) VALUES ($1, $2)`;
-
+    if (connection.driver === 'sqlserver') {
+      const insertSql = `
+        INSERT INTO sde.SDE_state_lineages (lineage_name, lineage_id)
+        SELECT @p0, @p1
+        WHERE NOT EXISTS (
+          SELECT 1 FROM sde.SDE_state_lineages
+          WHERE lineage_name = @p0 AND lineage_id = @p1
+        )
+      `;
+      try {
+        await connection.execute(insertSql, [lineageName, stateId]);
+      } catch (e: unknown) {
+        // mssql wraps the SQL Server error in RequestError; the original
+        // PK-violation number lives on `number` or in `originalError`. Use
+        // ONLY the numeric error codes — message text is locale-dependent
+        // and a regex over the English wording would let a legitimate race
+        // re-throw as a fatal error on a localized SQL Server.
+        const err = e as { number?: number; originalError?: { number?: number } };
+        const num = err?.number ?? err?.originalError?.number;
+        const isPkViolation = num === 2627 || num === 2601;
+        if (!isPkViolation) throw e;
+        // Race lost to a concurrent reconcile inserting the same row.
+        // Desired state is already present; continue.
+      }
+    } else {
+      const insertSql = `
+        INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id)
+        VALUES ($1, $2)
+        ON CONFLICT (lineage_name, lineage_id) DO NOTHING
+      `;
       await connection.execute(insertSql, [lineageName, stateId]);
     }
   }

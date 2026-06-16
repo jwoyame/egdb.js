@@ -28,6 +28,7 @@ import type {
 import {
   findCommonAncestor,
   getStatesInRange,
+  getLineageName,
   addStatesToLineage,
   getAllChanges,
   detectDetailedConflicts,
@@ -38,11 +39,14 @@ import {
   updateVersionState,
   deleteStates,
   getChildUniqueStates,
-  compressStates,
-  removeOrphanedStates,
   getVersionStats,
   cleanupStaleLocks,
+  computeGraduablePrefix,
+  graduateTable,
+  pruneStates,
+  collapseLineages,
 } from './reconcile';
+import type { GraduateTableResult } from './reconcile';
 import type { StaleLockCleanupResult } from './reconcile';
 
 /**
@@ -446,22 +450,34 @@ export class EnterpriseGeodatabase {
     const version = await this.getVersion(versionName);
     if (!version?.stateId) return null;
 
+    // The tip itself (version.stateId) is UNIONed in because ArcGIS-
+    // authored states don't have a self-row in SDE_state_lineages. Without
+    // this, the version's own A/D rows (at SDE_STATE_ID = version.stateId)
+    // would be invisible. See SDE_COMPRESS_SPEC.md Section 4.1.
     const sql = this.config.driver === 'sqlserver'
       ? `
-        SELECT DISTINCT sl.lineage_id
-        FROM sde.SDE_state_lineages sl
-        JOIN sde.SDE_states s ON s.state_id = @p0
-        WHERE sl.lineage_name = s.lineage_name
-          AND sl.lineage_id <= @p0
-        ORDER BY sl.lineage_id
+        SELECT DISTINCT lineage_id FROM (
+          SELECT sl.lineage_id
+          FROM sde.SDE_state_lineages sl
+          JOIN sde.SDE_states s ON s.state_id = @p0
+          WHERE sl.lineage_name = s.lineage_name
+            AND sl.lineage_id <= @p0
+          UNION
+          SELECT @p0 AS lineage_id
+        ) closure
+        ORDER BY lineage_id
       `
       : `
-        SELECT DISTINCT sl.lineage_id
-        FROM sde.sde_state_lineages sl
-        JOIN sde.sde_states s ON s.state_id = $1
-        WHERE sl.lineage_name = s.lineage_name
-          AND sl.lineage_id <= $1
-        ORDER BY sl.lineage_id
+        SELECT DISTINCT lineage_id FROM (
+          SELECT sl.lineage_id
+          FROM sde.sde_state_lineages sl
+          JOIN sde.sde_states s ON s.state_id = $1
+          WHERE sl.lineage_name = s.lineage_name
+            AND sl.lineage_id <= $1
+          UNION
+          SELECT $1 AS lineage_id
+        ) closure
+        ORDER BY lineage_id
       `;
 
     const rows = await this.connection.query<{ lineage_id: number | bigint }>(sql, [version.stateId]);
@@ -838,7 +854,14 @@ export class EnterpriseGeodatabase {
     // from the early `!version.stateId` guard does not cross into nested
     // arrow functions.
     const childStateId = version.stateId;
-    const childLineageName = childStateId; // Lineage name equals current state_id
+    // Look up the actual lineage_name from SDE_states — do NOT conflate it
+    // with state_id. createChildState (via SDE_state_new_edit) gives the child
+    // the PARENT's lineage_name, and ArcGIS-Pro-authored states likewise use a
+    // separate tree identifier (Putnam empirical: state 25066 has lineage_name
+    // 24542). Using childStateId as the lineage_name inserts the parent's
+    // states under the WRONG lineage tree, and the child's closure silently
+    // does NOT gain the parent's tip.
+    const childLineageName = await getLineageName(this.connection, childStateId);
 
     const runApply = async () => {
       const result = await applyParentChanges(
@@ -988,7 +1011,18 @@ export class EnterpriseGeodatabase {
         parent.stateId
       );
 
-      await deleteStates(this.connection, childUniqueStates);
+      const deleteResult = await deleteStates(this.connection, childUniqueStates);
+      if (deleteResult.danglingCrossTreeRows > 0) {
+        // A sibling version's closure still references one of the now-
+        // deleted states as `lineage_id`. The sibling will be reconciled
+        // out at its own post; warn the operator so they don't mistake
+        // the dangling rows for corruption.
+        this._logger.warn?.(
+          `postVersion(${versionName}): deleted ${deleteResult.statesRemoved} states, ` +
+          `but ${deleteResult.danglingCrossTreeRows} closure rows in OTHER versions still reference them. ` +
+          `These dangling references are cleaned up when their owning versions are next deleted. See post.ts:deleteStates docs.`,
+        );
+      }
 
       // Lock auto-releases on commit for both drivers (Postgres:
       // pg_advisory_xact_lock; SQL Server: sp_getapplock with @LockOwner =
@@ -1009,61 +1043,6 @@ export class EnterpriseGeodatabase {
     }
   }
 
-  /**
-   * Compress a specific version's states to reduce A/D table bloat.
-   *
-   * This removes redundant entries:
-   * - Insert + Delete pairs for the same OBJECTID (net effect: nothing)
-   * - Multiple updates to the same OBJECTID (keeps only latest)
-   *
-   * @param versionName Version to compress
-   * @param options Compression options
-   * @returns Compression result
-   *
-   * @example
-   * ```typescript
-   * const result = await egdb.compressVersion('myuser.edit_version');
-   * console.log(`Removed ${result.addsRemoved} adds, ${result.deletesRemoved} deletes`);
-   * ```
-   */
-  async compressVersion(
-    versionName: string,
-    options?: CompressOptions
-  ): Promise<CompressResult> {
-    const version = await this.getVersion(versionName);
-    if (!version) {
-      throw new Error(`Version not found: ${versionName}`);
-    }
-    if (!version.stateId) {
-      throw new Error(`Version ${versionName} has no state ID`);
-    }
-
-    // Get version's state lineage
-    const stateLineage = await this.getVersionStateLineage(versionName);
-    if (!stateLineage || stateLineage.length === 0) {
-      return { addsRemoved: 0, deletesRemoved: 0, statesRemoved: 0 };
-    }
-
-    // Get tables to compress
-    const allTables = await this.listTables();
-    let tables = allTables.filter(t => t.isVersioned);
-
-    // Filter to specific tables if requested
-    if (options?.tables && options.tables.length > 0) {
-      const tableNames = new Set(options.tables.map(t => t.toLowerCase()));
-      tables = tables.filter(t => tableNames.has(t.name.toLowerCase()));
-    }
-
-    // Compress the states
-    const result = await compressStates(this.connection, tables, stateLineage);
-
-    // Optionally remove orphaned states
-    if (options?.removeOrphanedStates) {
-      result.statesRemoved = await removeOrphanedStates(this.connection);
-    }
-
-    return result;
-  }
 
   /**
    * Compress the entire geodatabase by removing orphaned states
@@ -1081,52 +1060,72 @@ export class EnterpriseGeodatabase {
    * ```
    */
   async compress(options?: CompressOptions): Promise<CompressResult> {
-    // Get all versioned tables
     const allTables = await this.listTables();
     let tables = allTables.filter(t => t.isVersioned);
-
-    // Filter to specific tables if requested
     if (options?.tables && options.tables.length > 0) {
       const tableNames = new Set(options.tables.map(t => t.toLowerCase()));
       tables = tables.filter(t => tableNames.has(t.name.toLowerCase()));
     }
 
-    // Get all versions to find all active states
-    const versions = await this.listVersions();
-    const activeStates = new Set<number>();
-    for (const v of versions) {
-      if (v.stateId) {
-        const lineage = await this.getVersionStateLineage(`${v.owner}.${v.name}`);
-        if (lineage) {
-          lineage.forEach(s => activeStates.add(s));
-        }
-      }
-    }
-
-    // Compress each version's states
+    // Phase 3 (Esri terminology): graduate delta rows into base tables.
+    // Per-table, SERIALIZABLE so the in-fence subset revalidation and the
+    // base writes form a single critical section against concurrent
+    // createVersion.
+    const graduableSnapshot = await computeGraduablePrefix(this.connection);
+    const columnCache = new Map<string, string[]>();
+    const graduationByTable: GraduateTableResult[] = [];
+    let graduatedUpserts = 0;
+    let graduatedDeletes = 0;
     let totalAddsRemoved = 0;
     let totalDeletesRemoved = 0;
-
-    for (const v of versions) {
-      if (v.stateId) {
-        const lineage = await this.getVersionStateLineage(`${v.owner}.${v.name}`);
-        if (lineage && lineage.length > 0) {
-          const result = await compressStates(this.connection, tables, lineage);
-          totalAddsRemoved += result.addsRemoved;
-          totalDeletesRemoved += result.deletesRemoved;
+    for (const t of tables) {
+      const wasInTx = this.connection.inTransaction();
+      if (!wasInTx) await this.connection.beginTransaction({ isolation: 'serializable' });
+      try {
+        const r = await graduateTable(this.connection, t, graduableSnapshot, columnCache);
+        if (!wasInTx) await this.connection.commitTransaction();
+        graduationByTable.push(r);
+        graduatedUpserts += r.upserts;
+        graduatedDeletes += r.deletes;
+        totalAddsRemoved += r.aRowsRemoved;
+        totalDeletesRemoved += r.dRowsRemoved;
+      } catch (e) {
+        if (!wasInTx && this.connection.inTransaction()) {
+          await this.connection.rollbackTransaction();
         }
+        throw e;
       }
     }
 
-    // Remove orphaned states (states not referenced by any version)
-    const statesRemoved = options?.removeOrphanedStates !== false
-      ? await removeOrphanedStates(this.connection)
-      : 0;
+    // Phase 1: prune unreferenced, non-branch-point, unlocked states.
+    const pruneResult = await pruneStates(this.connection, tables);
+    totalAddsRemoved += pruneResult.deltaRowsRemoved;
+    const statesRemoved = pruneResult.statesRemoved;
+
+    // Phase 2: collapse linear state chains (child into parent).
+    const collapseResult = await collapseLineages(this.connection, tables);
+
+    const allTablesSkipped = graduationByTable.length > 0
+      && graduationByTable.every(t => t.status === 'skipped-version-set-changed');
+    if (allTablesSkipped) {
+      this._logger.warn?.(
+        `compress: every table's graduation skipped with status='skipped-version-set-changed'. ` +
+        `The version set changed during compress (likely a concurrent createVersion). ` +
+        `Re-run compress.`,
+      );
+    }
 
     return {
       addsRemoved: totalAddsRemoved,
       deletesRemoved: totalDeletesRemoved,
       statesRemoved,
+      graduatedUpserts,
+      graduatedDeletes,
+      graduationByTable,
+      lineagesCollapsed: collapseResult.collapses,
+      rowsRewritten: collapseResult.rowsRewritten,
+      statesSkippedByPrune: pruneResult.statesSkipped,
+      allTablesSkippedDueToConcurrentVersionChange: allTablesSkipped || undefined,
     };
   }
 

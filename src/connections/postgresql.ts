@@ -167,12 +167,16 @@ export class PostgreSQLConnection implements IDatabaseConnection {
   /**
    * Begin a transaction
    */
-  async beginTransaction(): Promise<void> {
+  async beginTransaction(options?: { isolation?: 'serializable' }): Promise<void> {
     if (!this.pool) throw new Error('Not connected');
     if (this.transactionClient) throw new Error('Transaction already in progress');
 
     this.transactionClient = await this.pool.connect();
-    await this.transactionClient.query('BEGIN');
+    if (options?.isolation === 'serializable') {
+      await this.transactionClient.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+    } else {
+      await this.transactionClient.query('BEGIN');
+    }
   }
 
   /**

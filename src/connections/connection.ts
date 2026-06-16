@@ -42,8 +42,17 @@ export interface IDatabaseConnection {
    */
   executeInsert(sql: string, params?: unknown[]): Promise<number[]>;
 
-  /** Begin a transaction */
-  beginTransaction(): Promise<void>;
+  /**
+   * Begin a transaction.
+   *
+   * @param options.isolation Optional isolation level. 'serializable' maps to
+   *   SET TRANSACTION ISOLATION LEVEL SERIALIZABLE (SQL Server) or
+   *   BEGIN ISOLATION LEVEL SERIALIZABLE (PostgreSQL). Required by
+   *   `graduateTable` so the in-fence subset revalidation and the subsequent
+   *   base-table writes form a single critical section against concurrent
+   *   `createVersion`.
+   */
+  beginTransaction(options?: { isolation?: 'serializable' }): Promise<void>;
 
   /** Commit the current transaction */
   commitTransaction(): Promise<void>;

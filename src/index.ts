@@ -70,8 +70,6 @@ export {
   detectConflicts,
   detectDetailedConflicts,
   getConflictsSummary,
-  compressStates,
-  removeOrphanedStates,
   getVersionStats,
   cleanupStaleLocks,
   InsufficientPrivilegeError,

@@ -425,8 +425,6 @@ export interface PostResult {
 export interface CompressOptions {
   /** Only compress specific tables (default: all versioned tables) */
   tables?: string[];
-  /** Remove states that are no longer referenced (default: true) */
-  removeOrphanedStates?: boolean;
 }
 
 /** Compression result */
@@ -437,6 +435,31 @@ export interface CompressResult {
   deletesRemoved: number;
   /** Number of orphaned states removed */
   statesRemoved: number;
+  /** A-rows graduated into base tables as UPSERTs */
+  graduatedUpserts?: number;
+  /** Rows deleted from base tables via D-row graduation */
+  graduatedDeletes?: number;
+  /** Per-table graduation results */
+  graduationByTable?: Array<{
+    table: string;
+    status: 'graduated' | 'skipped-version-set-changed' | 'no-graduable-rows';
+    upserts: number;
+    deletes: number;
+    aRowsRemoved: number;
+    dRowsRemoved: number;
+    warnings: string[];
+  }>;
+  /** Linear state chains collapsed (child-into-parent) */
+  lineagesCollapsed?: number;
+  /** Delta rows rewritten during state collapse */
+  rowsRewritten?: number;
+  /** Prune candidates that were re-checked out under concurrent locks */
+  statesSkippedByPrune?: number;
+  /** True iff every graduation table skipped with status='skipped-version-set-changed'.
+   *  Indicates the version set changed during compress (e.g. a concurrent createVersion).
+   *  Operators should re-run compress.
+   */
+  allTablesSkippedDueToConcurrentVersionChange?: boolean;
 }
 
 /**
