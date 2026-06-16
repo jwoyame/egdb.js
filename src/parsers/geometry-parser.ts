@@ -741,7 +741,15 @@ export interface SegmentModifier {
   startPointIndex: number;
   /** 1 = circular arc, 3 = spiral, 4 = bezier, 5 = elliptic arc */
   segmentType: number;
-  /** Arc center (segmentType=1, IsPoint=0) */
+  /**
+   * Third arc point (segmentType=1, IsPoint=0). In modern Esri SDE
+   * encoding (10.x+) this is a point lying ON the arc — typically the arc
+   * midpoint — not the geometric circle center. Together with the chord
+   * endpoints (source[startPointIndex] and source[startPointIndex+1]),
+   * three points uniquely define the arc; the true circumcenter and sweep
+   * direction are derived from them. The legacy field name "center" is
+   * preserved for backward compatibility.
+   */
   centerX?: number;
   centerY?: number;
   /** Arc start/central angles (segmentType=1, IsPoint=1) */
@@ -1332,26 +1340,163 @@ export function parseSdeBinary(
 }
 
 // =============================================================================
-// Curve densification — turn SegmentModifier records into sampled line segments
+// Curve densification — turn SegmentModifier records into sampled line segments.
 //
-// `parseSdeBinaryMultiPart` returns the source control points (un-densified)
-// and the curve modifier records. To get GeoJSON-compatible polygons with
-// curves rendered as polylines, walk through the source points and replace
-// each chord that has an associated curve modifier with sampled points along
-// the curve. This is what `densifyCurves` does.
+// We use tolerance-based adaptive sampling, matching the approach Esri uses
+// for `Densify` and `arcpy.management.Densify`. The caller specifies a maximum
+// perpendicular deviation from the true curve (the "sagitta" tolerance), and
+// the densifier picks a per-curve segment count that respects it.
+//
+// For circular arcs of radius r, the per-segment chord-to-arc deviation as a
+// function of the per-segment central angle θ is:
+//
+//     sagitta(θ) = r * (1 − cos(θ/2))
+//
+// So for a target tolerance T:
+//
+//     θ_max = 2 * arccos(1 − T/r)        // when 0 < T < 2r
+//     N     = ceil(|sweep| / θ_max)       // segments needed for the full arc
+//
+// We additionally clamp by `maxAngle` (so very large radii don't produce
+// over-long chords), `minSegments` (visual smoothness on small features), and
+// `maxSegments` (safety cap).
+//
+// For cubic Beziers, exact tolerance is harder. We use adaptive subdivision
+// (recursive de Casteljau) until the control polygon is "flat enough" against
+// the chord (max signed area / max perpendicular distance < tolerance), which
+// is the standard high-quality approach used by font rasterizers and
+// vector-graphics libraries.
 // =============================================================================
 
 const TWO_PI = 2 * Math.PI;
 
 /**
+ * Options for curve densification.
+ *
+ * The defaults are tuned for sub-foot-precision data (FL state plane, UTM,
+ * etc.). For latitude/longitude data, set `tolerance` to a small value in
+ * degrees (e.g. 1e-6).
+ */
+export interface DensifyOptions {
+  /**
+   * Maximum perpendicular distance from any chord to the true curve, in the
+   * data's coordinate units. Smaller values yield more points. Default 0.01.
+   */
+  tolerance?: number;
+  /**
+   * Maximum angular step per arc segment, in radians. Caps chord length on
+   * very-large-radius arcs where tolerance alone permits long chords.
+   * Default π/16 (≈11.25°).
+   */
+  maxAngle?: number;
+  /** Minimum samples per curve (default 4). */
+  minSegments?: number;
+  /** Maximum samples per curve, safety cap (default 256). */
+  maxSegments?: number;
+  /**
+   * Override: when set, sample exactly this many segments per curve and
+   * ignore tolerance / maxAngle. Useful for uniform sampling in tests.
+   */
+  segmentsPerCurve?: number;
+}
+
+interface ResolvedOptions {
+  tolerance: number;
+  maxAngle: number;
+  minSegments: number;
+  maxSegments: number;
+  segmentsPerCurve?: number;
+}
+
+function resolveOptions(opts: DensifyOptions): ResolvedOptions {
+  return {
+    tolerance: opts.tolerance ?? 0.01,
+    maxAngle: opts.maxAngle ?? Math.PI / 16,
+    minSegments: opts.minSegments ?? 4,
+    maxSegments: opts.maxSegments ?? 256,
+    segmentsPerCurve: opts.segmentsPerCurve,
+  };
+}
+
+/**
+ * Compute the signed sweep angle for an arc going from `startAngle` to
+ * `endAngle` in the specified direction. Returns a positive value for CCW,
+ * negative for CW.
+ */
+function arcSweepAngle(startAngle: number, endAngle: number, isCCW: boolean): number {
+  let sweep = endAngle - startAngle;
+  if (isCCW) {
+    if (sweep <= 0) sweep += TWO_PI;
+  } else {
+    if (sweep >= 0) sweep -= TWO_PI;
+  }
+  return sweep;
+}
+
+/**
+ * Sagitta-based segment count for a circular arc with the given sweep and
+ * radius, respecting the resolved tolerance options.
+ */
+function arcSegmentCount(absSweep: number, radius: number, opts: ResolvedOptions): number {
+  if (opts.segmentsPerCurve !== undefined) {
+    return Math.max(1, opts.segmentsPerCurve);
+  }
+  // Per-segment angle bound from sagitta tolerance.
+  // Sagitta s = r * (1 − cos(θ/2)); solve for θ.
+  let segAngle: number;
+  if (radius <= 0) {
+    segAngle = opts.maxAngle;
+  } else {
+    const ratio = opts.tolerance / radius;
+    if (ratio >= 2) {
+      // Tolerance dominates; one segment suffices for any sweep.
+      segAngle = opts.maxAngle;
+    } else if (ratio <= 0) {
+      segAngle = opts.maxAngle;
+    } else {
+      const tolAngle = 2 * Math.acos(1 - ratio);
+      segAngle = Math.min(tolAngle, opts.maxAngle);
+    }
+  }
+  if (!Number.isFinite(segAngle) || segAngle <= 0) segAngle = opts.maxAngle;
+  let n = Math.ceil(absSweep / segAngle);
+  if (n < opts.minSegments) n = opts.minSegments;
+  if (n > opts.maxSegments) n = opts.maxSegments;
+  if (n < 1) n = 1;
+  return n;
+}
+
+/**
+ * Compute the circumcenter of the unique circle through three points.
+ * Returns null if the points are collinear (no finite circle).
+ */
+function circumcenterFromThreePoints(
+  p1: readonly [number, number],
+  p2: readonly [number, number],
+  p3: readonly [number, number],
+): { x: number; y: number } | null {
+  const ax = p2[0] - p1[0];
+  const ay = p2[1] - p1[1];
+  const bx = p3[0] - p1[0];
+  const by = p3[1] - p1[1];
+  const d = 2 * (ax * by - ay * bx);
+  if (!Number.isFinite(d) || Math.abs(d) < 1e-12) return null;
+  const a2 = ax * ax + ay * ay;
+  const b2 = bx * bx + by * by;
+  const cx = p1[0] + (by * a2 - ay * b2) / d;
+  const cy = p1[1] + (ax * b2 - bx * a2) / d;
+  return { x: cx, y: cy };
+}
+
+/**
  * Sample points along a circular arc.
  *
- * Returns `segments + 1` points: start, intermediate samples, end.
+ * Returns `segments + 1` points: start, interior samples, end. By default
+ * `segments` is computed adaptively from the tolerance options. Pass a number
+ * to use a fixed segment count instead.
  *
- * The arc goes from `start` to `end` around `(centerX, centerY)`. `isCCW`
- * picks which of the two possible arcs to use (the counterclockwise or
- * clockwise one). The IsMinor flag is redundant given start, end, center,
- * and isCCW — we don't need it for densification.
+ * `isCCW` picks which of the two possible arcs to use. The Esri `IsMinor`
+ * flag is redundant given start, end, center, and `isCCW`.
  */
 export function densifyArc(
   start: readonly [number, number],
@@ -1359,28 +1504,24 @@ export function densifyArc(
   centerX: number,
   centerY: number,
   isCCW: boolean,
-  segments = 32,
+  optionsOrSegments?: DensifyOptions | number,
 ): number[][] {
+  const opts: ResolvedOptions =
+    typeof optionsOrSegments === "number"
+      ? resolveOptions({ segmentsPerCurve: optionsOrSegments })
+      : resolveOptions(optionsOrSegments ?? {});
+
   const startAngle = Math.atan2(start[1] - centerY, start[0] - centerX);
   const endAngle = Math.atan2(end[1] - centerY, end[0] - centerX);
+  const sweep = arcSweepAngle(startAngle, endAngle, isCCW);
 
-  let sweep = endAngle - startAngle;
-  if (isCCW) {
-    // Counterclockwise: sweep is positive. If the raw difference is negative
-    // or zero, we need to wrap the long way around.
-    if (sweep <= 0) sweep += TWO_PI;
-  } else {
-    // Clockwise: sweep is negative. If the raw difference is positive or zero,
-    // wrap the long way the other direction.
-    if (sweep >= 0) sweep -= TWO_PI;
-  }
-
-  // Use the average of |start - center| and |end - center| as the radius.
-  // For a well-formed arc these are equal; averaging makes us robust to tiny
-  // numerical noise.
+  // Average of the two start/end radii; equal for well-formed arcs, robust to
+  // tiny numerical noise.
   const r0 = Math.hypot(start[0] - centerX, start[1] - centerY);
   const r1 = Math.hypot(end[0] - centerX, end[1] - centerY);
   const radius = (r0 + r1) / 2;
+
+  const segments = arcSegmentCount(Math.abs(sweep), radius, opts);
 
   const out: number[][] = [[start[0], start[1]]];
   for (let i = 1; i < segments; i++) {
@@ -1392,44 +1533,153 @@ export function densifyArc(
 }
 
 /**
- * Sample points along a cubic Bezier curve from `start` to `end` with two
- * interior control points. Returns `segments + 1` points.
+ * Maximum perpendicular distance from a cubic Bezier's control polygon to
+ * its chord. Used as a "flatness" metric for adaptive subdivision: a Bezier
+ * is "flat enough" when both interior control points lie within `tolerance`
+ * of the chord, since the curve itself is bounded by the convex hull of its
+ * control points.
+ */
+function bezierFlatness(
+  p0: readonly [number, number],
+  p1: readonly [number, number],
+  p2: readonly [number, number],
+  p3: readonly [number, number],
+): number {
+  const ux = 3 * p1[0] - 2 * p0[0] - p3[0];
+  const uy = 3 * p1[1] - 2 * p0[1] - p3[1];
+  const vx = 3 * p2[0] - p0[0] - 2 * p3[0];
+  const vy = 3 * p2[1] - p0[1] - 2 * p3[1];
+  return Math.max(ux * ux + uy * uy, vx * vx + vy * vy);
+}
+
+/**
+ * Subdivide a cubic Bezier at t=0.5 using de Casteljau's algorithm.
+ */
+function bezierSubdivide(
+  p0: readonly [number, number],
+  p1: readonly [number, number],
+  p2: readonly [number, number],
+  p3: readonly [number, number],
+): {
+  left: [[number, number], [number, number], [number, number], [number, number]];
+  right: [[number, number], [number, number], [number, number], [number, number]];
+} {
+  const m01: [number, number] = [(p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2];
+  const m12: [number, number] = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
+  const m23: [number, number] = [(p2[0] + p3[0]) / 2, (p2[1] + p3[1]) / 2];
+  const m012: [number, number] = [(m01[0] + m12[0]) / 2, (m01[1] + m12[1]) / 2];
+  const m123: [number, number] = [(m12[0] + m23[0]) / 2, (m12[1] + m23[1]) / 2];
+  const m0123: [number, number] = [(m012[0] + m123[0]) / 2, (m012[1] + m123[1]) / 2];
+  return {
+    left: [[p0[0], p0[1]], m01, m012, m0123],
+    right: [m0123, m123, m23, [p3[0], p3[1]]],
+  };
+}
+
+/**
+ * Sample points along a cubic Bezier curve.
+ *
+ * By default uses adaptive de Casteljau subdivision until each segment of
+ * the control polygon is flat to within `tolerance`. Pass a number to use
+ * uniform sampling at that fixed segment count instead.
+ *
+ * Returns at least `segments + 1` points (or `minSegments + 1` for adaptive
+ * mode). The control points may be co-linear; in that case the function
+ * still returns at least `minSegments + 1` evenly spaced points so callers
+ * always get a polyline they can render.
  */
 export function densifyBezier(
   start: readonly [number, number],
   control1: readonly [number, number],
   control2: readonly [number, number],
   end: readonly [number, number],
-  segments = 32,
+  optionsOrSegments?: DensifyOptions | number,
 ): number[][] {
-  const out: number[][] = [];
-  for (let i = 0; i <= segments; i++) {
-    const t = i / segments;
-    const u = 1 - t;
-    const w0 = u * u * u;
-    const w1 = 3 * u * u * t;
-    const w2 = 3 * u * t * t;
-    const w3 = t * t * t;
-    out.push([
-      w0 * start[0] + w1 * control1[0] + w2 * control2[0] + w3 * end[0],
-      w0 * start[1] + w1 * control1[1] + w2 * control2[1] + w3 * end[1],
-    ]);
-  }
-  return out;
-}
+  const opts: ResolvedOptions =
+    typeof optionsOrSegments === "number"
+      ? resolveOptions({ segmentsPerCurve: optionsOrSegments })
+      : resolveOptions(optionsOrSegments ?? {});
 
-export interface DensifyOptions {
-  /** Segments to sample per curve (default 32) */
-  segmentsPerCurve?: number;
+  if (opts.segmentsPerCurve !== undefined) {
+    const n = Math.max(1, opts.segmentsPerCurve);
+    const out: number[][] = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      const u = 1 - t;
+      const w0 = u * u * u;
+      const w1 = 3 * u * u * t;
+      const w2 = 3 * u * t * t;
+      const w3 = t * t * t;
+      out.push([
+        w0 * start[0] + w1 * control1[0] + w2 * control2[0] + w3 * end[0],
+        w0 * start[1] + w1 * control1[1] + w2 * control2[1] + w3 * end[1],
+      ]);
+    }
+    return out;
+  }
+
+  // Adaptive subdivision. We collect points by recursing depth-first; each
+  // leaf segment contributes its end point. We start with the start point
+  // outside the recursion.
+  const out: number[][] = [[start[0], start[1]]];
+  const tolSq = opts.tolerance * opts.tolerance;
+  // Stack-based to avoid recursion limits on pathological inputs.
+  type Frame = { p0: [number, number]; p1: [number, number]; p2: [number, number]; p3: [number, number]; depth: number };
+  const stack: Frame[] = [
+    {
+      p0: [start[0], start[1]],
+      p1: [control1[0], control1[1]],
+      p2: [control2[0], control2[1]],
+      p3: [end[0], end[1]],
+      depth: 0,
+    },
+  ];
+  // Pre-order traversal collects points in left-to-right order: process the
+  // current frame's left subtree, then push the right subtree.
+  const right: Frame[] = [];
+  let leafCount = 0;
+  const maxDepth = Math.ceil(Math.log2(opts.maxSegments)) + 1;
+  while (stack.length > 0 || right.length > 0) {
+    const top = stack.pop() ?? right.pop()!;
+    if (top.depth >= maxDepth || bezierFlatness(top.p0, top.p1, top.p2, top.p3) <= tolSq) {
+      out.push([top.p3[0], top.p3[1]]);
+      leafCount++;
+      continue;
+    }
+    const { left, right: rightHalf } = bezierSubdivide(top.p0, top.p1, top.p2, top.p3);
+    // Push right first so left is processed first.
+    stack.push({
+      p0: rightHalf[0],
+      p1: rightHalf[1],
+      p2: rightHalf[2],
+      p3: rightHalf[3],
+      depth: top.depth + 1,
+    });
+    stack.push({
+      p0: left[0],
+      p1: left[1],
+      p2: left[2],
+      p3: left[3],
+      depth: top.depth + 1,
+    });
+  }
+
+  // If adaptive sampling produced fewer than minSegments points, fall back to
+  // uniform sampling at minSegments to ensure consumers see a smooth polyline.
+  if (leafCount < opts.minSegments) {
+    return densifyBezier(start, control1, control2, end, opts.minSegments);
+  }
+
+  return out;
 }
 
 /**
  * Densify a parsed curved polygon. Walks the source control points across
- * all rings, and wherever a curve modifier attaches, replaces the chord
- * with sampled curve points.
+ * all rings, and wherever a curve modifier attaches, replaces the chord with
+ * sampled curve points using tolerance-based adaptive sampling.
  *
  * `parts` is the per-ring source points returned by `parseSdeBinaryMultiPart`
- * (when `hasCurves` is true). `curves` is the corresponding `result.curves`.
+ * (when `hasCurves` is true). `curves` is `result.curves` from the same call.
  *
  * Curve modifiers' `startPointIndex` is a global index into the concatenated
  * point sequence across all rings (per Esri spec). This function reconstructs
@@ -1444,7 +1694,7 @@ export function densifyCurves(
   curves: readonly SegmentModifier[],
   options: DensifyOptions = {},
 ): number[][][] {
-  const segmentsPerCurve = options.segmentsPerCurve ?? 32;
+  const opts = resolveOptions(options);
   if (curves.length === 0) return parts.map((r) => r.map((p) => [...p]));
 
   // Map global point index → SegmentModifier (the curve attached at that point).
@@ -1484,21 +1734,45 @@ export function densifyCurves(
         curve.centerY !== undefined &&
         !curve.isPoint
       ) {
-        densified = densifyArc(
+        // Modern Esri SDE encoding (10.x+) stores circular arcs as three
+        // points: start, end, and a third point ON the arc (the "arc
+        // midpoint"). The two doubles in the segment modifier are this third
+        // point — NOT the geometric center. We compute the true circumcenter
+        // from the three points. With three points specified, isCCW and
+        // isMinor are redundant: the arc through the midpoint is uniquely
+        // defined.
+        const center = circumcenterFromThreePoints(
           [point[0]!, point[1]!],
+          [curve.centerX, curve.centerY],
           [next[0]!, next[1]!],
-          curve.centerX,
-          curve.centerY,
-          curve.isCCW ?? false,
-          segmentsPerCurve,
         );
+        if (center) {
+          // CCW direction follows the orientation of (start → midpoint →
+          // end): a positive cross product means the three points wind CCW
+          // around the circumcenter, so the arc through the midpoint travels
+          // CCW from start to end.
+          const cross =
+            (curve.centerX - point[0]!) * (next[1]! - point[1]!) -
+            (curve.centerY - point[1]!) * (next[0]! - point[0]!);
+          const isCCW = cross > 0;
+          densified = densifyArc(
+            [point[0]!, point[1]!],
+            [next[0]!, next[1]!],
+            center.x,
+            center.y,
+            isCCW,
+            opts,
+          );
+        } else {
+          // Three points are collinear: fall through, leaving the chord.
+        }
       } else if (curve.segmentType === 4 && curve.controlPoint1 && curve.controlPoint2) {
         densified = densifyBezier(
           [point[0]!, point[1]!],
           [curve.controlPoint1.x, curve.controlPoint1.y],
           [curve.controlPoint2.x, curve.controlPoint2.y],
           [next[0]!, next[1]!],
-          segmentsPerCurve,
+          opts,
         );
       }
 

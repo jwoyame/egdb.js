@@ -8,7 +8,11 @@ import {
   parseSdeBinary,
   parseSdeBinaryPoints,
   parseSdeBinaryMultiPart,
+  densifyArc,
+  densifyBezier,
+  densifyCurves,
   type SpatialReferenceParams,
+  type SegmentModifier,
 } from '../src/parsers/geometry-parser.js';
 import { parseDefinitionXml, parseGdbItems } from '../src/parsers/gdb-items-parser.js';
 import { geometryToWkt, isValidGeometry, geometryToSqlExpression } from '../src/parsers/geometry-writer.js';
@@ -366,17 +370,17 @@ describe('SDEBINARY Parser', () => {
       expect(result.error).toMatch(/Insufficient/);
     });
 
-    it('flags hasCurves when bytes-per-point exceeds the curve threshold', () => {
-      // 8 header + 30 payload bytes for 2 points = 15 bytes/pt, above the
-      // curve threshold (12). Whatever the parse outcome, hasCurves should
-      // be set so the caller knows the geometry needs curve handling.
+    it('flags hasCurves when header byte 5 has bit 0x08 set', () => {
+      // The "has curves" flag lives in byte 5 of the 8-byte header (verified
+      // across 305 polygon layers in test data, and consistent with Esri's
+      // ArcSDE 10.0 SDK byte layout).
       const buf = Buffer.alloc(8 + 30);
+      buf[5] = 0x08;
       const result = parseSdeBinaryMultiPart(buf, 2, stdSr);
       expect(result.hasCurves).toBe(true);
     });
 
-    it('does not flag hasCurves for typical polygon density', () => {
-      // 8 header + 20 payload bytes for 4 points = 5 bytes/pt, below threshold
+    it('does not flag hasCurves when byte 5 is 0', () => {
       const buf = Buffer.alloc(8 + 20);
       const result = parseSdeBinaryMultiPart(buf, 4, stdSr);
       expect(result.hasCurves).toBe(false);
@@ -444,6 +448,162 @@ describe('SDEBINARY Parser', () => {
     it('returns an empty array when there are no parts', () => {
       const result = parseSdeBinaryPoints(Buffer.alloc(0), 0, stdSr);
       expect(result).toEqual([]);
+    });
+  });
+});
+
+describe('Curve Densification', () => {
+  describe('densifyArc', () => {
+    it('produces segments+1 points', () => {
+      // Quarter arc from (1,0) to (0,1) around origin, CCW
+      const out = densifyArc([1, 0], [0, 1], 0, 0, true, 8);
+      expect(out.length).toBe(9);
+    });
+
+    it('starts at start and ends at end', () => {
+      const out = densifyArc([1, 0], [0, 1], 0, 0, true, 4);
+      expect(out[0]).toEqual([1, 0]);
+      expect(out[out.length - 1]).toEqual([0, 1]);
+    });
+
+    it('produces points on the circle (CCW quarter arc)', () => {
+      const out = densifyArc([1, 0], [0, 1], 0, 0, true, 16);
+      for (const p of out) {
+        const r = Math.hypot(p[0]!, p[1]!);
+        expect(r).toBeCloseTo(1, 6);
+      }
+    });
+
+    it('CCW vs CW pick different arcs', () => {
+      // CCW from (1,0) to (-1,0): goes through (0,1) (upper)
+      const ccw = densifyArc([1, 0], [-1, 0], 0, 0, true, 4);
+      // CW from (1,0) to (-1,0): goes through (0,-1) (lower)
+      const cw = densifyArc([1, 0], [-1, 0], 0, 0, false, 4);
+      // Mid-arc point: CCW should have y > 0, CW should have y < 0
+      expect(ccw[2]![1]!).toBeGreaterThan(0);
+      expect(cw[2]![1]!).toBeLessThan(0);
+    });
+
+    it('handles long arc (CCW from (1,0) to (1,-ε) going almost full circle)', () => {
+      // CCW from (1,0) to (cos(-π/4), sin(-π/4)): the CCW path goes the long way (~7π/4)
+      const end: [number, number] = [Math.cos(-Math.PI / 4), Math.sin(-Math.PI / 4)];
+      const out = densifyArc([1, 0], end, 0, 0, true, 32);
+      // Mid-arc should be roughly (-1, 0) since we go around the long way
+      const mid = out[16]!;
+      expect(mid[0]).toBeLessThan(0);
+    });
+  });
+
+  describe('densifyBezier', () => {
+    it('produces segments+1 points', () => {
+      const out = densifyBezier([0, 0], [1, 1], [2, 1], [3, 0], 8);
+      expect(out.length).toBe(9);
+    });
+
+    it('starts at start and ends at end', () => {
+      const out = densifyBezier([0, 0], [1, 2], [3, 2], [4, 0], 4);
+      expect(out[0]).toEqual([0, 0]);
+      expect(out[out.length - 1]).toEqual([4, 0]);
+    });
+  });
+
+  describe('densifyCurves', () => {
+    it('returns identical parts when curves array is empty', () => {
+      const parts = [
+        [
+          [0, 0],
+          [10, 0],
+          [10, 10],
+          [0, 10],
+          [0, 0],
+        ],
+      ];
+      const result = densifyCurves(parts, []);
+      expect(result.length).toBe(1);
+      expect(result[0]).toHaveLength(5);
+    });
+
+    it('densifies a circular arc segment in a polygon', () => {
+      // Esri's modern arc encoding stores three points on the arc: start,
+      // end, and a midpoint. Here the chord is (10,0)→(10,10), and we mark
+      // the arc midpoint at (15,5) — a half-circle bulging to +X.
+      const parts = [
+        [
+          [0, 0],
+          [10, 0],
+          [10, 10],
+          [0, 10],
+          [0, 0],
+        ],
+      ];
+      const curves: SegmentModifier[] = [
+        {
+          startPointIndex: 1, // chord between point 1 and point 2
+          segmentType: 1,
+          centerX: 15, // arc midpoint X (not the geometric center)
+          centerY: 5,  // arc midpoint Y
+        },
+      ];
+      const out = densifyCurves(parts, curves, { segmentsPerCurve: 8 });
+      expect(out.length).toBe(1);
+      const ring = out[0]!;
+      // Original 5 points + 7 interior arc samples (segments - 1) = 12
+      expect(ring.length).toBe(12);
+      expect(ring[0]).toEqual([0, 0]);
+      expect(ring[1]).toEqual([10, 0]);
+      expect(ring[ring.length - 1]).toEqual([0, 0]);
+      // Mid-arc (densified index 4 → ring index 5) is at (15, 5)
+      const midArc = ring[5]!;
+      expect(midArc[0]!).toBeCloseTo(15, 1);
+      expect(midArc[1]!).toBeCloseTo(5, 1);
+    });
+
+    it('skips densification when isLine is set', () => {
+      const parts = [
+        [
+          [0, 0],
+          [10, 0],
+        ],
+      ];
+      const curves: SegmentModifier[] = [
+        {
+          startPointIndex: 0,
+          segmentType: 1,
+          centerX: 5,
+          centerY: 0,
+          isLine: true,
+        },
+      ];
+      const out = densifyCurves(parts, curves);
+      expect(out[0]).toHaveLength(2); // unchanged
+    });
+
+    it('maps global startPointIndex correctly across multipart rings', () => {
+      // Two rings of 3 points each. Curve attaches at global index 4
+      // (= ring 1, local index 1).
+      const parts = [
+        [
+          [0, 0],
+          [10, 0],
+          [0, 0],
+        ],
+        [
+          [100, 100],
+          [200, 100],
+          [100, 100],
+        ],
+      ];
+      const curves: SegmentModifier[] = [
+        {
+          startPointIndex: 4,
+          segmentType: 1,
+          centerX: 150, // arc midpoint X
+          centerY: 110, // arc midpoint Y (bulges up — non-collinear with chord)
+        },
+      ];
+      const out = densifyCurves(parts, curves, { segmentsPerCurve: 8 });
+      expect(out[0]).toHaveLength(3); // ring 0 unchanged
+      expect(out[1]!.length).toBeGreaterThan(3); // ring 1 densified
     });
   });
 });
