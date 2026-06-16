@@ -68,6 +68,20 @@ export class EnterpriseGeodatabase {
   private config: ConnectionConfig;
   private _version: string | null = null;
   private _tables: TableInfo[] | null = null;
+  // Opened tables, keyed by canonical (lower-cased) table name. Table schema
+  // is static for the life of the connection, so openTable's metadata load
+  // (GDB_ITEMS XML + INFORMATION_SCHEMA + COUNT + evw lookup - several round
+  // trips) only needs to run once per table. Promise-valued so concurrent
+  // opens share one load; evicted on failure so a transient error doesn't
+  // poison the cache. Version is NOT part of the key: the table is
+  // version-agnostic and stream()/insert() take the version per call.
+  //
+  // Caveat: a cached table's metadata (field list and featureCount) is frozen
+  // at first open until the connection is recycled. featureCount is otherwise
+  // unused; a live schema change (ALTER TABLE / re-registration) needs
+  // evictTable() or a reconnect to be picked up. The key assumes table Name is
+  // unique across the geodatabase (true for a single parcel fabric).
+  private _tableCache = new Map<string, Promise<EnterpriseTable>>();
   private _logger: Logger;
 
   private constructor(config: ConnectionConfig, connection: IDatabaseConnection) {
@@ -260,6 +274,30 @@ export class EnterpriseGeodatabase {
       throw new Error(`Table not found: ${name}`);
     }
 
+    // Cache by canonical name so re-opening the same table (every parcel
+    // click opens Parcels/Lines/Points) skips the multi-round-trip metadata
+    // load. listTables() above is already cached, so the lookup is cheap.
+    const key = tableInfo.name.toLowerCase();
+    const cached = this._tableCache.get(key);
+    if (cached) return cached;
+
+    const opening = this.buildTable(tableInfo);
+    this._tableCache.set(key, opening);
+    opening.catch(() => this._tableCache.delete(key));
+    return opening;
+  }
+
+  /**
+   * Drop a cached table so the next openTable() reloads its metadata. Call
+   * after a live schema change (ALTER TABLE / re-registration); otherwise a
+   * table's fields and featureCount stay frozen for the connection's lifetime.
+   */
+  evictTable(name: string): void {
+    this._tableCache.delete(name.toLowerCase());
+  }
+
+  /** Resolve a table's version wiring and open it (no caching). */
+  private async buildTable(tableInfo: TableInfo): Promise<EnterpriseTable> {
     // Check for enterprise versioned view if table is versioned
     if (tableInfo.isVersioned && !tableInfo.evwViewName) {
       tableInfo.evwViewName = await this.getEvwViewName(tableInfo.name) ?? undefined;
@@ -1349,6 +1387,9 @@ export class EnterpriseGeodatabase {
    * Close the geodatabase connection
    */
   async close(): Promise<void> {
+    // Cached tables hold this connection; drop them so they can't be reused
+    // against a closed connection after a reconnect.
+    this._tableCache.clear();
     await this.connection.close();
   }
 }
