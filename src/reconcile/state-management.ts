@@ -12,10 +12,16 @@ import { buildIntegerList } from '../utils/sql-helpers';
 /**
  * Create a child state branching from parentStateId.
  *
- * The caller MUST hold an open transaction. The three writes (allocate id,
- * insert state row, copy lineage) must commit or roll back together — without
- * a transaction, a partial failure leaves the state generator advanced and
- * the lineage table inconsistent.
+ * SQL Server uses ArcSDE's own primitives (SDE_get_primary_oid +
+ * SDE_state_new_edit), which is what ArcMap does: it allocates the id, closes
+ * the parent if open, inserts the open child sharing the parent's lineage, and
+ * sets the state lock. NOTE this closes the parent state - safe for egdb's
+ * model (the version tip is already closed) but a caveat in a mixed-writer
+ * (ArcGIS) environment. The PG fallback is a separate, unvalidated path that
+ * still uses the old generator-table approach and a divergent lineage shape.
+ *
+ * The caller MUST hold an open transaction so the id allocation and state
+ * creation commit or roll back together.
  *
  * @returns the new state_id
  */
@@ -29,44 +35,71 @@ export async function createChildState(
 
   const driver = connection.driver;
 
-  const nextIdSql =
-    driver === 'sqlserver'
-      ? `UPDATE sde.SDE_state_id_generator SET id_value = id_value + 1 OUTPUT DELETED.id_value`
-      : `UPDATE sde.sde_state_id_generator SET id_value = id_value + 1 RETURNING id_value - 1 AS new_id`;
-
-  const idResult = await connection.query<{ id_value?: number; new_id?: number }>(nextIdSql);
-  const newStateId = idResult[0]?.id_value ?? idResult[0]?.new_id;
-  if (newStateId === undefined) {
-    throw new Error('Failed to allocate state ID from SDE_state_id_generator');
+  if (driver === 'sqlserver') {
+    // Do exactly what ArcMap/ArcSDE does to start an edit: allocate a new
+    // state id (id_type 8) and an SDE connection id (id_type 12) from
+    // sde.SDE_object_ids via SDE_get_primary_oid, then call SDE_state_new_edit.
+    // That stored procedure closes the parent state, inserts the OPEN child
+    // state branching from it, maintains the SDE_state_lineages closure, and
+    // places the state lock - all the invariants real ArcSDE relies on.
+    //
+    // (egdb previously updated a fabricated sde.SDE_state_id_generator table,
+    // which does not exist in a real ArcSDE geodatabase - so versioned inserts
+    // failed with "Invalid object name 'sde.SDE_state_id_generator'".)
+    const sql = `
+      SET NOCOUNT ON;
+      DECLARE @newState BIGINT, @conn INT, @usr NVARCHAR(128), @lin BIGINT, @crt DATETIME;
+      EXEC sde.SDE_get_primary_oid 8, 1, @newState OUTPUT;
+      EXEC sde.SDE_get_primary_oid 12, 1, @conn OUTPUT;
+      EXEC sde.SDE_get_current_user_name @usr OUTPUT;
+      SELECT @lin = lineage_name FROM sde.SDE_states WHERE state_id = @p0;
+      EXEC sde.SDE_state_new_edit @newState, @usr, @p0, @lin OUTPUT, @conn, @crt OUTPUT;
+      SELECT @newState AS new_id;`;
+    const rows = await connection.query<{ new_id?: number }>(sql, [parentStateId]);
+    const newStateId = rows[0]?.new_id;
+    if (newStateId === undefined || newStateId === null) {
+      throw new Error('Failed to allocate state via sde.SDE_state_new_edit');
+    }
+    return Number(newStateId);
   }
 
-  const insertStateSql =
-    driver === 'sqlserver'
-      ? `INSERT INTO sde.SDE_states (state_id, owner, creation_time, lineage_name, parent_state_id)
-         VALUES (@p0, SYSTEM_USER, GETDATE(), @p0, @p1)`
-      : `INSERT INTO sde.sde_states (state_id, owner, creation_time, lineage_name, parent_state_id)
-         VALUES ($1, current_user, now(), $1, $2)`;
-  await connection.execute(insertStateSql, [newStateId, parentStateId]);
-
-  const copyLineageSql =
-    driver === 'sqlserver'
-      ? `INSERT INTO sde.SDE_state_lineages (lineage_name, lineage_id)
-         SELECT @p0, lineage_id FROM sde.SDE_state_lineages
-         WHERE lineage_name = (SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p1)
-         UNION ALL
-         SELECT @p0, @p0`
-      : `INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id)
-         SELECT $1, lineage_id FROM sde.sde_state_lineages
-         WHERE lineage_name = (SELECT lineage_name FROM sde.sde_states WHERE state_id = $2)
-         UNION ALL
-         SELECT $1, $1`;
-  await connection.execute(copyLineageSql, [newStateId, parentStateId]);
-
+  // PostgreSQL ArcSDE path. NOTE: this has NOT been validated against a real
+  // ArcSDE PG instance (Putnam is SQL Server). When adding a PG deployment,
+  // mirror the SQL Server approach using the PG ArcSDE state functions rather
+  // than this generator-table fallback.
+  const idResult = await connection.query<{ new_id?: number }>(
+    `UPDATE sde.sde_state_id_generator SET id_value = id_value + 1 RETURNING id_value - 1 AS new_id`,
+  );
+  const newStateId = idResult[0]?.new_id;
+  if (newStateId === undefined) {
+    throw new Error('Failed to allocate state ID');
+  }
+  await connection.execute(
+    `INSERT INTO sde.sde_states (state_id, owner, creation_time, lineage_name, parent_state_id)
+     VALUES ($1, current_user, now(), $1, $2)`,
+    [newStateId, parentStateId],
+  );
+  await connection.execute(
+    `INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id)
+     SELECT $1, lineage_id FROM sde.sde_state_lineages
+     WHERE lineage_name = (SELECT lineage_name FROM sde.sde_states WHERE state_id = $2)
+     UNION ALL
+     SELECT $1, $1`,
+    [newStateId, parentStateId],
+  );
   return newStateId;
 }
 
 /**
  * Delete a child state and its A/D table entries.
+ *
+ * **PRECONDITION:** the state must be a LEAF — it must have no children in
+ * `SDE_states.parent_state_id`. Deleting a state that has children would
+ * silently destroy A/D rows that descendant states still inherit (their
+ * versioned-view reads would lose features). Today the only caller is
+ * `EditSession.discard()` which operates on its own newly-created child
+ * (always a leaf at discard time), but the guard makes the helper safe for
+ * future cleanup callers.
  *
  * Order matters: SDE_state_locks rows referencing the state must be removed
  * before the state row itself, because the schema typically has a foreign
@@ -79,6 +112,20 @@ export async function deleteChildState(
 ): Promise<void> {
   const driver = connection.driver;
   const quoteId = (name: string): string => (driver === 'sqlserver' ? `[${name}]` : `"${name}"`);
+
+  // Leaf precondition — refuse to delete a state that has children, because
+  // descendants inherit A/D rows tagged with this state_id.
+  const childCheckSql = driver === 'sqlserver'
+    ? `SELECT TOP 1 state_id FROM sde.SDE_states WHERE parent_state_id = @p0`
+    : `SELECT state_id FROM sde.sde_states WHERE parent_state_id = $1 LIMIT 1`;
+  const children = await connection.query<{ state_id: number | bigint }>(childCheckSql, [stateId]);
+  if (children.length > 0) {
+    throw new Error(
+      `deleteChildState(${stateId}): refusing to delete — state has child ${Number(children[0]!.state_id)} in SDE_states.parent_state_id. ` +
+      `Deleting a non-leaf state would orphan descendant A/D rows. ` +
+      `Delete descendants first or use a higher-level cleanup helper.`,
+    );
+  }
 
   for (const table of registeredTables) {
     const qSchema = quoteId(table.schema);

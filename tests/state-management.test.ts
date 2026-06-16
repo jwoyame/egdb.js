@@ -89,38 +89,34 @@ describe('createChildState', () => {
     );
   });
 
-  it('threads the parent state into the lineage copy', async () => {
+  it('creates the edit state the ArcMap way via SDE_state_new_edit', async () => {
     const { connection, calls } = makeMock({
       inTransaction: true,
       driver: 'sqlserver',
       queryResponses: [
-        { match: /SDE_state_id_generator/, rows: [{ id_value: 999 }] },
+        { match: /SDE_state_new_edit/, rows: [{ new_id: 25067 }] },
       ],
     });
 
     const newId = await createChildState(connection, 100);
-    expect(newId).toBe(999);
+    expect(newId).toBe(25067);
 
-    // Order: id allocation, state insert, lineage copy
-    expect(calls.map((c) => c.sql.replace(/\s+/g, ' ').trim())).toEqual([
-      expect.stringMatching(/SDE_state_id_generator/),
-      expect.stringMatching(/INSERT INTO sde\.SDE_states/),
-      expect.stringMatching(/INSERT INTO sde\.SDE_state_lineages/),
-    ]);
-
-    // State insert uses the new id and parent id
-    expect(calls[1]!.params).toEqual([999, 100]);
-    // Lineage copy uses the new id and parent id
-    expect(calls[2]!.params).toEqual([999, 100]);
+    // Single batch that allocates the id from SDE_object_ids and calls the
+    // native edit-state proc, threading the parent state id as the param.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.sql).toMatch(/SDE_get_primary_oid 8, 1/);
+    expect(calls[0]!.sql).toMatch(/SDE_state_new_edit/);
+    expect(calls[0]!.sql).not.toMatch(/SDE_state_id_generator/);
+    expect(calls[0]!.params).toEqual([100]);
   });
 
-  it('throws when the id generator returns nothing', async () => {
+  it('throws when the native state proc returns nothing', async () => {
     const { connection } = makeMock({
       inTransaction: true,
-      queryResponses: [{ match: /SDE_state_id_generator/, rows: [] }],
+      queryResponses: [{ match: /SDE_state_new_edit/, rows: [] }],
     });
     await expect(createChildState(connection, 100)).rejects.toThrow(
-      /Failed to allocate state ID/
+      /Failed to allocate state via sde\.SDE_state_new_edit/
     );
   });
 });
@@ -130,12 +126,13 @@ describe('deleteChildState', () => {
     const { connection, calls } = makeMock({ driver: 'sqlserver' });
     await deleteChildState(connection, 555, []);
 
-    // With no registered tables, only the three system-table deletes run
+    // Leaf precondition query runs first, then the three system-table deletes.
     const sqls = calls.map((c) => c.sql.replace(/\s+/g, ' ').trim());
-    expect(sqls).toHaveLength(3);
-    expect(sqls[0]).toMatch(/DELETE FROM sde\.SDE_state_locks/);
-    expect(sqls[1]).toMatch(/DELETE FROM sde\.SDE_state_lineages/);
-    expect(sqls[2]).toMatch(/DELETE FROM sde\.SDE_states/);
+    expect(sqls).toHaveLength(4);
+    expect(sqls[0]).toMatch(/SELECT TOP 1 state_id FROM sde\.SDE_states WHERE parent_state_id/);
+    expect(sqls[1]).toMatch(/DELETE FROM sde\.SDE_state_locks/);
+    expect(sqls[2]).toMatch(/DELETE FROM sde\.SDE_state_lineages/);
+    expect(sqls[3]).toMatch(/DELETE FROM sde\.SDE_states/);
   });
 
   it('cleans A/D rows for each registered table before touching system tables', async () => {
@@ -145,11 +142,24 @@ describe('deleteChildState', () => {
     ]);
 
     const sqls = calls.map((c) => c.sql.replace(/\s+/g, ' ').trim());
-    expect(sqls[0]).toMatch(/DELETE FROM \[PA\]\.\[a42\]/);
-    expect(sqls[1]).toMatch(/DELETE FROM \[PA\]\.\[D42\]/);
-    expect(sqls[2]).toMatch(/SDE_state_locks/);
-    expect(sqls[3]).toMatch(/SDE_state_lineages/);
-    expect(sqls[4]).toMatch(/SDE_states/);
+    expect(sqls[0]).toMatch(/SELECT TOP 1 state_id FROM sde\.SDE_states WHERE parent_state_id/);
+    expect(sqls[1]).toMatch(/DELETE FROM \[PA\]\.\[a42\]/);
+    expect(sqls[2]).toMatch(/DELETE FROM \[PA\]\.\[D42\]/);
+    expect(sqls[3]).toMatch(/SDE_state_locks/);
+    expect(sqls[4]).toMatch(/SDE_state_lineages/);
+    expect(sqls[5]).toMatch(/SDE_states/);
+  });
+
+  it('refuses to delete a state with children', async () => {
+    const { connection } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        { match: /parent_state_id/, rows: [{ state_id: 999 }] },
+      ],
+    });
+    await expect(deleteChildState(connection, 555, [])).rejects.toThrow(
+      /refusing to delete — state has child 999/,
+    );
   });
 });
 
