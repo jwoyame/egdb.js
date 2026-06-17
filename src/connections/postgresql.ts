@@ -4,12 +4,19 @@
 import { Pool, PoolClient, PoolConfig } from 'pg';
 import type { IDatabaseConnection, ExecuteResult } from './connection';
 import type { PostgreSQLConfig } from '../types';
+import { RwLock } from '../utils/rw-lock';
 
 export class PostgreSQLConnection implements IDatabaseConnection {
   private pool: Pool | null = null;
   private config: PoolConfig;
   private _isConnected = false;
   private transactionClient: PoolClient | null = null;
+
+  // See SqlServerConnection / utils/rw-lock.ts: a transaction holds the single
+  // `transactionClient` slot exclusively; plain statements take a shared lock so
+  // they can't run on it concurrently. The owner's in-transaction statements
+  // bypass it. stream() uses its own dedicated client, so it isn't locked.
+  private lock = new RwLock();
 
   readonly driver = 'postgresql' as const;
 
@@ -23,6 +30,9 @@ export class PostgreSQLConnection implements IDatabaseConnection {
       ssl: config.ssl,
       connectionTimeoutMillis: config.options?.connectionTimeout ?? 30000,
       query_timeout: config.options?.requestTimeout ?? 30000,
+      // Headroom for concurrent streaming reads + a write transaction on a
+      // shared single-login server (pg pool default max is 10). See sqlserver.ts.
+      max: 20,
     };
   }
 
@@ -45,9 +55,14 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     // Convert @p0, @p1 parameter syntax to $1, $2 for PostgreSQL
     const pgQuery = sqlQuery.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
 
-    const client = this.transactionClient ?? this.pool;
-    const result = await client.query(pgQuery, params);
-    return result.rows as T[];
+    if (this.transactionClient) {
+      const result = await this.transactionClient.query(pgQuery, params);
+      return result.rows as T[];
+    }
+    return this.lock.read(async () => {
+      const result = await this.pool!.query(pgQuery, params);
+      return result.rows as T[];
+    });
   }
 
   async *stream(
@@ -132,12 +147,14 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     // Convert @p0, @p1 parameter syntax to $1, $2 for PostgreSQL
     const pgQuery = sqlStatement.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
 
-    const client = this.transactionClient ?? this.pool;
-    const result = await client.query(pgQuery, params);
-
-    return {
-      rowsAffected: result.rowCount ?? 0,
-    };
+    if (this.transactionClient) {
+      const result = await this.transactionClient.query(pgQuery, params);
+      return { rowsAffected: result.rowCount ?? 0 };
+    }
+    return this.lock.read(async () => {
+      const result = await this.pool!.query(pgQuery, params);
+      return { rowsAffected: result.rowCount ?? 0 };
+    });
   }
 
   /**
@@ -150,18 +167,24 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     // Convert parameter syntax
     const pgQuery = sqlStatement.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
 
-    const client = this.transactionClient ?? this.pool;
-    const result = await client.query(pgQuery, params);
+    const extract = (rows: Record<string, unknown>[]): number[] => {
+      if (rows && rows.length > 0) {
+        return rows.map((row) => {
+          const id = row.objectid ?? row.OBJECTID ?? row.id ?? row.ID;
+          return typeof id === 'number' ? id : parseInt(String(id), 10);
+        });
+      }
+      return [];
+    };
 
-    // Extract objectid from rows (RETURNING objectid)
-    if (result.rows && result.rows.length > 0) {
-      return result.rows.map((row: Record<string, unknown>) => {
-        const id = row.objectid ?? row.OBJECTID ?? row.id ?? row.ID;
-        return typeof id === 'number' ? id : parseInt(String(id), 10);
-      });
+    if (this.transactionClient) {
+      const result = await this.transactionClient.query(pgQuery, params);
+      return extract(result.rows);
     }
-
-    return [];
+    return this.lock.read(async () => {
+      const result = await this.pool!.query(pgQuery, params);
+      return extract(result.rows);
+    });
   }
 
   /**
@@ -169,13 +192,26 @@ export class PostgreSQLConnection implements IDatabaseConnection {
    */
   async beginTransaction(options?: { isolation?: 'serializable' }): Promise<void> {
     if (!this.pool) throw new Error('Not connected');
+    // Guard re-entrant begin before taking the (non-reentrant) write lock.
     if (this.transactionClient) throw new Error('Transaction already in progress');
 
-    this.transactionClient = await this.pool.connect();
-    if (options?.isolation === 'serializable') {
-      await this.transactionClient.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-    } else {
-      await this.transactionClient.query('BEGIN');
+    await this.lock.acquireWrite();
+    try {
+      const client = await this.pool.connect();
+      try {
+        if (options?.isolation === 'serializable') {
+          await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+        } else {
+          await client.query('BEGIN');
+        }
+      } catch (err) {
+        client.release();
+        throw err;
+      }
+      this.transactionClient = client;
+    } catch (err) {
+      this.lock.releaseWrite();
+      throw err;
     }
   }
 
@@ -184,10 +220,16 @@ export class PostgreSQLConnection implements IDatabaseConnection {
    */
   async commitTransaction(): Promise<void> {
     if (!this.transactionClient) throw new Error('No transaction in progress');
-
-    await this.transactionClient.query('COMMIT');
-    this.transactionClient.release();
-    this.transactionClient = null;
+    const client = this.transactionClient;
+    try {
+      await client.query('COMMIT');
+    } finally {
+      // Clear the slot before releasing the lock; always release so a driver
+      // error can't strand the connection.
+      client.release();
+      this.transactionClient = null;
+      this.lock.releaseWrite();
+    }
   }
 
   /**
@@ -195,10 +237,14 @@ export class PostgreSQLConnection implements IDatabaseConnection {
    */
   async rollbackTransaction(): Promise<void> {
     if (!this.transactionClient) throw new Error('No transaction in progress');
-
-    await this.transactionClient.query('ROLLBACK');
-    this.transactionClient.release();
-    this.transactionClient = null;
+    const client = this.transactionClient;
+    try {
+      await client.query('ROLLBACK');
+    } finally {
+      client.release();
+      this.transactionClient = null;
+      this.lock.releaseWrite();
+    }
   }
 
   /**

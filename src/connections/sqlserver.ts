@@ -4,11 +4,19 @@
 import sql from 'mssql';
 import type { IDatabaseConnection, ExecuteResult } from './connection';
 import type { SqlServerConfig } from '../types';
+import { RwLock } from '../utils/rw-lock';
 
 export class SqlServerConnection implements IDatabaseConnection {
   private pool: sql.ConnectionPool | null = null;
   private config: sql.config;
   private transaction: sql.Transaction | null = null;
+
+  // Serialises the single `this.transaction` slot against concurrent
+  // statements: a transaction holds this exclusively for its whole lifetime,
+  // plain statements take it shared. The owner's own in-transaction statements
+  // bypass it (they detect `this.transaction`). Streaming reads use a dedicated
+  // pooled request and don't touch the lock. See utils/rw-lock.ts.
+  private lock = new RwLock();
 
   readonly driver = 'sqlserver' as const;
 
@@ -25,6 +33,11 @@ export class SqlServerConnection implements IDatabaseConnection {
       },
       connectionTimeout: config.options?.connectionTimeout ?? 30000,
       requestTimeout: config.options?.requestTimeout ?? 30000,
+      // Streaming reads each hold a pooled connection for their lifetime and a
+      // write transaction needs one too; the default max of 10 is tight for a
+      // shared single-login server, where a writer could otherwise wait on a
+      // free connection while holding the RW write lock. Give some headroom.
+      pool: { max: 20, min: 0, idleTimeoutMillis: 30000 },
     };
   }
 
@@ -39,19 +52,20 @@ export class SqlServerConnection implements IDatabaseConnection {
   async query<T>(sqlQuery: string, params?: unknown[]): Promise<T[]> {
     if (!this.pool) throw new Error('Not connected');
 
-    const request = this.transaction
-      ? this.transaction.request()
-      : this.pool.request();
-
-    // Add parameters
-    if (params) {
-      params.forEach((param, index) => {
-        request.input(`p${index}`, param);
-      });
+    // Inside our own transaction: run on it directly (we hold the write lock).
+    if (this.transaction) {
+      const request = this.transaction.request();
+      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
+      const result = await request.query(sqlQuery);
+      return result.recordset as T[];
     }
-
-    const result = await request.query(sqlQuery);
-    return result.recordset as T[];
+    // Otherwise take the shared lock so we can't run while a transaction is open.
+    return this.lock.read(async () => {
+      const request = this.pool!.request();
+      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
+      const result = await request.query(sqlQuery);
+      return result.recordset as T[];
+    });
   }
 
   async *stream(
@@ -60,9 +74,13 @@ export class SqlServerConnection implements IDatabaseConnection {
   ): AsyncIterable<Record<string, unknown>> {
     if (!this.pool) throw new Error('Not connected');
 
-    const request = this.transaction
-      ? this.transaction.request()
-      : this.pool.request();
+    // Always stream on a fresh pooled request, independent of any open
+    // transaction. A long generator driven by network backpressure must not
+    // sit on the transaction slot (it would collide with the owner) or on the
+    // RW lock (it would block writers for the stream's whole lifetime). Reads
+    // see committed data under READ COMMITTED; that's the same isolation the
+    // postgres driver's cursor stream uses.
+    const request = this.pool.request();
     request.stream = true;
 
     if (params) {
@@ -169,20 +187,14 @@ export class SqlServerConnection implements IDatabaseConnection {
   async execute(sqlStatement: string, params?: unknown[]): Promise<ExecuteResult> {
     if (!this.pool) throw new Error('Not connected');
 
-    const request = this.transaction
-      ? this.transaction.request()
-      : this.pool.request();
-
-    if (params) {
-      params.forEach((param, index) => {
-        request.input(`p${index}`, param);
-      });
-    }
-
-    const result = await request.query(sqlStatement);
-    return {
-      rowsAffected: result.rowsAffected.reduce((sum, n) => sum + n, 0),
+    const run = async (request: sql.Request): Promise<ExecuteResult> => {
+      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
+      const result = await request.query(sqlStatement);
+      return { rowsAffected: result.rowsAffected.reduce((sum, n) => sum + n, 0) };
     };
+
+    if (this.transaction) return run(this.transaction.request());
+    return this.lock.read(() => run(this.pool!.request()));
   }
 
   /**
@@ -192,27 +204,21 @@ export class SqlServerConnection implements IDatabaseConnection {
   async executeInsert(sqlStatement: string, params?: unknown[]): Promise<number[]> {
     if (!this.pool) throw new Error('Not connected');
 
-    const request = this.transaction
-      ? this.transaction.request()
-      : this.pool.request();
+    const run = async (request: sql.Request): Promise<number[]> => {
+      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
+      const result = await request.query(sqlStatement);
+      // Extract OBJECTID from recordset (OUTPUT INSERTED.OBJECTID)
+      if (result.recordset && result.recordset.length > 0) {
+        return result.recordset.map((row: Record<string, unknown>) => {
+          const id = row.OBJECTID ?? row.objectid ?? row.id ?? row.ID;
+          return typeof id === 'number' ? id : parseInt(String(id), 10);
+        });
+      }
+      return [];
+    };
 
-    if (params) {
-      params.forEach((param, index) => {
-        request.input(`p${index}`, param);
-      });
-    }
-
-    const result = await request.query(sqlStatement);
-
-    // Extract OBJECTID from recordset (OUTPUT INSERTED.OBJECTID)
-    if (result.recordset && result.recordset.length > 0) {
-      return result.recordset.map((row: Record<string, unknown>) => {
-        const id = row.OBJECTID ?? row.objectid ?? row.id ?? row.ID;
-        return typeof id === 'number' ? id : parseInt(String(id), 10);
-      });
-    }
-
-    return [];
+    if (this.transaction) return run(this.transaction.request());
+    return this.lock.read(() => run(this.pool!.request()));
   }
 
   /**
@@ -220,16 +226,29 @@ export class SqlServerConnection implements IDatabaseConnection {
    */
   async beginTransaction(options?: { isolation?: 'serializable' }): Promise<void> {
     if (!this.pool) throw new Error('Not connected');
+    // Guard re-entrant begin BEFORE taking the lock: the write lock is not
+    // reentrant, so an owner that re-begins would self-deadlock. Callers guard
+    // with inTransaction(); this is the last-resort check.
     if (this.transaction) throw new Error('Transaction already in progress');
 
-    this.transaction = new sql.Transaction(this.pool);
-    const isoLevel = options?.isolation === 'serializable'
-      ? sql.ISOLATION_LEVEL.SERIALIZABLE
-      : undefined;
-    if (isoLevel !== undefined) {
-      await this.transaction.begin(isoLevel);
-    } else {
-      await this.transaction.begin();
+    // Hold the connection exclusively for the whole transaction. Acquire the
+    // lock before assigning `this.transaction` so no reader observes it mid-open.
+    await this.lock.acquireWrite();
+    try {
+      const tx = new sql.Transaction(this.pool);
+      const isoLevel = options?.isolation === 'serializable'
+        ? sql.ISOLATION_LEVEL.SERIALIZABLE
+        : undefined;
+      if (isoLevel !== undefined) {
+        await tx.begin(isoLevel);
+      } else {
+        await tx.begin();
+      }
+      this.transaction = tx;
+    } catch (err) {
+      // begin() failed — release the lock so the connection isn't stranded.
+      this.lock.releaseWrite();
+      throw err;
     }
   }
 
@@ -238,9 +257,16 @@ export class SqlServerConnection implements IDatabaseConnection {
    */
   async commitTransaction(): Promise<void> {
     if (!this.transaction) throw new Error('No transaction in progress');
-
-    await this.transaction.commit();
-    this.transaction = null;
+    const tx = this.transaction;
+    try {
+      await tx.commit();
+    } finally {
+      // Clear the slot BEFORE releasing so a freshly-woken reader never routes
+      // into a finished transaction; release even if commit threw so a driver
+      // error can't freeze the connection forever.
+      this.transaction = null;
+      this.lock.releaseWrite();
+    }
   }
 
   /**
@@ -248,9 +274,13 @@ export class SqlServerConnection implements IDatabaseConnection {
    */
   async rollbackTransaction(): Promise<void> {
     if (!this.transaction) throw new Error('No transaction in progress');
-
-    await this.transaction.rollback();
-    this.transaction = null;
+    const tx = this.transaction;
+    try {
+      await tx.rollback();
+    } finally {
+      this.transaction = null;
+      this.lock.releaseWrite();
+    }
   }
 
   /**
