@@ -18,47 +18,40 @@ export async function findCommonAncestor(
   childStateId: number,
   parentStateId: number
 ): Promise<number> {
-  const sql = connection.driver === 'sqlserver'
-    ? `
-      SELECT MAX(child_lin.lineage_id) as ancestor_state_id
-      FROM sde.SDE_state_lineages child_lin
-      WHERE child_lin.lineage_name = (
-        SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p0
-      )
-      AND child_lin.lineage_id IN (
-        SELECT lineage_id FROM sde.SDE_state_lineages
-        WHERE lineage_name = (
-          SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p1
-        )
-      )
-    `
-    : `
-      SELECT MAX(child_lin.lineage_id) as ancestor_state_id
-      FROM sde.sde_state_lineages child_lin
-      WHERE child_lin.lineage_name = (
-        SELECT lineage_name FROM sde.sde_states WHERE state_id = $1
-      )
-      AND child_lin.lineage_id IN (
-        SELECT lineage_id FROM sde.sde_state_lineages
-        WHERE lineage_name = (
-          SELECT lineage_name FROM sde.sde_states WHERE state_id = $2
-        )
-      )
-    `;
+  // The common ancestor is the deepest state that is an ancestor of BOTH.
+  // Compute each state's bounded, tip-inclusive ancestor closure (the same
+  // primitive getStatesInRange/getVersionStateLineage use), intersect, take
+  // the max.
+  //
+  // The previous implementation took MAX(lineage_id) over states sharing the
+  // child's lineage_name that were also in the parent's lineage_name set. But
+  // `lineage_name` identifies a whole lineage TREE, not an ancestry path, and a
+  // version's edit states share DEFAULT's lineage_name (correct ArcSDE
+  // behaviour). So when the parent hadn't branched away (the normal case —
+  // e.g. DEFAULT at 25066, an un-reconciled version's tip at 25070, all on
+  // lineage_name 24542), the "intersection" was the whole chain and MAX
+  // returned the child's own tip. That made childOnlyStates empty, so
+  // Reconcile & Post and conflict detection saw zero changes. Bounding each
+  // closure by its own state_id (via getStatesInRange) fixes it for both the
+  // same-lineage and branched-lineage cases.
+  const [childClosure, parentClosure] = await Promise.all([
+    getStatesInRange(connection, childStateId, 0),
+    getStatesInRange(connection, parentStateId, 0),
+  ]);
 
-  const result = await connection.query<{ ancestor_state_id: number | null }>(
-    sql,
-    [childStateId, parentStateId]
-  );
+  const parentSet = new Set(parentClosure);
+  let ancestor = -1;
+  for (const s of childClosure) {
+    if (parentSet.has(s) && s > ancestor) ancestor = s;
+  }
 
-  const ancestorStateId = result[0]?.ancestor_state_id;
-  if (ancestorStateId === null || ancestorStateId === undefined) {
+  if (ancestor < 0) {
     throw new Error(
       `Could not find common ancestor between states ${childStateId} and ${parentStateId}`
     );
   }
 
-  return ancestorStateId;
+  return ancestor;
 }
 
 /**
