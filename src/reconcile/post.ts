@@ -270,6 +270,10 @@ export async function getChildUniqueStates(
       ORDER BY state_id
     `;
 
-  const result = await connection.query<{ state_id: number }>(sql, [childStateId, parentStateId]);
-  return result.map(r => r.state_id);
+  const result = await connection.query<{ state_id: number | bigint | string }>(sql, [childStateId, parentStateId]);
+  // Coerce to Number: SQL Server returns the BIGINT state_id as a string (the
+  // outer DISTINCT over a lineage_id/param UNION yields a bigint-typed column),
+  // and postChangesToParent's buildIntegerList rejects string state ids. Other
+  // state-id readers (getVersionStateLineage) already coerce.
+  return result.map(r => Number(r.state_id));
 }

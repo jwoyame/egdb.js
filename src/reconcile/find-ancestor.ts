@@ -99,12 +99,14 @@ export async function getStatesInRange(
       ORDER BY state_id
     `;
 
-  const result = await connection.query<{ state_id: number }>(
+  const result = await connection.query<{ state_id: number | bigint | string }>(
     sql,
     [versionStateId, ancestorStateId]
   );
 
-  return result.map(r => r.state_id);
+  // Coerce: SQL Server can return BIGINT state_id as a string. Downstream
+  // consumers (post's buildIntegerList, numeric comparisons) need real numbers.
+  return result.map(r => Number(r.state_id));
 }
 
 /**
