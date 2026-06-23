@@ -16,6 +16,7 @@ export {
   getStatesInRange,
   getLineageName,
   addStatesToLineage,
+  findExternallyReferencedStates,
 } from './find-ancestor';
 
 // Change detection

@@ -108,6 +108,71 @@ export async function getStatesInRange(
 }
 
 /**
+ * Find which of `states` are NOT exclusive to the version (owner.name) -- i.e.
+ * referenced by another version's lineage, or having a forked child that is not
+ * part of this version's own edit chain. Editing those states in place would
+ * corrupt the other version, so a caller (revertFeatures) must refuse.
+ *
+ * `states` is the version's child-only state set (its own edits since it
+ * diverged from its parent). Two ways a state can be external:
+ *   (a) another version's tip equals it, or its closure includes it; or
+ *   (b) some state forks off it that is NOT itself one of these child-only
+ *       states (a branch into another version / an orphan).
+ * Branches off the COMMON ANCESTOR (e.g. other versions off DEFAULT) are fine
+ * and are not flagged, because their fork point is below `states`.
+ */
+export async function findExternallyReferencedStates(
+  connection: IDatabaseConnection,
+  owner: string,
+  name: string,
+  states: number[],
+): Promise<number[]> {
+  if (states.length === 0) return [];
+  const inStates = states.join(',');
+  const sql = connection.driver === 'sqlserver'
+    ? `
+      SELECT DISTINCT sl.lineage_id AS state
+      FROM sde.SDE_versions v
+      JOIN sde.SDE_states vs ON vs.state_id = v.state_id
+      JOIN sde.SDE_state_lineages sl
+        ON sl.lineage_name = vs.lineage_name AND sl.lineage_id <= v.state_id
+      WHERE NOT (LOWER(v.owner) = LOWER(@p0) AND LOWER(v.name) = LOWER(@p1))
+        AND sl.lineage_id IN (${inStates})
+      UNION
+      SELECT v.state_id AS state
+      FROM sde.SDE_versions v
+      WHERE NOT (LOWER(v.owner) = LOWER(@p0) AND LOWER(v.name) = LOWER(@p1))
+        AND v.state_id IN (${inStates})
+      UNION
+      SELECT s.parent_state_id AS state
+      FROM sde.SDE_states s
+      WHERE s.parent_state_id IN (${inStates})
+        AND s.state_id NOT IN (${inStates})
+    `
+    : `
+      SELECT DISTINCT sl.lineage_id AS state
+      FROM sde.sde_versions v
+      JOIN sde.sde_states vs ON vs.state_id = v.state_id
+      JOIN sde.sde_state_lineages sl
+        ON sl.lineage_name = vs.lineage_name AND sl.lineage_id <= v.state_id
+      WHERE NOT (LOWER(v.owner) = LOWER($1) AND LOWER(v.name) = LOWER($2))
+        AND sl.lineage_id IN (${inStates})
+      UNION
+      SELECT v.state_id AS state
+      FROM sde.sde_versions v
+      WHERE NOT (LOWER(v.owner) = LOWER($1) AND LOWER(v.name) = LOWER($2))
+        AND v.state_id IN (${inStates})
+      UNION
+      SELECT s.parent_state_id AS state
+      FROM sde.sde_states s
+      WHERE s.parent_state_id IN (${inStates})
+        AND s.state_id NOT IN (${inStates})
+    `;
+  const rows = await connection.query<{ state: number | bigint }>(sql, [owner, name]);
+  return [...new Set(rows.map(r => Number(r.state)))];
+}
+
+/**
  * Get the lineage name for a state.
  *
  * @param connection Database connection

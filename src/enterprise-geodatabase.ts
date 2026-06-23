@@ -28,6 +28,9 @@ import type {
 import {
   findCommonAncestor,
   getStatesInRange,
+  findExternallyReferencedStates,
+  removeFromATable,
+  removeFromDTable,
   getLineageName,
   addStatesToLineage,
   getAllChanges,
@@ -520,6 +523,82 @@ export class EnterpriseGeodatabase {
 
     const rows = await this.connection.query<{ lineage_id: number | bigint }>(sql, [version.stateId]);
     return rows.map(r => Number(r.lineage_id));
+  }
+
+  /**
+   * Revert specific features within a version back to their parent state, by
+   * physically removing their A-table rows and D-table delete-markers from the
+   * version's OWN edit states (the states between its common ancestor with its
+   * parent and its tip). Unlike a normal edit, this creates no new state and
+   * leaves NO edit behind for those features -- so they drop out of the version
+   * diff AND out of a subsequent post, as if the edit never happened. This is
+   * the clean primitive behind a per-operation "reverse": delete what an
+   * operation created, un-retire what it retired, undo what it mutated -- all by
+   * the same "remove this feature's edits" action.
+   *
+   * SAFETY: refuses (throws) if any of the version's edit states are shared with
+   * another version or have a fork, since deleting their rows would corrupt that
+   * other version. The caller must serialise against concurrent edits/reconcile
+   * on this version (e.g. a version mutex + no open edit session).
+   *
+   * @param versionName  owner.name of the (non-root) version to edit.
+   * @param features     the features to revert, by table name + OBJECTID.
+   * @returns the count reverted and the state ids that were touched.
+   */
+  async revertFeatures(
+    versionName: string,
+    features: ReadonlyArray<{ table: string; objectId: number }>,
+  ): Promise<{ reverted: number; states: number[] }> {
+    const version = await this.getVersion(versionName);
+    if (!version?.stateId) throw new Error(`Version not found or has no state: ${versionName}`);
+    if (!version.parentName) throw new Error(`Cannot revert features in a root version: ${versionName}`);
+    if (features.length === 0) return { reverted: 0, states: [] };
+
+    const parent = await this.getVersion(version.parentName);
+    if (!parent?.stateId) throw new Error(`Parent version not found: ${version.parentName}`);
+
+    const conn = this.connection;
+    const ancestor = await findCommonAncestor(conn, version.stateId, parent.stateId);
+    const childOnlyStates = await getStatesInRange(conn, version.stateId, ancestor);
+    if (childOnlyStates.length === 0) return { reverted: 0, states: [] };
+
+    // Never edit a state another version can see.
+    const shared = await findExternallyReferencedStates(conn, version.owner, version.name, childOnlyStates);
+    if (shared.length > 0) {
+      throw new Error(
+        `Refusing to revert features in ${versionName}: edit state(s) ${shared.join(', ')} are shared with another version. Reconcile/post it first.`,
+      );
+    }
+
+    // Resolve each table's registration metadata once.
+    const allTables = await this.listTables();
+    const tableInfoByName = new Map<string, TableInfo>();
+    for (const f of features) {
+      const key = f.table.toLowerCase();
+      if (tableInfoByName.has(key)) continue;
+      const ti = allTables.find(
+        t => t.name.toLowerCase() === key || t.physicalName.toLowerCase() === key,
+      );
+      if (!ti) throw new Error(`Table not found: ${f.table}`);
+      tableInfoByName.set(key, ti);
+    }
+
+    const wasInTx = conn.inTransaction();
+    if (!wasInTx) await conn.beginTransaction();
+    try {
+      for (const f of features) {
+        const ti = tableInfoByName.get(f.table.toLowerCase())!;
+        for (const stateId of childOnlyStates) {
+          await removeFromATable(conn, ti, f.objectId, stateId);
+          await removeFromDTable(conn, ti, f.objectId, stateId);
+        }
+      }
+      if (!wasInTx) await conn.commitTransaction();
+    } catch (e) {
+      if (!wasInTx) await conn.rollbackTransaction();
+      throw e;
+    }
+    return { reverted: features.length, states: childOnlyStates };
   }
 
   /**
