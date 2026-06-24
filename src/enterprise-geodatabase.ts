@@ -40,7 +40,6 @@ import {
   isReconciled,
   countChangesInStates,
   updateVersionState,
-  getChildUniqueStates,
   getVersionStats,
   cleanupStaleLocks,
   computeGraduablePrefix,
@@ -1131,14 +1130,16 @@ export class EnterpriseGeodatabase {
         );
       }
 
-      const childUniqueStates = await getChildUniqueStates(
-        this.connection,
-        version.stateId,
-        parent.stateId
-      );
-
       const tables = await this.listTables();
       const versionedTables = tables.filter(t => t.isVersioned);
+
+      // Count the version's posted changes over the states between the common
+      // ancestor and the version tip -- the same reliable range the reverse path
+      // uses. (getChildUniqueStates was returning empty for some reconciled
+      // versions, so changesPosted came back 0 even though the post landed.)
+      const ancestor = await findCommonAncestor(this.connection, version.stateId, parent.stateId);
+      const childStates = await getStatesInRange(this.connection, version.stateId, ancestor);
+      const changesPosted = await countChangesInStates(this.connection, versionedTables, childStates);
 
       // ArcMap-style post: the version's edits already live in ITS OWN states,
       // which descend from the parent's (DEFAULT's) current tip and share its
@@ -1152,16 +1153,21 @@ export class EnterpriseGeodatabase {
       // reconcile would see no parent changes and silently miss (then resurrect)
       // this post. Advancing to a NEW tip state keeps every state immutable and
       // lets siblings pick the post up on their next reconcile.
-      const changesPosted = childUniqueStates.length === 0
-        ? 0
-        : await countChangesInStates(this.connection, versionedTables, childUniqueStates);
-
-      await updateVersionState(
+      const versionsAdvanced = await updateVersionState(
         this.connection,
         parent.owner,
         parent.name,
         version.stateId
       );
+      // The actual landing guarantee: DEFAULT must have advanced to the version
+      // tip. If 0 rows matched, the edit did NOT publish -- fail loudly (and roll
+      // back) rather than report a phantom success, the way April's post did.
+      if (versionsAdvanced !== 1) {
+        throw new Error(
+          `Post did not advance ${parentFullName}: matched ${versionsAdvanced} version rows ` +
+          `(expected 1). The edit was NOT published.`
+        );
+      }
 
       // Lock auto-releases on commit (Postgres pg_advisory_xact_lock; SQL Server
       // sp_getapplock @LockOwner='Transaction'). No explicit unlock needed.

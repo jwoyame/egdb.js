@@ -156,12 +156,13 @@ export async function updateVersionState(
   versionOwner: string,
   versionName: string,
   newStateId: number
-): Promise<void> {
+): Promise<number> {
   const sql = connection.driver === 'sqlserver'
     ? `UPDATE sde.SDE_versions SET state_id = @p0 WHERE owner = @p1 AND name = @p2`
     : `UPDATE sde.sde_versions SET state_id = $1 WHERE owner = $2 AND name = $3`;
 
-  await connection.execute(sql, [newStateId, versionOwner, versionName]);
+  const r = await connection.execute(sql, [newStateId, versionOwner, versionName]);
+  return r.rowsAffected;
 }
 
 /**
