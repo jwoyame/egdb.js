@@ -114,6 +114,36 @@ export async function postChangesToParent(
 }
 
 /**
+ * Count the A/D delta rows tagged with any of `stateIds`, across all versioned
+ * tables. Used by the ArcMap-style post (which advances the parent pointer
+ * instead of moving rows) to report changesPosted without mutating anything --
+ * and so the caller can refuse to tear a version down on a 0-change post.
+ */
+export async function countChangesInStates(
+  connection: IDatabaseConnection,
+  tables: TableInfo[],
+  stateIds: number[]
+): Promise<number> {
+  if (stateIds.length === 0) return 0;
+  const driver = connection.driver;
+  const stateList = buildIntegerList(stateIds, 'countChangesInStates');
+  const sidCol = driver === 'sqlserver' ? 'SDE_STATE_ID' : 'sde_state_id';
+  let count = 0;
+  for (const table of tables) {
+    if (!table.isVersioned || !table.registrationId) continue;
+    const qSchema = quoteId(driver, table.schema);
+    for (const prefix of ['a', 'D']) {
+      const t = `${qSchema}.${quoteId(driver, `${prefix}${table.registrationId}`)}`;
+      const r = await connection.query<{ c: number | bigint }>(
+        `SELECT COUNT(*) AS c FROM ${t} WHERE ${sidCol} IN (${stateList})`
+      );
+      count += Number(r[0]?.c ?? 0);
+    }
+  }
+  return count;
+}
+
+/**
  * Update a version's state_id in the versions table.
  *
  * @param connection Database connection

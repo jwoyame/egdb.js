@@ -62,6 +62,7 @@ export {
 export {
   isReconciled,
   postChangesToParent,
+  countChangesInStates,
   updateVersionState,
   deleteStates,
   getChildUniqueStates,

@@ -39,9 +39,8 @@ import {
   getConflictsSummary,
   applyParentChanges,
   isReconciled,
-  postChangesToParent,
+  countChangesInStates,
   updateVersionState,
-  deleteStates,
   getChildUniqueStates,
   getVersionStats,
   cleanupStaleLocks,
@@ -1140,45 +1139,43 @@ export class EnterpriseGeodatabase {
       const tables = await this.listTables();
       const versionedTables = tables.filter(t => t.isVersioned);
 
-      const changesPosted = await postChangesToParent(
-        this.connection,
-        versionedTables,
-        childUniqueStates,
-        parent.stateId
-      );
+      // ArcMap-style post: the version's edits already live in ITS OWN states,
+      // which descend from the parent's (DEFAULT's) current tip and share its
+      // lineage (reconcile guaranteed both). So posting is just ADVANCING the
+      // parent's state pointer to the version's reconciled tip -- DEFAULT then
+      // resolves those edits with ZERO row copying and ZERO new states.
+      //
+      // Why not mutate/re-tag like the old code did: a sibling version that
+      // reconciled against the old DEFAULT tip has it in its closure; if we
+      // changed that state's CONTENTS in place (same id), the sibling's next
+      // reconcile would see no parent changes and silently miss (then resurrect)
+      // this post. Advancing to a NEW tip state keeps every state immutable and
+      // lets siblings pick the post up on their next reconcile.
+      const changesPosted = childUniqueStates.length === 0
+        ? 0
+        : await countChangesInStates(this.connection, versionedTables, childUniqueStates);
 
       await updateVersionState(
         this.connection,
-        version.owner,
-        version.name,
-        parent.stateId
+        parent.owner,
+        parent.name,
+        version.stateId
       );
 
-      const deleteResult = await deleteStates(this.connection, childUniqueStates);
-      if (deleteResult.danglingCrossTreeRows > 0) {
-        // A sibling version's closure still references one of the now-
-        // deleted states as `lineage_id`. The sibling will be reconciled
-        // out at its own post; warn the operator so they don't mistake
-        // the dangling rows for corruption.
-        this._logger.warn?.(
-          `postVersion(${versionName}): deleted ${deleteResult.statesRemoved} states, ` +
-          `but ${deleteResult.danglingCrossTreeRows} closure rows in OTHER versions still reference them. ` +
-          `These dangling references are cleaned up when their owning versions are next deleted. See post.ts:deleteStates docs.`,
-        );
-      }
-
-      // Lock auto-releases on commit for both drivers (Postgres:
-      // pg_advisory_xact_lock; SQL Server: sp_getapplock with @LockOwner =
-      // 'Transaction'). No explicit unlock needed on the success path.
+      // Lock auto-releases on commit (Postgres pg_advisory_xact_lock; SQL Server
+      // sp_getapplock @LockOwner='Transaction'). No explicit unlock needed.
       await this.connection.commitTransaction();
 
+      // sde.delete_version is reference-aware: it drops the version row but keeps
+      // the now-shared states DEFAULT was just pointed at. The version's edit
+      // states simply become part of DEFAULT's history (compress graduates them).
       if (options?.deleteVersionAfterPost) {
         await this.deleteVersion(versionName);
       }
 
       return {
         changesPosted,
-        newParentStateId: parent.stateId,
+        newParentStateId: version.stateId,
       };
     } catch (error) {
       await this.connection.rollbackTransaction();
