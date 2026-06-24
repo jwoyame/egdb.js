@@ -42,10 +42,11 @@ export async function findCommonAncestor(
   // Reconcile & Post and conflict detection saw zero changes. Bounding each
   // closure by its own state_id (via getStatesInRange) fixes it for both the
   // same-lineage and branched-lineage cases.
-  const [childClosure, parentClosure] = await Promise.all([
-    getStatesInRange(connection, childStateId, 0),
-    getStatesInRange(connection, parentStateId, 0),
-  ]);
+  // Sequential, NOT Promise.all: a single connection (e.g. inside a transaction,
+  // as revertFeatures uses) cannot run two concurrent requests -- mssql throws
+  // "request in progress". The two queries are cheap, so serial is fine.
+  const childClosure = await getStatesInRange(connection, childStateId, 0);
+  const parentClosure = await getStatesInRange(connection, parentStateId, 0);
 
   const parentSet = new Set(parentClosure);
   let ancestor = -1;
