@@ -4,7 +4,7 @@
 
 import type { IDatabaseConnection } from '../connections/connection';
 import type { TableInfo } from '../types';
-import { buildIntegerList } from '../utils/sql-helpers';
+import { buildIntegerList, validateNonNegativeInteger } from '../utils/sql-helpers';
 
 /**
  * Quote an identifier based on database driver.
@@ -274,6 +274,11 @@ export async function getChildUniqueStates(
   // Coerce to Number: SQL Server returns the BIGINT state_id as a string (the
   // outer DISTINCT over a lineage_id/param UNION yields a bigint-typed column),
   // and postChangesToParent's buildIntegerList rejects string state ids. Other
-  // state-id readers (getVersionStateLineage) already coerce.
-  return result.map(r => Number(r.state_id));
+  // state-id readers (getVersionStateLineage) already coerce. Validate so a
+  // precision-lost id fails loudly rather than rewriting the wrong state's rows.
+  return result.map(r => {
+    const n = Number(r.state_id);
+    validateNonNegativeInteger(n, 'getChildUniqueStates');
+    return n;
+  });
 }

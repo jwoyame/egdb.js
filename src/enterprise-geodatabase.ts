@@ -29,6 +29,7 @@ import {
   findCommonAncestor,
   getStatesInRange,
   findExternallyReferencedStates,
+  readLockedBranches,
   removeFromATable,
   removeFromDTable,
   getLineageName,
@@ -536,10 +537,16 @@ export class EnterpriseGeodatabase {
    * operation created, un-retire what it retired, undo what it mutated -- all by
    * the same "remove this feature's edits" action.
    *
-   * SAFETY: refuses (throws) if any of the version's edit states are shared with
-   * another version or have a fork, since deleting their rows would corrupt that
-   * other version. The caller must serialise against concurrent edits/reconcile
-   * on this version (e.g. a version mutex + no open edit session).
+   * The caller MUST revert a topologically-complete set (e.g. a parcel and all
+   * its lines/points) -- this primitive reverts exactly the OBJECTIDs given and
+   * does not chase references.
+   *
+   * SAFETY: runs under an exclusive version lock and re-validates inside it
+   * (the version tip can advance between calls). It refuses (throws) if any of
+   * the version's edit states are (a) shared with / forked into another version,
+   * or (b) held by a live edit session (SDE_state_locks), since deleting their
+   * rows would corrupt that version or destroy unsaved edits. The caller should
+   * additionally serialise app-level (a version mutex + no open edit session).
    *
    * @param versionName  owner.name of the (non-root) version to edit.
    * @param features     the features to revert, by table name + OBJECTID.
@@ -549,28 +556,15 @@ export class EnterpriseGeodatabase {
     versionName: string,
     features: ReadonlyArray<{ table: string; objectId: number }>,
   ): Promise<{ reverted: number; states: number[] }> {
-    const version = await this.getVersion(versionName);
-    if (!version?.stateId) throw new Error(`Version not found or has no state: ${versionName}`);
-    if (!version.parentName) throw new Error(`Cannot revert features in a root version: ${versionName}`);
     if (features.length === 0) return { reverted: 0, states: [] };
 
-    const parent = await this.getVersion(version.parentName);
-    if (!parent?.stateId) throw new Error(`Parent version not found: ${version.parentName}`);
+    const v0 = await this.getVersion(versionName);
+    if (!v0?.stateId) throw new Error(`Version not found or has no state: ${versionName}`);
+    if (!v0.parentName) throw new Error(`Cannot revert features in a root version: ${versionName}`);
 
     const conn = this.connection;
-    const ancestor = await findCommonAncestor(conn, version.stateId, parent.stateId);
-    const childOnlyStates = await getStatesInRange(conn, version.stateId, ancestor);
-    if (childOnlyStates.length === 0) return { reverted: 0, states: [] };
 
-    // Never edit a state another version can see.
-    const shared = await findExternallyReferencedStates(conn, version.owner, version.name, childOnlyStates);
-    if (shared.length > 0) {
-      throw new Error(
-        `Refusing to revert features in ${versionName}: edit state(s) ${shared.join(', ')} are shared with another version. Reconcile/post it first.`,
-      );
-    }
-
-    // Resolve each table's registration metadata once.
+    // Resolve each table's registration metadata once (read-only).
     const allTables = await this.listTables();
     const tableInfoByName = new Map<string, TableInfo>();
     for (const f of features) {
@@ -586,6 +580,38 @@ export class EnterpriseGeodatabase {
     const wasInTx = conn.inTransaction();
     if (!wasInTx) await conn.beginTransaction();
     try {
+      // Serialise against concurrent posts/reverts on this version; held to
+      // commit/rollback. Then re-read the tip + parent INSIDE the lock (they may
+      // have advanced since the pre-lock read) and validate before deleting.
+      await this.lockVersion(versionName);
+
+      const version = await this.getVersion(versionName);
+      if (!version?.stateId) throw new Error(`Version vanished under lock: ${versionName}`);
+      const parent = version.parentName ? await this.getVersion(version.parentName) : null;
+      if (!parent?.stateId) throw new Error(`Parent version not found: ${version.parentName}`);
+
+      const ancestor = await findCommonAncestor(conn, version.stateId, parent.stateId);
+      const childOnlyStates = await getStatesInRange(conn, version.stateId, ancestor);
+      if (childOnlyStates.length === 0) {
+        if (!wasInTx) await conn.commitTransaction();
+        return { reverted: 0, states: [] };
+      }
+
+      // Refuse if any edit state is visible to another version (shared/forked)
+      // or held by a live edit session (its lock + unsaved descendant states).
+      const shared = await findExternallyReferencedStates(conn, version.owner, version.name, childOnlyStates);
+      const locked = await readLockedBranches(conn);
+      const blocked = [...new Set([
+        ...shared,
+        ...childOnlyStates.filter(s => locked.has(s)),
+      ])].sort((a, b) => a - b);
+      if (blocked.length > 0) {
+        throw new Error(
+          `Refusing to revert features in ${versionName}: edit state(s) ${blocked.join(', ')} ` +
+          `are shared with another version or held by a live edit session. Reconcile/post or close that session first.`,
+        );
+      }
+
       for (const f of features) {
         const ti = tableInfoByName.get(f.table.toLowerCase())!;
         for (const stateId of childOnlyStates) {
@@ -594,11 +620,11 @@ export class EnterpriseGeodatabase {
         }
       }
       if (!wasInTx) await conn.commitTransaction();
+      return { reverted: features.length, states: childOnlyStates };
     } catch (e) {
       if (!wasInTx) await conn.rollbackTransaction();
       throw e;
     }
-    return { reverted: features.length, states: childOnlyStates };
   }
 
   /**

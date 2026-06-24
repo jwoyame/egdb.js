@@ -3,6 +3,14 @@
  */
 
 import type { IDatabaseConnection } from '../connections/connection';
+import { buildIntegerList, validateNonNegativeInteger } from '../utils/sql-helpers';
+
+/** Coerce a DB state_id (SQL Server returns BIGINT as a string) to a checked integer. */
+function toStateId(raw: number | bigint | string, context: string): number {
+  const n = Number(raw);
+  validateNonNegativeInteger(n, context); // throws if NaN / non-integer / precision-lost
+  return n;
+}
 
 /**
  * Find the common ancestor state between two versions.
@@ -105,8 +113,9 @@ export async function getStatesInRange(
   );
 
   // Coerce: SQL Server can return BIGINT state_id as a string. Downstream
-  // consumers (post's buildIntegerList, numeric comparisons) need real numbers.
-  return result.map(r => Number(r.state_id));
+  // consumers (post's buildIntegerList, numeric comparisons, and the in-place
+  // delete in revertFeatures) need real, checked integers.
+  return result.map(r => toStateId(r.state_id, 'getStatesInRange'));
 }
 
 /**
@@ -130,7 +139,10 @@ export async function findExternallyReferencedStates(
   states: number[],
 ): Promise<number[]> {
   if (states.length === 0) return [];
-  const inStates = states.join(',');
+  // buildIntegerList validates every element is a finite integer before inlining
+  // (these feed an IN clause used to choose which delta rows revertFeatures may
+  // delete -- a non-integer must fail loudly, never silently mis-query).
+  const inStates = buildIntegerList(states, 'findExternallyReferencedStates');
   const sql = connection.driver === 'sqlserver'
     ? `
       SELECT DISTINCT sl.lineage_id AS state
