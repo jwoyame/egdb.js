@@ -29,7 +29,6 @@ import {
   findCommonAncestor,
   getStatesInRange,
   findExternallyReferencedStates,
-  readLockedBranches,
   removeFromATable,
   removeFromDTable,
   getLineageName,
@@ -596,18 +595,20 @@ export class EnterpriseGeodatabase {
         return { reverted: 0, states: [] };
       }
 
-      // Refuse if any edit state is visible to another version (shared/forked)
-      // or held by a live edit session (its lock + unsaved descendant states).
-      const shared = await findExternallyReferencedStates(conn, version.owner, version.name, childOnlyStates);
-      const locked = await readLockedBranches(conn);
-      const blocked = [...new Set([
-        ...shared,
-        ...childOnlyStates.filter(s => locked.has(s)),
-      ])].sort((a, b) => a - b);
+      // Refuse if any edit state is visible to another version (shared) or has a
+      // fork off it. The fork branch also covers a concurrent edit session: a
+      // live session forks a new child state off this version's tip (via
+      // SDE_state_new_edit, which wires the lineage), so that fork is flagged. We
+      // deliberately do NOT also union readLockedBranches: a version's OWN
+      // committed edits leave SDE_state_new_edit locks on their states, which
+      // would false-positive every normal revert. Callers also hold an app-level
+      // version mutex + assert no open edit session.
+      const blocked = (await findExternallyReferencedStates(conn, version.owner, version.name, childOnlyStates))
+        .sort((a, b) => a - b);
       if (blocked.length > 0) {
         throw new Error(
           `Refusing to revert features in ${versionName}: edit state(s) ${blocked.join(', ')} ` +
-          `are shared with another version or held by a live edit session. Reconcile/post or close that session first.`,
+          `are shared with or forked by another version. Reconcile/post or close that version first.`,
         );
       }
 
