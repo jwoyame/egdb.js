@@ -144,6 +144,65 @@ export async function countChangesInStates(
 }
 
 /**
+ * Emit Esri-standard base-shadow delete markers for the rows a post superseded.
+ *
+ * egdb's edit-time delete markers use the EDIT state for SDE_STATE_ID, which its
+ * own reader understands (it matches D rows by `SDE_STATE_ID IN lineage`). But
+ * Esri's versioned views, the publish ETL, and ArcGIS hide a superseded BASE row
+ * only when a `SDE_STATE_ID = 0` marker exists -- which egdb never writes. Result:
+ * after a post, a retired/merged parcel's stale base row leaks to those readers.
+ *
+ * This additive step (run inside the post txn, after the parent pointer advanced)
+ * inserts the standard `(OBJECTID, SDE_STATE_ID=0, DELETED_AT=<edit state>)` marker
+ * for every OBJECTID this post introduced a NEW A-row for (state > sinceState in
+ * the parent's new closure) that still has a base-table row and lacks the marker.
+ * It changes no existing rows and is idempotent. SQL Server only (Putnam); the PG
+ * ArcSDE evw shape is not validated here.
+ *
+ * @returns number of markers inserted
+ */
+export async function emitBaseShadowMarkers(
+  connection: IDatabaseConnection,
+  tables: TableInfo[],
+  tipState: number,
+  sinceState: number
+): Promise<number> {
+  const driver = connection.driver;
+  if (driver !== 'sqlserver') return 0;
+  const tip = Number(tipState);
+  const since = Number(sinceState);
+  // The parent's (DEFAULT's) closure at its new tip, expressed as a subquery so
+  // we never materialise a huge IN-list (Putnam runs 10k+ states pre-compress).
+  const closure =
+    `SELECT l.lineage_id FROM sde.SDE_states s ` +
+    `INNER JOIN sde.SDE_state_lineages l ON l.lineage_name = s.lineage_name ` +
+    `WHERE s.state_id = ${tip} AND l.lineage_id <= s.state_id`;
+  let total = 0;
+  for (const t of tables) {
+    if (!t.isVersioned || !t.registrationId) continue;
+    const schema = quoteId(driver, t.schema);
+    const aTable = `${schema}.${quoteId(driver, `a${t.registrationId}`)}`;
+    const dTable = `${schema}.${quoteId(driver, `D${t.registrationId}`)}`;
+    // t.name is the 2-part table identifier (t.physicalName is the 3-part
+    // DATABASE.SCHEMA.TABLE form and would build an invalid object name here).
+    const base = `${schema}.${quoteId(driver, t.name)}`;
+    const sql =
+      `INSERT INTO ${dTable} (SDE_DELETES_ROW_ID, SDE_STATE_ID, DELETED_AT) ` +
+      `SELECT m.OBJECTID, 0, m.ms FROM (` +
+      `  SELECT a.OBJECTID, MAX(a.SDE_STATE_ID) AS ms FROM ${aTable} a ` +
+      `  WHERE a.SDE_STATE_ID IN (${closure}) AND a.SDE_STATE_ID > ${since} ` +
+      `  GROUP BY a.OBJECTID` +
+      `) m ` +
+      `WHERE EXISTS (SELECT 1 FROM ${base} b WHERE b.OBJECTID = m.OBJECTID) ` +
+      `AND NOT EXISTS (SELECT 1 FROM ${dTable} d WHERE d.SDE_DELETES_ROW_ID = m.OBJECTID ` +
+      `AND d.SDE_STATE_ID = 0 AND d.DELETED_AT IN (${closure}))`;
+    const r = await connection.execute(sql);
+    total += r.rowsAffected;
+  }
+  return total;
+}
+
+/**
  * Update a version's state_id in the versions table.
  *
  * @param connection Database connection

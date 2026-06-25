@@ -39,6 +39,7 @@ import {
   applyParentChanges,
   isReconciled,
   countChangesInStates,
+  emitBaseShadowMarkers,
   updateVersionState,
   getVersionStats,
   cleanupStaleLocks,
@@ -1168,6 +1169,19 @@ export class EnterpriseGeodatabase {
           `(expected 1). The edit was NOT published.`
         );
       }
+
+      // Emit Esri-standard base-shadow delete markers for the rows this post
+      // superseded, so the publish ETL / ArcGIS / *_evw views hide the stale
+      // base rows. egdb's edit-time markers use the edit state (only egdb's own
+      // reader understands that); without this, a retired/merged parcel's base
+      // row leaks to Esri readers. Additive + idempotent; scoped to the version's
+      // own contribution (states above the pre-post parent tip).
+      await emitBaseShadowMarkers(
+        this.connection,
+        versionedTables,
+        version.stateId,
+        parent.stateId
+      );
 
       // Lock auto-releases on commit (Postgres pg_advisory_xact_lock; SQL Server
       // sp_getapplock @LockOwner='Transaction'). No explicit unlock needed.
