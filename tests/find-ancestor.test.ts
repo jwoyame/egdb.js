@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { findCommonAncestor } from '../src/reconcile/find-ancestor';
+import { findCommonAncestor, getStatesInRange } from '../src/reconcile/find-ancestor';
 import type { IDatabaseConnection } from '../src/connections/connection';
 
 function mockConn(closuresByCall: number[][]): IDatabaseConnection {
@@ -53,5 +53,58 @@ describe('findCommonAncestor', () => {
     await expect(
       findCommonAncestor(mockConn([[40], [50]]), 40, 50),
     ).rejects.toThrow(/common ancestor/);
+  });
+});
+
+describe('getStatesInRange', () => {
+  // Capture the SQL + params the function issues, and return canned rows.
+  function spyConn(
+    rows: unknown[],
+    driver: 'sqlserver' | 'postgresql' = 'sqlserver',
+  ): { conn: IDatabaseConnection; sql: () => string; params: () => unknown[] } {
+    let lastSql = '';
+    let lastParams: unknown[] = [];
+    const conn = {
+      driver,
+      query: async (sql: string, params: unknown[]) => {
+        lastSql = sql;
+        lastParams = params;
+        return rows.map((s) => ({ state_id: s }));
+      },
+    } as unknown as IDatabaseConnection;
+    return { conn, sql: () => lastSql, params: () => lastParams };
+  }
+
+  it('derives ancestry from the parent_state_id tree, NOT the SDE_state_lineages closure', async () => {
+    // Regression guard: reading the sparse closure dropped ArcMap-authored edit
+    // states (Putnam atom_0329cloud: closure listed 6 states, real chain 148).
+    const s = spyConn([]);
+    await getStatesInRange(s.conn, 25066, 0);
+    expect(s.sql()).toMatch(/parent_state_id/i);
+    expect(s.sql()).not.toMatch(/state_lineages/i);
+    expect(s.params()).toEqual([25066, 0]);
+  });
+
+  it('uses a recursive parent_state_id walk on Postgres too (not the closure)', async () => {
+    const s = spyConn([], 'postgresql');
+    await getStatesInRange(s.conn, 25066, 0);
+    expect(s.sql()).toMatch(/WITH RECURSIVE/i);
+    expect(s.sql()).toMatch(/parent_state_id/i);
+    expect(s.sql()).not.toMatch(/state_lineages/i);
+    expect(s.params()).toEqual([25066, 0]);
+  });
+
+  it('returns the ancestor states the query yields (numeric-coerced)', async () => {
+    // SQL Server can hand back BIGINT state_id as a string; result must be numbers.
+    const s = spyConn([24329, '24825', 25066]);
+    const out = await getStatesInRange(s.conn, 25066, 24328);
+    expect(out).toEqual([24329, 24825, 25066]);
+  });
+
+  it('throws on an invalid (non-integer/precision-lost) state_id from the DB', async () => {
+    // toStateId coercion must fail loud: a bad state id must never silently
+    // become NaN and mis-query the delta tables downstream.
+    const s = spyConn(['not-a-number']);
+    await expect(getStatesInRange(s.conn, 25066, 0)).rejects.toThrow();
   });
 });

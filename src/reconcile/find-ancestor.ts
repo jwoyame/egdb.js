@@ -77,34 +77,64 @@ export async function getStatesInRange(
   versionStateId: number,
   ancestorStateId: number
 ): Promise<number[]> {
-  // The tip itself (versionStateId) must be UNIONed in: ArcGIS-authored
-  // states don't have self-rows in SDE_state_lineages, so the tip's own
-  // A/D rows would be missed by the closure-table-only query. Verified
-  // empirically against Putnam parcel_fabric_test where 161/163 states
-  // had no self-row. See SDE_COMPRESS_SPEC.md Section 4.1.
+  // Ancestry is derived from the physical state tree (SDE_states.parent_state_id),
+  // NOT from the SDE_state_lineages closure. The closure is a denormalized cache
+  // that ArcMap/ArcSDE populates sparsely: in a real fabric the vast majority of
+  // edit states have NO row in it (verified on Putnam — atom_0329cloud's closure
+  // listed 6 states while its parent chain is 148, missing every one of its ~59
+  // edit states). Reading the closure therefore dropped ArcMap-authored edits and
+  // made Reconcile & Post / conflict detection see "no changes". The parent chain
+  // is the complete, authoritative ancestry and is exactly what ArcMap walks, so
+  // we walk it here (a recursive CTE up parent_state_id to the root).
+  //
+  // Contract unchanged: return the ancestors of `versionStateId` that are strictly
+  // greater than `ancestorStateId` (i.e. the states in the half-open range
+  // (ancestorStateId, versionStateId]). Robustness/perf notes:
+  //   * The recursion stops once a parent is <= `ancestorStateId` (`> @p1`), not
+  //     just at the root. Because parent_state_id is always < its child, every
+  //     ancestor at or below the bound is out of range anyway, so this prunes the
+  //     walk to the requested window instead of always descending to state 0. It
+  //     also guarantees state 0 (the base) is never emitted — callers treat base
+  //     separately — for every non-negative `ancestorStateId` (all callers pass 0
+  //     or a real state id).
+  //   * SQL Server: MAXRECURSION 0 (unlimited) — a chain can exceed the 32767
+  //     default on an un-compressed fabric, and capping would make reconcile/post
+  //     THROW there. Termination rests on the strictly-decreasing parent_state_id
+  //     invariant, which also makes cycles impossible in valid SDE data.
+  //   * Postgres: UNION (not UNION ALL) so an accidental cycle from corrupt data
+  //     terminates instead of looping (PG has no MAXRECURSION analogue). For a
+  //     valid tree each state appears once, so UNION and UNION ALL are equivalent.
+  //     SQL Server can't mirror this — its recursive CTE REQUIRES UNION ALL — so a
+  //     corrupt cycle there loops only until the request timeout (bounded, not
+  //     infinite). Both are non-issues for valid data (the invariant forbids cycles).
   const sql = connection.driver === 'sqlserver'
     ? `
-      SELECT lineage_id as state_id
-      FROM sde.SDE_state_lineages
-      WHERE lineage_name = (
-        SELECT lineage_name FROM sde.SDE_states WHERE state_id = @p0
+      WITH anc AS (
+        SELECT state_id, parent_state_id
+        FROM sde.SDE_states WHERE state_id = @p0
+        UNION ALL
+        SELECT s.state_id, s.parent_state_id
+        FROM sde.SDE_states s
+        JOIN anc ON s.state_id = anc.parent_state_id
+        WHERE anc.parent_state_id > @p1
       )
-      AND lineage_id > @p1
-      AND lineage_id <= @p0
-      UNION
-      SELECT @p0 AS state_id WHERE @p0 > @p1
+      SELECT state_id FROM anc
+      WHERE state_id > @p1
       ORDER BY state_id
+      OPTION (MAXRECURSION 0)
     `
     : `
-      SELECT lineage_id as state_id
-      FROM sde.sde_state_lineages
-      WHERE lineage_name = (
-        SELECT lineage_name FROM sde.sde_states WHERE state_id = $1
+      WITH RECURSIVE anc AS (
+        SELECT state_id, parent_state_id
+        FROM sde.sde_states WHERE state_id = $1
+        UNION
+        SELECT s.state_id, s.parent_state_id
+        FROM sde.sde_states s
+        JOIN anc ON s.state_id = anc.parent_state_id
+        WHERE anc.parent_state_id > $2
       )
-      AND lineage_id > $2
-      AND lineage_id <= $1
-      UNION
-      SELECT $1 AS state_id WHERE $1 > $2
+      SELECT state_id FROM anc
+      WHERE state_id > $2
       ORDER BY state_id
     `;
 
@@ -126,12 +156,22 @@ export async function getStatesInRange(
  * corrupt the other version, so a caller (revertFeatures) must refuse.
  *
  * `states` is the version's child-only state set (its own edits since it
- * diverged from its parent). Two ways a state can be external:
- *   (a) another version's tip equals it, or its closure includes it; or
- *   (b) some state forks off it that is NOT itself one of these child-only
- *       states (a branch into another version / an orphan).
+ * diverged from its parent). Three signals that a state is external:
+ *   (a) another version's lineage closure (SDE_state_lineages) includes it;
+ *   (b) another version's tip equals it (SDE_versions, reliable); or
+ *   (c) some state forks off it that is NOT itself one of these child-only
+ *       states (SDE_states.parent_state_id, reliable).
  * Branches off the COMMON ANCESTOR (e.g. other versions off DEFAULT) are fine
  * and are not flagged, because their fork point is below `states`.
+ *
+ * IMPORTANT: signal (a) is now UNRELIABLE and effectively dead weight. Since
+ * SDE_state_lineages is sparsely populated in real fabrics (see getStatesInRange),
+ * the closure rarely lists a sibling's non-tip states. Revert safety therefore
+ * rests entirely on (b) [tip match] + (c) [fork in SDE_states] -- both of which
+ * read authoritative tables and DO cover the real cases: a sibling either points
+ * its tip at a shared state (b) or forks a child off one (c). Do NOT "simplify"
+ * revert by leaning on the closure branch; keep (b)+(c). (a) is retained only as
+ * a belt-and-suspenders no-op for the rare deployments whose closure IS complete.
  */
 export async function findExternallyReferencedStates(
   connection: IDatabaseConnection,
