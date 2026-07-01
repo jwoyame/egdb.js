@@ -308,6 +308,14 @@ export async function deleteStates(
 /**
  * Get child version's unique states (states not in parent's lineage).
  *
+ * @deprecated CLOSURE-BASED AND UNRELIABLE. This reads SDE_state_lineages, which
+ * is sparsely populated in real fabrics (see getStatesInRange in find-ancestor.ts):
+ * it drops ArcMap-authored edit states and would report far too few "unique" states.
+ * post.ts now counts changes over `getStatesInRange` (parent_state_id) instead, so
+ * this is currently DEAD. Do NOT wire it into a new caller; use
+ * `getStatesInRange(childState, findCommonAncestor(childState, parentState))`.
+ * Retained only to avoid breaking the re-export in reconcile/index.ts.
+ *
  * @param connection Database connection
  * @param childStateId Child version's current state
  * @param parentStateId Parent version's current state

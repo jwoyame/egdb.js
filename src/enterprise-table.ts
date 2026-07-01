@@ -469,19 +469,60 @@ export class EnterpriseTable {
     // Quote OBJECTID based on driver
     const qObjectId = driver === 'sqlserver' ? '[OBJECTID]' : '"objectid"';
 
-    // Query: Base table rows not in deletes UNION adds rows
-    // Base table contains rows at state 0 (initial state)
+    // Reconstruct the version's view of each row from the base table + A/D deltas,
+    // over the full state lineage (`stateIds`). Two correctness rules, both of
+    // which matter now that the lineage is the complete parent chain (dozens–
+    // hundreds of states) rather than the old sparse closure (a handful):
+    //
+    //  1. ADDS — one row per OBJECTID. A row edited N times has N A-rows across
+    //     the lineage; the version sees only the LATEST (highest SDE_STATE_ID in
+    //     the lineage). Without this the read returned a row per edit-state
+    //     (verified: 970 rows for ~98 parcels). The correlated NOT EXISTS keeps
+    //     only the max-state A-row per OID.
+    //
+    //  2. BASE — a base row is hidden once the version has superseded it. A row
+    //     is superseded if a delete marker records it as removed AT one of the
+    //     lineage's states (`DELETED_AT IN lineage`) — this is how ArcMap tags
+    //     both hard deletes and the old half of an update, and covers markers
+    //     tagged SDE_STATE_ID=0 (Esri/ArcMap base-row source) or =edit-state
+    //     (egdb) alike, while staying scoped to THIS version (a delete on a
+    //     sibling branch has DELETED_AT outside the lineage and is ignored).
+    //     The second NOT EXISTS is a belt-and-suspenders: hide a base row that has
+    //     a replacement A-row in the lineage even if its delete marker were missing.
+    //     Assumes DELETED_AT is populated on every D-row (a NULL would leave the
+    //     base row visible). Verified 0 NULLs across the Putnam fabric D-tables
+    //     (d17/d18/d19, live + training). If a fabric can have NULL DELETED_AT,
+    //     add `OR (d.DELETED_AT IS NULL AND d.SDE_STATE_ID IN (${stateIdList}))`.
+    //
+    // Not handled (unchanged from before): a hard DELETE of a row that was itself
+    // INSERTed within the same version (no base row, A-row + later D-row) still
+    // surfaces via the adds side. Parcels retire via Historical=1 updates, not
+    // hard deletes, so this does not affect the fabric; noted for follow-up.
+    // NOT EXISTS (not NOT IN): null-safe — a NULL from the subquery would make
+    // `NOT IN` return zero base rows, silently emptying the read.
     const sql = `
       SELECT ${selectFields}
       FROM ${this.qualifiedTableName} b
-      WHERE b.${qObjectId} NOT IN (
-        SELECT SDE_DELETES_ROW_ID FROM ${deletesTable}
-        WHERE SDE_STATE_ID IN (${stateIdList})
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${deletesTable} d
+        WHERE d.SDE_DELETES_ROW_ID = b.${qObjectId}
+          AND d.DELETED_AT IN (${stateIdList})
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM ${addsTable} sup
+        WHERE sup.${qObjectId} = b.${qObjectId}
+          AND sup.SDE_STATE_ID IN (${stateIdList})
       )${baseWhere}
       UNION ALL
       SELECT ${selectFields}
-      FROM ${addsTable}
-      WHERE SDE_STATE_ID IN (${stateIdList})${baseWhere}
+      FROM ${addsTable} a
+      WHERE a.SDE_STATE_ID IN (${stateIdList})
+      AND NOT EXISTS (
+        SELECT 1 FROM ${addsTable} a2
+        WHERE a2.${qObjectId} = a.${qObjectId}
+          AND a2.SDE_STATE_ID IN (${stateIdList})
+          AND a2.SDE_STATE_ID > a.SDE_STATE_ID
+      )${baseWhere}
     `;
 
     return sql;

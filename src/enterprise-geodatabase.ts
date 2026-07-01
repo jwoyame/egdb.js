@@ -490,38 +490,18 @@ export class EnterpriseGeodatabase {
     const version = await this.getVersion(versionName);
     if (!version?.stateId) return null;
 
-    // The tip itself (version.stateId) is UNIONed in because ArcGIS-
-    // authored states don't have a self-row in SDE_state_lineages. Without
-    // this, the version's own A/D rows (at SDE_STATE_ID = version.stateId)
-    // would be invisible. See SDE_COMPRESS_SPEC.md Section 4.1.
-    const sql = this.config.driver === 'sqlserver'
-      ? `
-        SELECT DISTINCT lineage_id FROM (
-          SELECT sl.lineage_id
-          FROM sde.SDE_state_lineages sl
-          JOIN sde.SDE_states s ON s.state_id = @p0
-          WHERE sl.lineage_name = s.lineage_name
-            AND sl.lineage_id <= @p0
-          UNION
-          SELECT @p0 AS lineage_id
-        ) closure
-        ORDER BY lineage_id
-      `
-      : `
-        SELECT DISTINCT lineage_id FROM (
-          SELECT sl.lineage_id
-          FROM sde.sde_state_lineages sl
-          JOIN sde.sde_states s ON s.state_id = $1
-          WHERE sl.lineage_name = s.lineage_name
-            AND sl.lineage_id <= $1
-          UNION
-          SELECT $1 AS lineage_id
-        ) closure
-        ORDER BY lineage_id
-      `;
-
-    const rows = await this.connection.query<{ lineage_id: number | bigint }>(sql, [version.stateId]);
-    return rows.map(r => Number(r.lineage_id));
+    // Ancestry comes from the physical state tree (SDE_states.parent_state_id),
+    // NOT the SDE_state_lineages closure. The closure is sparsely populated in
+    // real fabrics (see getStatesInRange in reconcile/find-ancestor.ts) and drops
+    // ArcMap-authored edit states, so closure-based reads made a version's own
+    // edits invisible (e.g. 98 subdivision parcels ArcMap posted into DEFAULT).
+    // The parent chain is the complete ancestry ArcMap reads through.
+    //
+    // This returns the edit-state ancestry only (state 0 / the base table is not
+    // a lineage member). buildVersionedQuery keys base-row shadowing off the
+    // delete markers' DELETED_AT (the edit state a row was superseded in), which
+    // is always one of these ancestry states, so state 0 is not needed here.
+    return getStatesInRange(this.connection, version.stateId, 0);
   }
 
   /**
