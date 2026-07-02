@@ -469,19 +469,53 @@ export class EnterpriseTable {
     // Quote OBJECTID based on driver
     const qObjectId = driver === 'sqlserver' ? '[OBJECTID]' : '"objectid"';
 
-    // Query: Base table rows not in deletes UNION adds rows
-    // Base table contains rows at state 0 (initial state)
+    // Query: base rows (not deleted, not superseded by an add) UNION the FRESHEST
+    // add row per OBJECTID.
+    //
+    // A feature edited N times across a version's lineage has N a-rows (one per
+    // child state -- each editTransaction commits a new state). Returning all of
+    // them (the old `UNION ALL` of every a-row) yields duplicates, and a bare
+    // `LIMIT 1` then picks fresh-or-stale nondeterministically. Resolve per
+    // OBJECTID to the a-row at the greatest lineage state (freshest edit; SDE
+    // state ids increase with creation, and the lineage is the linear ancestry).
+    //
+    // The freshest-state derived table (`m`) is computed over ALL a-rows for the
+    // OBJECTID in the lineage -- the caller's `baseWhere` is applied only in the
+    // OUTER query, never inside `m`. Otherwise a filter like `Historical IS NULL`
+    // would make MAX pick a stale row that happens to match the filter instead of
+    // the true freshest row. `m` exposes `moid`/`ms` (not `OBJECTID`) so the
+    // unqualified `selectFields`/`baseWhere` columns resolve to `a` unambiguously.
+    //
+    // A pure delete after the freshest add (D row at a state > that add's state,
+    // with no paired add) suppresses it. Update writes D+A at the SAME state, so
+    // `> a.SDE_STATE_ID` does not suppress an update.
     const sql = `
       SELECT ${selectFields}
       FROM ${this.qualifiedTableName} b
       WHERE b.${qObjectId} NOT IN (
         SELECT SDE_DELETES_ROW_ID FROM ${deletesTable}
         WHERE SDE_STATE_ID IN (${stateIdList})
+      )
+      AND b.${qObjectId} NOT IN (
+        SELECT ${qObjectId} FROM ${addsTable}
+        WHERE SDE_STATE_ID IN (${stateIdList})
       )${baseWhere}
       UNION ALL
       SELECT ${selectFields}
-      FROM ${addsTable}
-      WHERE SDE_STATE_ID IN (${stateIdList})${baseWhere}
+      FROM ${addsTable} a
+      INNER JOIN (
+        SELECT ${qObjectId} AS moid, MAX(SDE_STATE_ID) AS ms
+        FROM ${addsTable}
+        WHERE SDE_STATE_ID IN (${stateIdList})
+        GROUP BY ${qObjectId}
+      ) m ON m.moid = a.${qObjectId} AND m.ms = a.SDE_STATE_ID
+      WHERE a.SDE_STATE_ID IN (${stateIdList})
+      AND NOT EXISTS (
+        SELECT 1 FROM ${deletesTable} d
+        WHERE d.SDE_DELETES_ROW_ID = a.${qObjectId}
+          AND d.SDE_STATE_ID IN (${stateIdList})
+          AND d.SDE_STATE_ID > a.SDE_STATE_ID
+      )${baseWhere}
     `;
 
     return sql;
