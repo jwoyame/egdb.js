@@ -84,6 +84,21 @@ export class EnterpriseGeodatabase {
   // evictTable() or a reconnect to be picked up. The key assumes table Name is
   // unique across the geodatabase (true for a single parcel fabric).
   private _tableCache = new Map<string, Promise<EnterpriseTable>>();
+  // Cache of a state's ancestry (getStatesInRange(stateId, 0)) keyed by that
+  // state id, to remove the per-read recursive-CTE lineage walk (~70-170ms
+  // measured) now that every user-facing read goes through the versioned view.
+  //
+  // Between compresses this is effectively immutable (states are append-only;
+  // an edit advances the tip → new key). The one thing that CAN change an
+  // existing tip's ancestry is a compress: it trims/collapses states and
+  // re-points surviving parents, so a chain cached before a compress can go
+  // stale. We therefore bound entries with a short TTL (compress is a rare,
+  // typically-nightly op) rather than caching forever, and expose clear() for
+  // the paths that run a compress in-process. Soft-capped against unbounded
+  // growth as tips advance.
+  private _stateLineageCache = new Map<number, { states: number[]; at: number }>();
+  private static readonly STATE_LINEAGE_CACHE_MAX = 512;
+  private static readonly STATE_LINEAGE_TTL_MS = 60_000;
   private _logger: Logger;
 
   private constructor(config: ConnectionConfig, connection: IDatabaseConnection) {
@@ -501,7 +516,23 @@ export class EnterpriseGeodatabase {
     // a lineage member). buildVersionedQuery keys base-row shadowing off the
     // delete markers' DELETED_AT (the edit state a row was superseded in), which
     // is always one of these ancestry states, so state 0 is not needed here.
-    return getStatesInRange(this.connection, version.stateId, 0);
+    //
+    // Memoized by tip state id — the ancestry is immutable (append-only states),
+    // so this is safe with no invalidation. Big win now that all reads are
+    // versioned: the recursive-CTE walk runs once per tip instead of per read.
+    const tip = version.stateId;
+    const cached = this._stateLineageCache.get(tip);
+    if (cached && Date.now() - cached.at < EnterpriseGeodatabase.STATE_LINEAGE_TTL_MS) {
+      return cached.states;
+    }
+    const lineage = await getStatesInRange(this.connection, tip, 0);
+    if (this._stateLineageCache.size >= EnterpriseGeodatabase.STATE_LINEAGE_CACHE_MAX) {
+      // Cheap eviction: drop the oldest insertion (Map preserves insertion order).
+      const oldest = this._stateLineageCache.keys().next().value;
+      if (oldest !== undefined) this._stateLineageCache.delete(oldest);
+    }
+    this._stateLineageCache.set(tip, { states: lineage, at: Date.now() });
+    return lineage;
   }
 
   /**
