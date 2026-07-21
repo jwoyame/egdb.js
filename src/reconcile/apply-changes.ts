@@ -55,7 +55,7 @@ export async function copyATableRow(
   objectId: number,
   fromStateId: number,
   toStateId: number
-): Promise<void> {
+): Promise<number> {
   const regId = requireRegistrationId(tableInfo);
   const schema = tableInfo.schema;
   const driver = connection.driver;
@@ -84,7 +84,8 @@ export async function copyATableRow(
       WHERE "objectid" = $2 AND "sde_state_id" = $3
     `;
 
-  await connection.execute(sql, [toStateId, objectId, fromStateId]);
+  const res = await connection.execute(sql, [toStateId, objectId, fromStateId]);
+  return res.rowsAffected;
 }
 
 /**

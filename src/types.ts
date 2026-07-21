@@ -411,6 +411,15 @@ export interface ReconcileResult {
 export interface PostOptions {
   /** Delete the child version after posting (default: false) */
   deleteVersionAfterPost?: boolean;
+  /**
+   * Use the ArcMap-style trim post: create a NEW DEFAULT-lineage state via
+   * SDE_state_new_edit and replay the version's deltas into it, instead of
+   * repointing DEFAULT onto the child's tip. This keeps DEFAULT's
+   * SDE_state_lineages closure == its parent_state_id ancestry, so Esri
+   * *_evw views / the publish ETL / ArcGIS (all closure readers) see posted
+   * edits. Default false during rollout; see handoff/DURABLE_CLOSURE_FIX_PLAN.md.
+   */
+  trimPost?: boolean;
 }
 
 /** Post result */

@@ -47,17 +47,26 @@ export async function getTableChanges(
   const aTable = `${qSchema}.${quoteId(driver, `a${regId}`)}`;
   const dTable = `${qSchema}.${quoteId(driver, `D${regId}`)}`;
 
-  // Get all rows in A table (adds) for these states
+  // Get all rows in A table (adds) for these states. ORDER BY SDE_STATE_ID
+  // ASC is REQUIRED for correctness: when an OBJECTID has A-rows in more than
+  // one of these states (the normal multi-state case -- every save/reconcile
+  // makes a state), the objectId->stateId Map below keeps the LAST row written,
+  // so ascending order makes it the MAX (tip) state. The tip is the row a
+  // versioned read resolves (enterprise-table.ts uses MAX(SDE_STATE_ID)), so
+  // consumers that copy this row (e.g. trim post) must copy the tip, not an
+  // arbitrary earlier state -- otherwise a parcel adjusted-then-retired across
+  // states could land its pre-retirement content in DEFAULT.
   const addsSql = driver === 'sqlserver'
-    ? `SELECT OBJECTID, SDE_STATE_ID FROM ${aTable} WHERE SDE_STATE_ID IN (${stateIdList})`
-    : `SELECT objectid as "OBJECTID", sde_state_id as "SDE_STATE_ID" FROM ${aTable} WHERE sde_state_id IN (${stateIdList})`;
+    ? `SELECT OBJECTID, SDE_STATE_ID FROM ${aTable} WHERE SDE_STATE_ID IN (${stateIdList}) ORDER BY SDE_STATE_ID ASC`
+    : `SELECT objectid as "OBJECTID", sde_state_id as "SDE_STATE_ID" FROM ${aTable} WHERE sde_state_id IN (${stateIdList}) ORDER BY sde_state_id ASC`;
 
   const addsRows = await connection.query<{ OBJECTID: number; SDE_STATE_ID: number }>(addsSql);
 
-  // Get all rows in D table (deletes) for these states
+  // Get all rows in D table (deletes) for these states. Same ASC ordering so a
+  // multi-state OBJECTID keeps its MAX delete state.
   const deletesSql = driver === 'sqlserver'
-    ? `SELECT SDE_DELETES_ROW_ID as OBJECTID, SDE_STATE_ID FROM ${dTable} WHERE SDE_STATE_ID IN (${stateIdList})`
-    : `SELECT sde_deletes_row_id as "OBJECTID", sde_state_id as "SDE_STATE_ID" FROM ${dTable} WHERE sde_state_id IN (${stateIdList})`;
+    ? `SELECT SDE_DELETES_ROW_ID as OBJECTID, SDE_STATE_ID FROM ${dTable} WHERE SDE_STATE_ID IN (${stateIdList}) ORDER BY SDE_STATE_ID ASC`
+    : `SELECT sde_deletes_row_id as "OBJECTID", sde_state_id as "SDE_STATE_ID" FROM ${dTable} WHERE sde_state_id IN (${stateIdList}) ORDER BY sde_state_id ASC`;
 
   const deletesRows = await connection.query<{ OBJECTID: number; SDE_STATE_ID: number }>(deletesSql);
 

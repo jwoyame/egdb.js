@@ -186,6 +186,8 @@ export async function emitBaseShadowMarkers(
     // t.name is the 2-part table identifier (t.physicalName is the 3-part
     // DATABASE.SCHEMA.TABLE form and would build an invalid object name here).
     const base = `${schema}.${quoteId(driver, t.name)}`;
+    // (1) Rows SUPERSEDED by a new A-row (update/split/retire): shadow the base
+    // row so Esri hides it in favour of the new adds-row content.
     const sql =
       `INSERT INTO ${dTable} (SDE_DELETES_ROW_ID, SDE_STATE_ID, DELETED_AT) ` +
       `SELECT m.OBJECTID, 0, m.ms FROM (` +
@@ -198,6 +200,26 @@ export async function emitBaseShadowMarkers(
       `AND d.SDE_STATE_ID = 0 AND d.DELETED_AT IN (${closure}))`;
     const r = await connection.execute(sql);
     total += r.rowsAffected;
+
+    // (2) Base rows HARD-DELETED by this post (a D marker in range but NO new
+    // A-row): egdb writes the delete marker at the edit state, which Esri's
+    // *_evw / the publish ETL ignore (they hide a base row only via a
+    // SDE_STATE_ID = 0 marker). Without this, a hard-deleted base parcel leaks
+    // to Esri readers -- the exact interop gap this function closes for updates.
+    const delSql =
+      `INSERT INTO ${dTable} (SDE_DELETES_ROW_ID, SDE_STATE_ID, DELETED_AT) ` +
+      `SELECT m.OBJECTID, 0, m.ms FROM (` +
+      `  SELECT d.SDE_DELETES_ROW_ID AS OBJECTID, MAX(d.SDE_STATE_ID) AS ms FROM ${dTable} d ` +
+      `  WHERE d.SDE_STATE_ID IN (${closure}) AND d.SDE_STATE_ID > ${since} ` +
+      `  GROUP BY d.SDE_DELETES_ROW_ID` +
+      `) m ` +
+      `WHERE EXISTS (SELECT 1 FROM ${base} b WHERE b.OBJECTID = m.OBJECTID) ` +
+      `AND NOT EXISTS (SELECT 1 FROM ${aTable} a WHERE a.OBJECTID = m.OBJECTID ` +
+      `AND a.SDE_STATE_ID IN (${closure}) AND a.SDE_STATE_ID > ${since}) ` +
+      `AND NOT EXISTS (SELECT 1 FROM ${dTable} d0 WHERE d0.SDE_DELETES_ROW_ID = m.OBJECTID ` +
+      `AND d0.SDE_STATE_ID = 0 AND d0.DELETED_AT IN (${closure}))`;
+    const rd = await connection.execute(delSql);
+    total += rd.rowsAffected;
   }
   return total;
 }

@@ -34,6 +34,9 @@ import {
   getLineageName,
   addStatesToLineage,
   getAllChanges,
+  createChildState,
+  copyATableRow,
+  insertDeleteMarker,
   detectDetailedConflicts,
   getConflictsSummary,
   applyParentChanges,
@@ -1153,44 +1156,107 @@ export class EnterpriseGeodatabase {
       const childStates = await getStatesInRange(this.connection, version.stateId, ancestor);
       const changesPosted = await countChangesInStates(this.connection, versionedTables, childStates);
 
-      // ArcMap-style post: the version's edits already live in ITS OWN states,
-      // which descend from the parent's (DEFAULT's) current tip and share its
-      // lineage (reconcile guaranteed both). So posting is just ADVANCING the
-      // parent's state pointer to the version's reconciled tip -- DEFAULT then
-      // resolves those edits with ZERO row copying and ZERO new states.
+      // Two post strategies:
       //
-      // Why not mutate/re-tag like the old code did: a sibling version that
-      // reconciled against the old DEFAULT tip has it in its closure; if we
-      // changed that state's CONTENTS in place (same id), the sibling's next
-      // reconcile would see no parent changes and silently miss (then resurrect)
-      // this post. Advancing to a NEW tip state keeps every state immutable and
-      // lets siblings pick the post up on their next reconcile.
-      const versionsAdvanced = await updateVersionState(
-        this.connection,
-        parent.owner,
-        parent.name,
-        version.stateId
-      );
-      // The actual landing guarantee: DEFAULT must have advanced to the version
-      // tip. If 0 rows matched, the edit did NOT publish -- fail loudly (and roll
-      // back) rather than report a phantom success, the way April's post did.
-      if (versionsAdvanced !== 1) {
-        throw new Error(
-          `Post did not advance ${parentFullName}: matched ${versionsAdvanced} version rows ` +
-          `(expected 1). The edit was NOT published.`
+      // trimPost (ArcMap-style, closure-correct): create a NEW state on
+      // DEFAULT's OWN lineage via SDE_state_new_edit (which maintains the
+      // SDE_state_lineages closure) and replay the version's net deltas into
+      // it. DEFAULT's closure stays == its parent_state_id ancestry, so Esri
+      // *_evw views / the publish ETL / ArcGIS (all resolve versions via the
+      // closure) see the posted edits. See handoff/DURABLE_CLOSURE_FIX_PLAN.md
+      // and memory project_publish_etl_closure_gap.
+      //
+      // Legacy repoint (default, being phased out): advances DEFAULT's pointer
+      // onto the child's tip with ZERO row copying. Immutable + cheap, and
+      // egdb's own parent_state_id reader resolves it -- but it does NOT write
+      // the closure rows, so every closure-based Esri reader silently misses
+      // the post. Kept behind the flag for rollback during rollout.
+      let postTargetState: number;
+      if (options?.trimPost) {
+        const newTip = await createChildState(this.connection, parent.stateId);
+        // SDE_state_new_edit places an exclusive lock on the new state. Unlike
+        // an EditSession's transient edit state, this state becomes DEFAULT's
+        // permanent tip, so the lock must be cleared -- a stuck lock blocks
+        // future edits and makes compress skip the branch. Clear by state_id
+        // (mirrors deleteChildState) since SDE_state_new_edit owns the lock
+        // under its own connection sde_id, which createChildState doesn't return.
+        await this.connection.execute(
+          this.connection.driver === 'sqlserver'
+            ? `DELETE FROM sde.SDE_state_locks WHERE state_id = @p0`
+            : `DELETE FROM sde.sde_state_locks WHERE state_id = $1`,
+          [newTip]
         );
+        // getAllChanges now yields the TIP (MAX SDE_STATE_ID) A/D row per
+        // OBJECTID (get-changes.ts orders ascending, Map keeps last), so each
+        // copy reproduces the version's resolved content, not an arbitrary
+        // earlier state. Every A-row copy MUST move exactly one row -- a 0-row
+        // copy would leave a bare delete marker with no A-row (a vanished
+        // feature), so we assert it loudly rather than commit a phantom post.
+        const changes = await getAllChanges(this.connection, versionedTables, childStates);
+        const copyOrThrow = async (t: TableInfo, oid: number, from: number) => {
+          const n = await copyATableRow(this.connection, t, oid, from, newTip);
+          if (n !== 1) {
+            throw new Error(
+              `Trim post failed to copy A-row for ${t.name} OBJECTID ${oid} from state ${from} ` +
+              `(rows affected = ${n}, expected 1). The post was NOT published.`
+            );
+          }
+        };
+        for (const c of [...changes.inserts, ...changes.updates, ...changes.deletes]) {
+          const t = versionedTables.find(vt => vt.name === c.table);
+          if (!t) continue;
+          if (c.changeType === 'insert' || c.changeType === 'update') {
+            // Both just copy the version's TIP a-row to newTip. An UPDATE needs
+            // NO delete marker at newTip: the superseded BASE row is hidden by
+            // emitBaseShadowMarkers' state-0 marker (below), and a prior a-row is
+            // superseded by MAX-state resolution. Emitting a (newTip) marker here
+            // would collide with the copied a-row -- egdb's own reader tolerates
+            // it (it only suppresses a delete at a state > the add), but Esri's
+            // *_evw / the publish ETL suppress on SDE_STATE_ID = the add's state,
+            // so the retired row would vanish from the published layer.
+            await copyOrThrow(t, c.objectId, c.stateId);
+          } else {
+            // Pure delete: the edit-state marker is what egdb's reader honors
+            // (base-half keys on DELETED_AT); emitBaseShadowMarkers adds the
+            // state-0 marker Esri readers need.
+            await insertDeleteMarker(this.connection, t, c.objectId, newTip);
+          }
+        }
+        const advanced = await updateVersionState(
+          this.connection, parent.owner, parent.name, newTip
+        );
+        if (advanced !== 1) {
+          throw new Error(
+            `Post did not advance ${parentFullName}: matched ${advanced} version rows ` +
+            `(expected 1). The edit was NOT published.`
+          );
+        }
+        postTargetState = newTip;
+      } else {
+        const versionsAdvanced = await updateVersionState(
+          this.connection, parent.owner, parent.name, version.stateId
+        );
+        // The actual landing guarantee: DEFAULT must have advanced. If 0 rows
+        // matched, the edit did NOT publish -- fail loudly (and roll back)
+        // rather than report a phantom success, the way April's post did.
+        if (versionsAdvanced !== 1) {
+          throw new Error(
+            `Post did not advance ${parentFullName}: matched ${versionsAdvanced} version rows ` +
+            `(expected 1). The edit was NOT published.`
+          );
+        }
+        postTargetState = version.stateId;
       }
 
       // Emit Esri-standard base-shadow delete markers for the rows this post
       // superseded, so the publish ETL / ArcGIS / *_evw views hide the stale
-      // base rows. egdb's edit-time markers use the edit state (only egdb's own
-      // reader understands that); without this, a retired/merged parcel's base
-      // row leaks to Esri readers. Additive + idempotent; scoped to the version's
-      // own contribution (states above the pre-post parent tip).
+      // base rows. Scoped to the post's own contribution (states above the
+      // pre-post parent tip); in trimPost mode the copied rows live at the new
+      // tip, which is in DEFAULT's closure.
       await emitBaseShadowMarkers(
         this.connection,
         versionedTables,
-        version.stateId,
+        postTargetState,
         parent.stateId
       );
 
@@ -1198,16 +1264,22 @@ export class EnterpriseGeodatabase {
       // sp_getapplock @LockOwner='Transaction'). No explicit unlock needed.
       await this.connection.commitTransaction();
 
-      // sde.delete_version is reference-aware: it drops the version row but keeps
-      // the now-shared states DEFAULT was just pointed at. The version's edit
-      // states simply become part of DEFAULT's history (compress graduates them).
+      // deleteVersion is reference-aware (native sde.delete_version keeps states
+      // still referenced by a version). Legacy post: DEFAULT now shares the
+      // version's own states, so those are kept and become DEFAULT's history.
+      // trimPost: DEFAULT points at a NEW state (newTip) and the version's edit
+      // states are only COUSINS of newTip (never its ancestors -- newTip
+      // branches from parent.stateId, the pre-post DEFAULT tip), so deleting the
+      // version can collect them WITHOUT affecting newTip's resolution -- the
+      // deltas were copied into newTip. (Runs outside the post txn; covered by
+      // the trimPost + deleteVersionAfterPost training case.)
       if (options?.deleteVersionAfterPost) {
         await this.deleteVersion(versionName);
       }
 
       return {
         changesPosted,
-        newParentStateId: version.stateId,
+        newParentStateId: postTargetState,
       };
     } catch (error) {
       await this.connection.rollbackTransaction();
