@@ -101,3 +101,15 @@ export {
   InsufficientPrivilegeError,
 } from './state-management';
 export type { StaleLockCleanupResult } from './state-management';
+
+// Set-based delta copying (replaces the row-by-row copy that could not scale).
+export {
+  selectChangedObjectIds,
+  selectDeletedObjectIds,
+  selectObjectIdsWithARows,
+  selectObjectIdsPresentInParent,
+  copyTipRows,
+  insertDeleteMarkers,
+  getTableColumnsCached,
+  clearColumnCache,
+} from './set-copy';

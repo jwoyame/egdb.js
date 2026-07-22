@@ -44,6 +44,12 @@ import {
   countChangesInStates,
   emitBaseShadowMarkers,
   updateVersionState,
+  selectChangedObjectIds,
+  selectDeletedObjectIds,
+  selectObjectIdsWithARows,
+  selectObjectIdsPresentInParent,
+  copyTipRows,
+  insertDeleteMarkers,
   getVersionStats,
   cleanupStaleLocks,
   computeGraduablePrefix,
@@ -1280,6 +1286,149 @@ export class EnterpriseGeodatabase {
       return {
         changesPosted,
         newParentStateId: postTargetState,
+      };
+    } catch (error) {
+      await this.connection.rollbackTransaction();
+      throw error;
+    }
+  }
+
+  /**
+   * Rebase a version onto its parent's current tip, keeping the version's own
+   * identity (same row in SDE_versions: same owner, same name).
+   *
+   * WHY: a reconcile copies the parent's changed rows INTO the child's state. On
+   * a large fabric that is tens of thousands of rows, and it leaves the version
+   * carrying a huge diff that is almost entirely the parent's own data -- which
+   * makes Review slow and Post time out, even though the editor only changed a
+   * handful of features. Rebasing instead creates a fresh state branched off the
+   * parent's tip and replays ONLY the rows that actually differ from the parent,
+   * so the version ends up with exactly the editor's work and nothing else.
+   *
+   * Redundant rows are identified structurally, not guessed: a child row that is
+   * byte-identical to a parent row carries no information (a previous reconcile
+   * copied it in), so dropping it cannot lose an edit. See selectChangedObjectIds.
+   *
+   * The version's OLD states are left untouched and simply become unreferenced,
+   * so this is REVERSIBLE (repoint the version back) until a compress reclaims
+   * them -- which is also how the leftover rows get cleaned up, natively.
+   *
+   * Returns per-table counts plus the old/new state ids.
+   */
+  async rebaseVersion(
+    versionName: string,
+    options?: { dryRun?: boolean },
+  ): Promise<{
+    version: string;
+    fromState: number;
+    toState: number | null;
+    replayed: Array<{ table: string; updates: number; deletes: number }>;
+    droppedRedundant: number;
+    dryRun: boolean;
+  }> {
+    const version = await this.getVersion(versionName);
+    if (!version || version.stateId == null) {
+      throw new Error(`Version not found: ${versionName}`);
+    }
+    if (!version.parentName) {
+      throw new Error(`Version ${versionName} has no parent; nothing to rebase onto.`);
+    }
+    const parentFullName = version.parentName.includes('.')
+      ? version.parentName
+      : `sde.${version.parentName}`;
+    const parent = await this.getVersion(parentFullName);
+    if (!parent || parent.stateId == null) {
+      throw new Error(`Parent version not found: ${parentFullName}`);
+    }
+
+    const ancestor = await findCommonAncestor(this.connection, version.stateId, parent.stateId);
+    const childStates = (await getStatesInRange(this.connection, version.stateId, 0))
+      .filter((s) => s > ancestor);
+    const parentStates = await getStatesInRange(this.connection, parent.stateId, 0);
+
+    const versionedTables = (await this.listTables()).filter((t) => t.isVersioned);
+
+    // Work out what to replay BEFORE opening a transaction (all reads).
+    const plan: Array<{ table: TableInfo; changed: number[]; pureDeletes: number[]; redundant: number }> = [];
+    let droppedRedundant = 0;
+    for (const table of versionedTables) {
+      const changed = await selectChangedObjectIds(this.connection, table, childStates, parentStates);
+      const deleted = await selectDeletedObjectIds(this.connection, table, childStates);
+      // A PURE delete is a D-row with NO A-row anywhere in the version's states.
+      // Filtering only against `changed` is not enough: a reconcile writes a
+      // delete marker AND a copied A-row per parent change, and those A-rows are
+      // dropped as identical-to-parent, so their markers would otherwise survive
+      // as thousands of phantom "deletions" that never happened.
+      const withARows = new Set(await selectObjectIdsWithARows(this.connection, table, childStates));
+      const pureDeletes = deleted.filter((oid) => !withARows.has(oid));
+      // A replayed row that SUPERSEDES a row the parent has is an update, whose
+      // native representation is delete-marker + A-row at the same state (exactly
+      // what the editor's own edit state held). Without the marker the diff
+      // mislabels a retirement as a creation. A brand-new feature gets NO marker:
+      // one at the same state as its A-row hides it from Esri's *_evw readers.
+      const supersedes = await selectObjectIdsPresentInParent(this.connection, table, changed, parentStates);
+      const markers = [...new Set([...pureDeletes, ...supersedes])];
+      if (changed.length || markers.length) {
+        plan.push({ table, changed, pureDeletes: markers, redundant: 0 });
+      }
+    }
+
+    if (options?.dryRun) {
+      return {
+        version: `${version.owner}.${version.name}`,
+        fromState: version.stateId,
+        toState: null,
+        replayed: plan.map((p) => ({ table: p.table.name, updates: p.changed.length, deletes: p.pureDeletes.length })),
+        droppedRedundant,
+        dryRun: true,
+      };
+    }
+
+    await this.connection.beginTransaction();
+    try {
+      const newState = await createChildState(this.connection, parent.stateId);
+      // SDE_state_new_edit locks the new state; this state becomes the version's
+      // permanent tip, so clear the lock (same reasoning as trim post).
+      await this.connection.execute(
+        this.connection.driver === 'sqlserver'
+          ? `DELETE FROM sde.SDE_state_locks WHERE state_id = @p0`
+          : `DELETE FROM sde.sde_state_locks WHERE state_id = $1`,
+        [newState],
+      );
+
+      const replayed: Array<{ table: string; updates: number; deletes: number }> = [];
+      for (const p of plan) {
+        const updates = await copyTipRows(this.connection, p.table, childStates, newState, p.changed);
+        if (updates !== p.changed.length) {
+          throw new Error(
+            `Rebase of ${versionName} failed on ${p.table.name}: copied ${updates} A-rows, ` +
+            `expected ${p.changed.length}. The version was NOT changed.`,
+          );
+        }
+        const deletes = await insertDeleteMarkers(this.connection, p.table, p.pureDeletes, newState);
+        replayed.push({ table: p.table.name, updates, deletes });
+      }
+
+      const moved = await updateVersionState(this.connection, version.owner, version.name, newState);
+      if (moved !== 1) {
+        throw new Error(
+          `Rebase did not move ${versionName}: matched ${moved} version rows (expected 1). ` +
+          `The version was NOT changed.`,
+        );
+      }
+
+      // Keep the closure Esri readers rely on consistent with the new ancestry.
+      const lineageName = await getLineageName(this.connection, newState);
+      await addStatesToLineage(this.connection, lineageName, [...parentStates, newState]);
+
+      await this.connection.commitTransaction();
+      return {
+        version: `${version.owner}.${version.name}`,
+        fromState: version.stateId,
+        toState: newState,
+        replayed,
+        droppedRedundant,
+        dryRun: false,
       };
     } catch (error) {
       await this.connection.rollbackTransaction();
