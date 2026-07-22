@@ -64,6 +64,7 @@ export { consoleLogger } from './logger';
 export {
   findCommonAncestor,
   NoCommonAncestorError,
+  BrokenLineageError,
   getStatesInRange,
   getAllChanges,
   getAllChangedFeatures,

@@ -14,6 +14,7 @@
 export {
   findCommonAncestor,
   NoCommonAncestorError,
+  BrokenLineageError,
   getStatesInRange,
   getLineageName,
   addStatesToLineage,

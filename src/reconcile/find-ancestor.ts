@@ -54,30 +54,79 @@ export async function findCommonAncestor(
     if (parentSet.has(s) && s > ancestor) ancestor = s;
   }
 
-  if (ancestor < 0) {
-    // No shared ancestor. Real-world cause: `childStateId` belongs to a version
-    // created before a DEFAULT compress that trimmed the states they had in
-    // common, orphaning the version's state tree. Consumers distinguish this
-    // (recoverable, user-facing) case from an unexpected failure via `.code`.
-    throw new NoCommonAncestorError(childStateId, parentStateId);
-  }
+  if (ancestor >= 0) return ancestor;
 
-  return ancestor;
+  // No shared state ABOVE the base. Every valid lineage still descends from the
+  // base state (0), so there are two sub-cases and they must be told apart:
+  //   - Both closures are base-rooted (their oldest state's parent is 0): the two
+  //     versions genuinely diverged AT the base, so the base is their common
+  //     ancestor. This is the normal result of a DEFAULT compress that folded the
+  //     shared history into the base tables and re-rooted an un-reconciled version
+  //     onto state 0. ArcMap/Pro reconcile such a version against the base, so
+  //     returning 0 matches Esri behaviour exactly.
+  //   - Either closure is NOT base-rooted (its chain dead-ends on a missing parent
+  //     row, or the tip row itself is gone): the state tree is damaged and has no
+  //     valid path to the base. Returning 0 would silently diff against the base;
+  //     instead throw BrokenLineageError so the caller reports the version as
+  //     damaged, as ArcMap refuses to reconcile a broken version.
+  // Sequential awaits (not Promise.all): one connection can't run two concurrent
+  // requests (see above).
+  const childBaseRooted = await isBaseRooted(connection, childClosure);
+  const parentBaseRooted = await isBaseRooted(connection, parentClosure);
+  if (childBaseRooted && parentBaseRooted) return 0;
+
+  throw new BrokenLineageError(childStateId, parentStateId);
 }
 
 /**
- * Thrown by {@link findCommonAncestor} when two states share no ancestor (e.g. a
- * version orphaned by a DEFAULT compress). Carries a stable `code` so callers can
- * branch on it without matching the message text.
- *
- * NOTE: the message wording is load-bearing for older consumers that still match
- * on it — do not reword it casually; prefer `err.code === 'NO_COMMON_ANCESTOR'`.
+ * True iff the closure's oldest state descends directly from the base (state 0) —
+ * i.e. the parent chain actually reached the base rather than dead-ending on a
+ * missing parent row. getStatesInRange stops recursing either at parent_state_id
+ * 0 (base-rooted) or when the parent row is absent (dangling); the oldest state's
+ * parent distinguishes them. An empty closure (the tip row itself is missing) is
+ * never base-rooted.
+ */
+async function isBaseRooted(
+  connection: IDatabaseConnection,
+  closure: number[],
+): Promise<boolean> {
+  if (closure.length === 0) return false;
+  const oldest = Math.min(...closure);
+  const sql = connection.driver === 'sqlserver'
+    ? `SELECT parent_state_id FROM sde.SDE_states WHERE state_id = @p0`
+    : `SELECT parent_state_id FROM sde.sde_states WHERE state_id = $1`;
+  const rows = await connection.query<{ parent_state_id: number | bigint | string }>(sql, [oldest]);
+  if (rows.length === 0) return false;
+  return Number(rows[0]!.parent_state_id) === 0;
+}
+
+/**
+ * Retained for API/back-compat. `findCommonAncestor` no longer throws this — a
+ * version that shares only the base with DEFAULT (compress-orphaned) now resolves
+ * to the base state 0 (see the base-rooted branch above), matching ArcMap. A
+ * genuinely damaged tree throws {@link BrokenLineageError} instead. Kept exported
+ * so consumers that still reference the `NO_COMMON_ANCESTOR` code compile.
  */
 export class NoCommonAncestorError extends Error {
   readonly code = 'NO_COMMON_ANCESTOR';
   constructor(childStateId: number, parentStateId: number) {
     super(`Could not find common ancestor between states ${childStateId} and ${parentStateId}`);
     this.name = 'NoCommonAncestorError';
+  }
+}
+
+/**
+ * Thrown by {@link findCommonAncestor} when two states share no ancestor AND at
+ * least one lineage does not reach the base — its parent chain dead-ends on a
+ * missing state row, or the tip row itself is gone. This is a damaged state tree
+ * that cannot be reconciled, distinct from the recoverable fully-diverged case
+ * (which returns the base state 0). Carries a stable `code`.
+ */
+export class BrokenLineageError extends Error {
+  readonly code = 'BROKEN_LINEAGE';
+  constructor(childStateId: number, parentStateId: number) {
+    super(`Damaged state lineage: no path to base between states ${childStateId} and ${parentStateId}`);
+    this.name = 'BrokenLineageError';
   }
 }
 

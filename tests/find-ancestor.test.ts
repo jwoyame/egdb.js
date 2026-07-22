@@ -12,15 +12,27 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { findCommonAncestor, getStatesInRange } from '../src/reconcile/find-ancestor';
+import { findCommonAncestor, getStatesInRange, BrokenLineageError } from '../src/reconcile/find-ancestor';
 import type { IDatabaseConnection } from '../src/connections/connection';
 
-function mockConn(closuresByCall: number[][]): IDatabaseConnection {
-  let call = 0;
+// Mock: getStatesInRange issues a recursive CTE (contains "WITH"); isBaseRooted
+// issues a plain `SELECT parent_state_id ... WHERE state_id = @p0`. We return the
+// two closures for the CTE calls (child then parent) and, for the plain query,
+// the parent_state_id of the requested state from `parentOf` ([] = row missing).
+function mockConn(
+  child: number[],
+  parent: number[],
+  parentOf: Record<number, number> = {},
+): IDatabaseConnection {
+  let closureCall = 0;
   return {
     driver: 'sqlserver',
-    query: async () => {
-      const rows = closuresByCall[call++] ?? [];
+    query: async (sql: string, params?: unknown[]) => {
+      if (!/WITH/i.test(sql)) {
+        const sid = (params as number[])[0]!;
+        return sid in parentOf ? [{ parent_state_id: parentOf[sid] }] : [];
+      }
+      const rows = closureCall++ === 0 ? child : parent;
       return rows.map((s) => ({ state_id: s }));
     },
   } as unknown as IDatabaseConnection;
@@ -32,7 +44,7 @@ describe('findCommonAncestor', () => {
     // The old impl returned 25070 (the child's own tip); correct is 25066.
     const child = [24814, 25008, 25066, 25067, 25068, 25069, 25070];
     const parent = [24814, 25008, 25066];
-    expect(await findCommonAncestor(mockConn([child, parent]), 25070, 25066)).toBe(25066);
+    expect(await findCommonAncestor(mockConn(child, parent), 25070, 25066)).toBe(25066);
   });
 
   it('handles the ArcGIS self-row-absent shape (tip present via getStatesInRange UNION)', async () => {
@@ -40,19 +52,35 @@ describe('findCommonAncestor', () => {
     // self-row, so its result is tip-inclusive; the parent tip is the ancestor.
     const child = [10, 20, 30, 40];
     const parent = [10, 20, 30];
-    expect(await findCommonAncestor(mockConn([child, parent]), 40, 30)).toBe(30);
+    expect(await findCommonAncestor(mockConn(child, parent), 40, 30)).toBe(30);
   });
 
   it('returns the divergence point for branched lineages (DEFAULT moved on)', async () => {
     const child = [10, 20, 40];
     const parent = [10, 20, 50];
-    expect(await findCommonAncestor(mockConn([child, parent]), 40, 50)).toBe(20);
+    expect(await findCommonAncestor(mockConn(child, parent), 40, 50)).toBe(20);
   });
 
-  it('throws when the two states share no ancestor', async () => {
-    await expect(
-      findCommonAncestor(mockConn([[40], [50]]), 40, 50),
-    ).rejects.toThrow(/common ancestor/);
+  it('returns base state 0 when both versions diverged at the base (compress-orphaned)', async () => {
+    // Putnam Alex shape: child tip 21931 (parent_state_id 0), DEFAULT rooted at
+    // 22052 (parent_state_id 0); they share nothing above the base. ArcMap
+    // reconciles such a version against the base, so 0 is the common ancestor.
+    const child = [21931];
+    const parent = [22052, 23000, 25169];
+    const conn = mockConn(child, parent, { 21931: 0, 22052: 0 });
+    expect(await findCommonAncestor(conn, 21931, 25169)).toBe(0);
+  });
+
+  it('throws BrokenLineageError when a lineage does not reach the base (dangling parent)', async () => {
+    // child's oldest state 40 claims parent 99, which is absent from the walk:
+    // a damaged tree with no path to base. Must NOT silently diff against base.
+    const conn = mockConn([40], [50], { 40: 99, 50: 0 });
+    await expect(findCommonAncestor(conn, 40, 50)).rejects.toBeInstanceOf(BrokenLineageError);
+  });
+
+  it('throws BrokenLineageError on an empty closure (missing tip row)', async () => {
+    const conn = mockConn([], [50], { 50: 0 });
+    await expect(findCommonAncestor(conn, 40, 50)).rejects.toBeInstanceOf(BrokenLineageError);
   });
 });
 
