@@ -6,12 +6,14 @@ import type { IDatabaseConnection } from '../connections/connection';
 import type {
   TableInfo,
   VersionChanges,
+  FeatureChange,
   DetailedConflict,
   ReconcileOptions,
   ConflictResolution,
 } from '../types';
 import { readATableRow } from './read-row-data';
 import { requireRegistrationId } from '../utils/guards';
+import { copyTipRows, insertDeleteMarkers, selectObjectIdsWithARows } from './set-copy';
 
 /**
  * Quote an identifier based on database driver.
@@ -237,7 +239,80 @@ export async function applyParentChanges(
   // Process all parent changes
   const allChanges = [...parentChanges.inserts, ...parentChanges.updates, ...parentChanges.deletes];
 
-  for (const change of allChanges) {
+  // ------------------------------------------------------------------
+  // Fast path: every change WITHOUT a conflict is applied set-based.
+  //
+  // Catching a version up to DEFAULT on a real fabric means tens of thousands of
+  // features. Doing that one row at a time -- each copy re-reading
+  // INFORMATION_SCHEMA -- is minutes of sequential round-trips, which is what
+  // made Submit time out. Conflicts are rare and need a per-row decision, so
+  // they keep the original loop below.
+  // ------------------------------------------------------------------
+  const isConflicted = (c: FeatureChange) => conflictMap.has(`${c.table}:${c.objectId}`);
+  const plain = allChanges.filter((c) => !isConflicted(c));
+  const conflicted = allChanges.filter(isConflicted);
+
+  const byTable = new Map<string, FeatureChange[]>();
+  for (const c of plain) {
+    const list = byTable.get(c.table) ?? [];
+    list.push(c);
+    byTable.set(c.table, list);
+  }
+
+  const uniq = (ns: number[]) => [...new Set(ns)];
+  // Chunk the IN-lists: one statement per chunk still collapses thousands of
+  // round-trips while keeping any single statement a sane size.
+  const CHUNK = 2000;
+  function chunk<T>(arr: T[]): T[][] {
+    const out: T[][] = [];
+    for (let i = 0; i < arr.length; i += CHUNK) out.push(arr.slice(i, i + CHUNK));
+    return out;
+  }
+
+  for (const [tableName, changes] of byTable) {
+    const tableInfo = tables.find((t) => t.name === tableName);
+    if (!tableInfo) continue;
+
+    const ins = changes.filter((c) => c.changeType === 'insert');
+    const upd = changes.filter((c) => c.changeType === 'update');
+    const del = changes.filter((c) => c.changeType === 'delete');
+
+    // Inserts: copy the parent's tip row per OBJECTID straight in.
+    for (const part of chunk(ins)) {
+      await copyTipRows(connection, tableInfo, uniq(part.map((c) => c.stateId)), childStateId,
+        uniq(part.map((c) => c.objectId)));
+    }
+    appliedCount += ins.length;
+
+    // Updates: skip any OBJECTID the child already modified in its own state --
+    // the same guard the row-by-row path applied via readATableRow, so the
+    // child's edit is never clobbered. The rest get delete-marker + A-row.
+    if (upd.length > 0) {
+      const alreadyMine = new Set(
+        await selectObjectIdsWithARows(connection, tableInfo, [childStateId]),
+      );
+      const todo = upd.filter((c) => !alreadyMine.has(c.objectId));
+      for (const part of chunk(todo)) {
+        const oids = uniq(part.map((c) => c.objectId));
+        await insertDeleteMarkers(connection, tableInfo, oids, childStateId);
+        await copyTipRows(connection, tableInfo, uniq(part.map((c) => c.stateId)), childStateId, oids);
+      }
+      // Count matches the previous behaviour: an update is "applied" even when
+      // the child's own edit caused it to be skipped.
+      appliedCount += upd.length;
+    }
+
+    // Deletes: markers only.
+    for (const part of chunk(del)) {
+      await insertDeleteMarkers(connection, tableInfo, uniq(part.map((c) => c.objectId)), childStateId);
+    }
+    appliedCount += del.length;
+  }
+
+  // ------------------------------------------------------------------
+  // Conflicts keep the original per-row handling (few, each needs a decision).
+  // ------------------------------------------------------------------
+  for (const change of conflicted) {
     const key = `${change.table}:${change.objectId}`;
     const conflict = conflictMap.get(key);
     const tableInfo = tables.find(t => t.name === change.table);
