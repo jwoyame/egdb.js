@@ -13,6 +13,7 @@
 // State lineage helpers
 export {
   findCommonAncestor,
+  NoCommonAncestorError,
   getStatesInRange,
   getLineageName,
   addStatesToLineage,

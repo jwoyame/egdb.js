@@ -55,12 +55,30 @@ export async function findCommonAncestor(
   }
 
   if (ancestor < 0) {
-    throw new Error(
-      `Could not find common ancestor between states ${childStateId} and ${parentStateId}`
-    );
+    // No shared ancestor. Real-world cause: `childStateId` belongs to a version
+    // created before a DEFAULT compress that trimmed the states they had in
+    // common, orphaning the version's state tree. Consumers distinguish this
+    // (recoverable, user-facing) case from an unexpected failure via `.code`.
+    throw new NoCommonAncestorError(childStateId, parentStateId);
   }
 
   return ancestor;
+}
+
+/**
+ * Thrown by {@link findCommonAncestor} when two states share no ancestor (e.g. a
+ * version orphaned by a DEFAULT compress). Carries a stable `code` so callers can
+ * branch on it without matching the message text.
+ *
+ * NOTE: the message wording is load-bearing for older consumers that still match
+ * on it — do not reword it casually; prefer `err.code === 'NO_COMMON_ANCESTOR'`.
+ */
+export class NoCommonAncestorError extends Error {
+  readonly code = 'NO_COMMON_ANCESTOR';
+  constructor(childStateId: number, parentStateId: number) {
+    super(`Could not find common ancestor between states ${childStateId} and ${parentStateId}`);
+    this.name = 'NoCommonAncestorError';
+  }
 }
 
 /**

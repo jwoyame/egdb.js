@@ -63,6 +63,7 @@ export { consoleLogger } from './logger';
 // Reconcile module (for advanced usage)
 export {
   findCommonAncestor,
+  NoCommonAncestorError,
   getStatesInRange,
   getAllChanges,
   getAllChangedFeatures,
