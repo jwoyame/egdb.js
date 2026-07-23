@@ -125,57 +125,26 @@ describe('countMissingSelfRows', () => {
 });
 
 describe('readLockedBranches', () => {
-  it('returns the union of locks, descendants, and ancestors via lineage_name lookup', async () => {
-    // Pretend lock is held on state 50; descendants {70, 80} and ancestors {10, 30}.
+  it('expands locked states to ancestors + descendants via the parent_state_id walk (root fix)', async () => {
     const { connection, calls } = makeMock({
       queryResponses: [
-        {
-          match: /UNION/,
-          rows: [
-            { state_id: 50 },
-            { state_id: 70 },
-            { state_id: 80 },
-            { state_id: 10 },
-            { state_id: 30 },
-          ],
-        },
+        { match: /UNION/, rows: [{ state_id: 50 }, { state_id: 70 }, { state_id: 80 }, { state_id: 10 }, { state_id: 30 }] },
       ],
     });
     const result = await readLockedBranches(connection);
     expect(result).toEqual(new Set([50, 70, 80, 10, 30]));
-    // Confirm the SQL joins SDE_states (correct lineage_name lookup) and
-    // uses lineage_id<=lock for ancestors, state_id>=lock for descendants.
-    expect(calls[0]!.sql).toMatch(/SDE_state_locks/);
-    expect(calls[0]!.sql).toMatch(/JOIN sde.SDE_states/);
-    expect(calls[0]!.sql).toMatch(/sl.lineage_name = sLock.lineage_name/);
+    // Two recursive CTEs over parent_state_id (ancestors UP, descendants DOWN),
+    // seeded from SDE_state_locks — NOT the SDE_state_lineages closure.
+    expect(calls[0]!.sql).toMatch(/locked AS \(SELECT DISTINCT state_id AS s FROM sde.SDE_state_locks\)/);
+    expect(calls[0]!.sql).toMatch(/JOIN anc a ON pp.state_id = a.p/);   // ancestors (up)
+    expect(calls[0]!.sql).toMatch(/JOIN dsc dd ON c.parent_state_id = dd.s/); // descendants (down)
+    expect(calls[0]!.sql).not.toMatch(/sl.lineage_name = sLock.lineage_name/);
   });
 });
 
-describe('computeGraduablePrefix', () => {
-  it('returns the empty set when no versions exist', async () => {
-    const { connection } = makeMock({
-      queryResponses: [{ match: /COUNT\(\*\) AS cnt/, rows: [{ cnt: 0 }] }],
-    });
-    const result = await computeGraduablePrefix(connection);
-    expect(result).toEqual(new Set());
-  });
-
-  it('groups closure rows and filters by version count, UNIONing each tip into its own closure', async () => {
-    const { connection, calls } = makeMock({
-      queryResponses: [
-        { match: /COUNT\(DISTINCT state_id\) AS cnt FROM sde.SDE_versions/, rows: [{ cnt: 3 }] },
-        {
-          match: /HAVING COUNT\(DISTINCT tip\)/,
-          rows: [{ state_id: 0 }, { state_id: 5 }, { state_id: 10 }],
-        },
-      ],
-    });
-    const result = await computeGraduablePrefix(connection);
-    expect(result).toEqual(new Set([0, 5, 10]));
-    // Confirm the SQL UNIONs each tip into its own closure (no self-row assumed).
-    expect(calls[1]!.sql).toMatch(/UNION SELECT state_id AS tip/);
-  });
-});
+// (computeGraduablePrefix + graduateTable winner/tie-break mock tests removed:
+//  they encoded the deleted closure/winner machinery. Graduation is now covered
+//  by tests/compress/ (reference-model oracle + DB harness). N12.)
 
 describe('graduateTable - subset revalidation', () => {
   it('returns skipped-version-set-changed when the snapshot is no longer a subset', async () => {
@@ -205,196 +174,6 @@ describe('graduateTable - subset revalidation', () => {
   });
 });
 
-describe('graduateTable - no winners', () => {
-  it('early-returns with no-graduable-rows when both winner queries are empty', async () => {
-    // Bulk semantics: an OID only enters the winners map if it has at least
-    // one winning A or D row. If neither winner query returns anything, the
-    // function early-returns without touching base or delta tables. (Under
-    // the previous per-OID loop, phantom-OID cleanup ran an extra DELETE;
-    // bulk skips that because there's nothing to delete.)
-    const { connection, calls } = makeMock({
-      queryResponses: [
-        { match: /COUNT\(DISTINCT state_id\) AS cnt FROM sde.SDE_versions/, rows: [{ cnt: 1 }] },
-        { match: /HAVING COUNT\(DISTINCT tip\)/, rows: [{ state_id: 5 }] },
-        { match: /FROM \[PA\]\.\[a42\] a1/, rows: [] },
-        { match: /FROM \[PA\]\.\[D42\] d1/, rows: [] },
-      ],
-    });
-
-    const result = await graduateTable(connection, FAB_TABLE, new Set([5]));
-    expect(result.status).toBe('no-graduable-rows');
-    expect(result.upserts).toBe(0);
-    expect(result.deletes).toBe(0);
-    // No DELETEs at all.
-    const deleteSqls = calls.filter(c => c.kind === 'execute' && /^DELETE/.test(c.sql));
-    expect(deleteSqls).toHaveLength(0);
-  });
-});
-
-describe('graduateTable - co-located D+A tie-breaker (UPSERT)', () => {
-  it('treats A and D at same state_id as UPDATE → UPSERT-A', async () => {
-    const { connection, calls } = makeMock({
-      queryResponses: [
-        { match: /COUNT\(DISTINCT state_id\) AS cnt FROM sde.SDE_versions/, rows: [{ cnt: 1 }] },
-        { match: /HAVING COUNT\(DISTINCT tip\)/, rows: [{ state_id: 5 }] },
-        { match: /UNION SELECT/, rows: [{ oid: 99 }] },
-        { match: /FROM \[PA\]\.\[a42\] a1/, rows: [{ oid: 99, state_id: 5 }] as Record<string, unknown>[] }, // A at 5
-        { match: /FROM \[PA\]\.\[D42\] d1/, rows: [{ oid: 99, state_id: 5, deleted_at: 5 }] as Record<string, unknown>[] }, // D at 5
-        // INFORMATION_SCHEMA columns
-        {
-          match: /INFORMATION_SCHEMA\.COLUMNS/,
-          rows: [
-            { name: 'OBJECTID' },
-            { name: 'SHAPE' },
-            { name: 'PIN' },
-            { name: 'SDE_STATE_ID' },
-          ],
-        },
-      ],
-      executeResponses: [
-        { match: /UPDATE base/, result: { rowsAffected: 1 } },
-        { match: /INSERT INTO \[PA\]\.\[Parcels\]/, result: { rowsAffected: 0 } },
-      ],
-    });
-
-    const result = await graduateTable(connection, FAB_TABLE, new Set([5]));
-    expect(result.status).toBe('graduated');
-    // Bulk semantics: UPDATE runs, then INSERT runs (no-op via NOT EXISTS).
-    // upserts = update-rows-affected + insert-rows-affected = 1 + 0.
-    expect(result.upserts).toBe(1);
-    expect(result.deletes).toBe(0);
-    const updates = calls.filter(c => c.kind === 'execute' && /UPDATE base/.test(c.sql));
-    expect(updates).toHaveLength(1);
-    // SDE_STATE_ID is excluded from the SET clause (FROM clause boundary).
-    const setClause = updates[0]!.sql.match(/SET (.+?) FROM/)?.[1] ?? '';
-    expect(setClause).not.toMatch(/SDE_STATE_ID/);
-  });
-});
-
-describe('graduateTable - D-winner is descendant of A-winner (DELETE)', () => {
-  it('graduates to DELETE when delete supersedes the add along the lineage', async () => {
-    const { connection } = makeMock({
-      queryResponses: [
-        { match: /COUNT\(DISTINCT state_id\) AS cnt FROM sde.SDE_versions/, rows: [{ cnt: 1 }] },
-        { match: /HAVING COUNT\(DISTINCT tip\)/, rows: [{ state_id: 5 }, { state_id: 7 }] },
-        { match: /UNION SELECT/, rows: [{ oid: 99 }] },
-        { match: /FROM \[PA\]\.\[a42\] a1/, rows: [{ oid: 99, state_id: 5 }] as Record<string, unknown>[] }, // A at 5
-        { match: /FROM \[PA\]\.\[D42\] d1/, rows: [{ oid: 99, state_id: 7, deleted_at: 7 }] as Record<string, unknown>[] }, // D at 7 (descendant)
-        {
-          // Batched ancestry: pair (5, 7) — 5 IS an ancestor of 7.
-          match: /FROM \(VALUES \(5, 7\)\) AS p/,
-          rows: [{ anc: 5, desc: 7 }],
-        },
-      ],
-      executeResponses: [
-        { match: /DELETE FROM \[PA\]\.\[Parcels\]/, result: { rowsAffected: 1 } },
-      ],
-    });
-
-    const result = await graduateTable(connection, FAB_TABLE, new Set([5, 7]));
-    expect(result.status).toBe('graduated');
-    expect(result.deletes).toBe(1);
-    expect(result.upserts).toBe(0);
-  });
-});
-
-describe('graduateTable - A-winner is descendant of D-winner (UPSERT)', () => {
-  it('UPSERTs when add supersedes the delete along the lineage', async () => {
-    const { connection } = makeMock({
-      queryResponses: [
-        { match: /COUNT\(DISTINCT state_id\) AS cnt FROM sde.SDE_versions/, rows: [{ cnt: 1 }] },
-        { match: /HAVING COUNT\(DISTINCT tip\)/, rows: [{ state_id: 5 }, { state_id: 7 }] },
-        { match: /UNION SELECT/, rows: [{ oid: 99 }] },
-        { match: /FROM \[PA\]\.\[a42\] a1/, rows: [{ oid: 99, state_id: 7 }] as Record<string, unknown>[] }, // A at 7 (descendant)
-        { match: /FROM \[PA\]\.\[D42\] d1/, rows: [{ oid: 99, state_id: 5, deleted_at: 5 }] as Record<string, unknown>[] }, // D at 5
-        {
-          // Batched ancestry: pair (7, 5) — 7 is NOT an ancestor of 5.
-          match: /FROM \(VALUES \(7, 5\)\) AS p/,
-          rows: [],
-        },
-        {
-          match: /INFORMATION_SCHEMA\.COLUMNS/,
-          rows: [{ name: 'OBJECTID' }, { name: 'SHAPE' }, { name: 'SDE_STATE_ID' }],
-        },
-      ],
-      executeResponses: [
-        { match: /UPDATE base/, result: { rowsAffected: 1 } },
-        { match: /INSERT INTO \[PA\]\.\[Parcels\]/, result: { rowsAffected: 0 } },
-      ],
-    });
-
-    const result = await graduateTable(connection, FAB_TABLE, new Set([5, 7]));
-    expect(result.status).toBe('graduated');
-    expect(result.upserts).toBe(1);
-    expect(result.deletes).toBe(0);
-  });
-});
-
-describe('graduateTable - multi-winner OID across non-comparable lineages', () => {
-  it('emits a warning and skips an OID when its A-winners are mutually incomparable', async () => {
-    // Two A-rows for OID 99: one at state 5, one at state 7. Neither is an
-    // ancestor of the other (different lineage_name trees, concurrent posts).
-    // Previously, `winners.set(oid, w)` silently overwrote one with the
-    // other, and the cleanup DELETE wiped both delta rows — losing one
-    // version's edits without ever writing them to base. The new code
-    // detects this case, warns, and refuses to graduate the OID.
-    const { connection, calls } = makeMock({
-      queryResponses: [
-        { match: /COUNT\(DISTINCT state_id\) AS cnt FROM sde.SDE_versions/, rows: [{ cnt: 2 }] },
-        { match: /HAVING COUNT\(DISTINCT tip\)/, rows: [{ state_id: 5 }, { state_id: 7 }] },
-        { match: /UNION SELECT/, rows: [{ oid: 99 }] },
-        {
-          match: /FROM \[PA\]\.\[a42\] a1/,
-          rows: [
-            { oid: 99, state_id: 5 },
-            { oid: 99, state_id: 7 },
-          ] as Record<string, unknown>[],
-        },
-        { match: /FROM \[PA\]\.\[D42\] d1/, rows: [] },
-        // Batched ancestry probes: neither pairwise relation holds.
-        { match: /FROM \(VALUES /, rows: [] },
-      ],
-    });
-
-    const result = await graduateTable(connection, FAB_TABLE, new Set([5, 7]));
-    expect(result.status).toBe('no-graduable-rows');
-    expect(result.upserts).toBe(0);
-    expect(result.deletes).toBe(0);
-    expect(result.warnings.length).toBeGreaterThan(0);
-    expect(result.warnings[0]).toMatch(/concurrent graduable A-rows/);
-    // Should not have issued any DELETE against the A or D tables.
-    const dels = calls.filter(c => c.kind === 'execute' && /DELETE FROM \[PA\]\./.test(c.sql));
-    expect(dels).toHaveLength(0);
-  });
-});
-
-describe('graduateTable - INSERT when UPDATE affects 0 rows', () => {
-  it('falls through to INSERT when the base row does not yet exist', async () => {
-    const { connection, calls } = makeMock({
-      queryResponses: [
-        { match: /COUNT\(DISTINCT state_id\) AS cnt FROM sde.SDE_versions/, rows: [{ cnt: 1 }] },
-        { match: /HAVING COUNT\(DISTINCT tip\)/, rows: [{ state_id: 5 }] },
-        { match: /UNION SELECT/, rows: [{ oid: 99 }] },
-        { match: /FROM \[PA\]\.\[a42\] a1/, rows: [{ oid: 99, state_id: 5 }] as Record<string, unknown>[] },
-        { match: /FROM \[PA\]\.\[D42\] d1/, rows: [] },
-        {
-          match: /INFORMATION_SCHEMA\.COLUMNS/,
-          rows: [{ name: 'OBJECTID' }, { name: 'SHAPE' }, { name: 'SDE_STATE_ID' }],
-        },
-      ],
-      executeResponses: [
-        { match: /UPDATE base/, result: { rowsAffected: 0 } }, // base row missing
-        { match: /INSERT INTO \[PA\]\.\[Parcels\]/, result: { rowsAffected: 1 } },
-      ],
-    });
-    const result = await graduateTable(connection, FAB_TABLE, new Set([5]));
-    expect(result.upserts).toBe(1);
-    const sqls = calls.filter(c => c.kind === 'execute').map(c => c.sql);
-    expect(sqls.some(s => /UPDATE base/.test(s))).toBe(true);
-    expect(sqls.some(s => /INSERT INTO \[PA\]\.\[Parcels\]/.test(s))).toBe(true);
-  });
-});
-
 describe('pruneStates', () => {
   it('does nothing when no candidates exist', async () => {
     const { connection } = makeMock({
@@ -408,17 +187,16 @@ describe('pruneStates', () => {
     expect(result.deltaRowsRemoved).toBe(0);
   });
 
-  it('uses the JOIN-on-lineage_name idiom for the closure subquery (not lineage_name = state_id)', async () => {
-    // Regression: the previous shape `WHERE lineage_name IN (SELECT state_id
-    // FROM SDE_versions)` treated each tip's state_id as if it were a
-    // lineage_name. On any DB where a tip's lineage_name differs from its
-    // state_id (the common case), that returned zero closure rows and made
-    // every linear ancestor a prune candidate.
+  it('decides prune candidates by the parent_state_id walk, not the closure (root fix)', async () => {
+    // COMPRESS_HARDENING_PLAN.md §5.1: prune candidacy is judged by the
+    // authoritative parent_state_id walk (a `reachable` recursive CTE), never by
+    // the SDE_state_lineages closure (which has diverged on the live fabric).
+    // Candidates must also be leaves (no child) and exclude the base state 0.
     let candidateSqls: string[] = [];
     const { connection } = makeMock({
       queryResponses: [
         { match: /UNION/, rows: [] }, // no locks
-        { match: /FROM sde.SDE_states s WHERE/, rows: [] }, // no candidates
+        { match: /FROM sde.SDE_states s\b/, rows: [] }, // no candidates
       ],
     });
     const origQuery = connection.query.bind(connection);
@@ -427,19 +205,17 @@ describe('pruneStates', () => {
       params?: unknown[],
     ) => {
       const norm = sql.replace(/\s+/g, ' ');
-      if (/FROM sde.SDE_states s WHERE/.test(norm)) {
-        candidateSqls.push(norm);
-      }
+      if (/reachable AS/.test(norm) && /FROM sde.SDE_states s\b/.test(norm)) candidateSqls.push(norm);
       return origQuery<T>(sql, params);
     };
     await pruneStates(connection, []);
     expect(candidateSqls.length).toBeGreaterThan(0);
     const sql = candidateSqls[0]!;
-    // Must JOIN SDE_states with SDE_state_lineages by lineage_name and
-    // filter by lineage_id <= tip; must NOT have the broken IN subquery.
-    expect(sql).toMatch(/JOIN sde.SDE_states vs ON vs.lineage_name = sl.lineage_name/);
-    expect(sql).toMatch(/sl.lineage_id <= vs.state_id/);
-    expect(sql).not.toMatch(/lineage_name IN \(SELECT state_id FROM sde.SDE_versions/);
+    expect(sql).toMatch(/reachable AS \( SELECT/);
+    expect(sql).toMatch(/JOIN reachable r ON st.state_id = r.rp/);
+    expect(sql).toMatch(/NOT EXISTS \(SELECT 1 FROM sde.SDE_states c WHERE c.parent_state_id = s.state_id\)/);
+    expect(sql).toMatch(/s.state_id <> 0/);
+    expect(sql).not.toMatch(/JOIN sde.SDE_states vs ON vs.lineage_name = sl.lineage_name/);
   });
 
   it('binds two params per stateId for the OR-on-two-cols DELETEs', async () => {

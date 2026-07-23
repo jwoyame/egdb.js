@@ -455,8 +455,24 @@ export interface PostResult {
 
 /** Compression options */
 export interface CompressOptions {
-  /** Only compress specific tables (default: all versioned tables) */
+  /**
+   * Only compress specific tables (default: all versioned tables).
+   *
+   * WARNING: this currently scopes prune/collapse too, which silently corrupts
+   * excluded tables (rows left tagged with a deleted state). Until that is
+   * fixed, only pass this with a single-table fabric. See
+   * openparcels/handoff/COMPRESS_HARDENING_PLAN.md item N2.
+   */
   tables?: string[];
+  /**
+   * REQUIRED to run. compress() is a from-scratch reimplementation of Esri's
+   * compress with known-unfixed defects (data-loss vectors under a divergent
+   * SDE_state_lineages closure; see COMPRESS_HARDENING_PLAN.md). It must never be
+   * wired to a route or a cron until that hardening lands, so it refuses to do
+   * anything unless the caller explicitly acknowledges the risk here. A `dryRun`
+   * is exempt (read-only) and does not require this.
+   */
+  acknowledgeExperimentalUnsafe?: boolean;
 }
 
 /** Compression result */

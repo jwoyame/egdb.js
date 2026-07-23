@@ -136,40 +136,33 @@ export async function readLockedBranches(connection: IDatabaseConnection): Promi
   const driver = connection.driver;
   const locks = sysTable(driver, 'SDE_state_locks');
   const states = sysTable(driver, 'SDE_states');
-  const lineages = sysTable(driver, 'SDE_state_lineages');
   const sid = col(driver, 'state_id');
-  const lid = col(driver, 'lineage_id');
-  const lname = col(driver, 'lineage_name');
+  const pid = col(driver, 'parent_state_id');
 
-  // Three branches to UNION:
-  //   1. The locked states themselves.
-  //   2. Ancestors of locked states. For each lock L, look up L's
-  //      lineage_name from SDE_states, then take the closure rows with
-  //      lineage_id <= L.state_id under that lineage_name. (Within a
-  //      lineage_name, state_id IS lineage order from root to tip; the
-  //      global "state_id is allocation order" caveat only applies across
-  //      different lineage_names — see SDE_COMPRESS_SPEC.md Section 4.)
-  //   3. Descendants of locked states. For each lock L, find SDE_states
-  //      rows S where S.lineage_name has L as a closure member (i.e., a
-  //      lineage_name+L pair exists in SDE_state_lineages) AND L.state_id
-  //      <= S.state_id.
-  //
-  // The original implementation read `lineage_name` as if it were a
-  // state_id and produced garbage when locks were present. Verified
-  // against Putnam parcel_fabric_test where lineage_name is a separate
-  // tree identifier (e.g., state 25066 has lineage_name 24542).
+  // Root fix (COMPRESS_HARDENING_PLAN.md §5.1, C5): a locked branch's protected
+  // set is the locked states plus their ANCESTORS (so reads through the lock
+  // resolve) plus their DESCENDANTS (so unsaved edits under the lock survive) —
+  // computed by walking parent_state_id, NOT the SDE_state_lineages closure. The
+  // old closure query was simultaneously over-broad (whole lineage_name) and
+  // incomplete (missed a re-allocated lineage_name). Ancestors need an UPWARD
+  // walk and descendants a DOWNWARD walk — two separate recursive CTEs.
+  const rec = driver === 'sqlserver' ? '' : 'RECURSIVE ';
+  const maxrec = driver === 'sqlserver' ? ' OPTION (MAXRECURSION 0)' : '';
   const sql = `
-    SELECT ${sid} AS state_id FROM ${locks}
+    WITH ${rec}locked AS (SELECT DISTINCT ${sid} AS s FROM ${locks}),
+    anc AS (
+      SELECT st.${sid} AS s, st.${pid} AS p FROM ${states} st JOIN locked l ON l.s = st.${sid}
+      UNION ALL
+      SELECT pp.${sid}, pp.${pid} FROM ${states} pp JOIN anc a ON pp.${sid} = a.p WHERE a.p <> 0
+    ),
+    dsc AS (
+      SELECT s FROM locked
+      UNION ALL
+      SELECT c.${sid} FROM ${states} c JOIN dsc dd ON c.${pid} = dd.s
+    )
+    SELECT s AS state_id FROM anc
     UNION
-    SELECT sl.${lid} AS state_id
-    FROM ${locks} lk
-    JOIN ${states} sLock ON sLock.${sid} = lk.${sid}
-    JOIN ${lineages} sl ON sl.${lname} = sLock.${lname} AND sl.${lid} <= lk.${sid}
-    UNION
-    SELECT sDesc.${sid} AS state_id
-    FROM ${locks} lk
-    JOIN ${lineages} sl ON sl.${lid} = lk.${sid}
-    JOIN ${states} sDesc ON sDesc.${lname} = sl.${lname} AND sDesc.${sid} >= lk.${sid}
+    SELECT s AS state_id FROM dsc${maxrec}
   `;
   const rows = await connection.query<{ state_id: number | bigint }>(sql);
   return new Set(rows.map(r => Number(r.state_id)));
@@ -189,40 +182,38 @@ export async function computeGraduablePrefix(connection: IDatabaseConnection): P
   const driver = connection.driver;
   const versions = sysTable(driver, 'SDE_versions');
   const states = sysTable(driver, 'SDE_states');
-  const lineages = sysTable(driver, 'SDE_state_lineages');
   const sid = col(driver, 'state_id');
-  const lid = col(driver, 'lineage_id');
-  const lname = col(driver, 'lineage_name');
+  const pid = col(driver, 'parent_state_id');
 
-  // Distinct version tips (collapsing multi-version-points-at-same-state).
+  // Distinct version tips.
   const versionCountRow = await connection.query<{ cnt: number | bigint }>(
     `SELECT COUNT(DISTINCT ${sid}) AS cnt FROM ${versions} WHERE ${sid} IS NOT NULL`
   );
   const versionCount = Number(versionCountRow[0]?.cnt ?? 0);
   if (versionCount === 0) return new Set();
 
-  // A state's effective closure follows the pattern in find-ancestor.ts:
-  //   - Look up the tip's lineage_name from SDE_states (NOT the tip's state_id)
-  //   - Join SDE_state_lineages with that lineage_name
-  //   - Filter lineage_id <= tip.state_id (within a lineage_name, state_id IS
-  //     monotonic from root to tip; the global state_id ordering pitfall only
-  //     applies ACROSS different lineage_names)
-  //   - UNION the tip itself (SDE does not write self-rows uniformly)
-  // Graduable iff state appears in EVERY tip's effective closure.
+  // Root fix (COMPRESS_HARDENING_PLAN.md §5.1): a delta is graduable iff its
+  // state is an ancestor of EVERY version tip — decided by the authoritative
+  // parent_state_id walk, NOT the SDE_state_lineages closure (which manufactures
+  // spurious ancestors when tips share a lineage_name — the C1 corruption path).
+  // Build (tip, ancestor) pairs by walking parent_state_id up from every tip,
+  // then keep ancestors common to all tips. The intersection of root-paths is
+  // itself a single chain (the LCA's root-path), so downstream tie-breaking
+  // reduces to state-id order. Base state 0 is excluded (never graduated).
+  const rec = driver === 'sqlserver' ? '' : 'RECURSIVE ';
+  const maxrec = driver === 'sqlserver' ? ' OPTION (MAXRECURSION 0)' : '';
   const sql = `
-    SELECT state_id FROM (
-      SELECT s.${sid} AS tip, sl.${lid} AS state_id
-      FROM ${versions} v
-      JOIN ${states} s ON s.${sid} = v.${sid}
-      JOIN ${lineages} sl ON sl.${lname} = s.${lname} AND sl.${lid} <= v.${sid}
-      WHERE v.${sid} IS NOT NULL
-      UNION
-      SELECT ${sid} AS tip, ${sid} AS state_id
-      FROM ${versions}
-      WHERE ${sid} IS NOT NULL
-    ) ${driver === 'sqlserver' ? 'closures' : 'AS closures'}
-    GROUP BY state_id
-    HAVING COUNT(DISTINCT tip) = ${versionCount}
+    WITH ${rec}anc AS (
+      SELECT v.${sid} AS tip, v.${sid} AS a, s.${pid} AS p
+        FROM ${versions} v JOIN ${states} s ON s.${sid} = v.${sid}
+        WHERE v.${sid} IS NOT NULL
+      UNION ALL
+      SELECT r.tip, st.${sid}, st.${pid}
+        FROM ${states} st JOIN anc r ON st.${sid} = r.p WHERE r.p <> 0
+    )
+    SELECT a AS state_id FROM anc
+    GROUP BY a
+    HAVING COUNT(DISTINCT tip) = ${versionCount}${maxrec}
   `;
   const rows = await connection.query<{ state_id: number | bigint }>(sql);
   return new Set(rows.map(r => Number(r.state_id)));
@@ -344,331 +335,70 @@ export async function graduateTable(
   const sidCol = col(driver, 'SDE_STATE_ID');
   const drowCol = col(driver, 'SDE_DELETES_ROW_ID');
   const delAtCol = col(driver, 'DELETED_AT');
-  const lineages = sysTable(driver, 'SDE_state_lineages');
-  const states = sysTable(driver, 'SDE_states');
-  const lid = col(driver, 'lineage_id');
-  const lname = col(driver, 'lineage_name');
-
   const graduableList = buildIntegerList(Array.from(graduableSnapshot), 'graduateTable');
 
-  // BULK STEP 1: find every winning A-row across all OIDs in one query.
-  // A winner = no newer A-row exists for the same OID in the graduable prefix.
-  // "Newer" = a2's state has a1's state as ancestor (lineage_name + lineage_id<=
-  // closure pattern; see Section 3.3 + Section 4.1 of the spec).
-  const aWinnersSql = `
-    SELECT a1.${oidCol} AS oid, a1.${sidCol} AS state_id
-    FROM ${aTable} a1
-    WHERE a1.${sidCol} IN (${graduableList})
+  // The graduable prefix is a single chain (computeGraduablePrefix intersects
+  // the tips' parent_state_id root-paths), so within it states are totally
+  // ordered by state_id: the winner per OID is simply the MAX graduable-state
+  // A-row not superseded by a graduable delete at a higher state. No cross-
+  // lineage ancestry resolution is needed — this replaces the old closure-based
+  // winner machinery (which carried the C1 wrong-value bug and a reserved-word
+  // SQL bug), and it fixes C0 by keying delete-graduation on DELETED_AT so the
+  // Esri base-shadow markers (SDE_STATE_ID = 0) are honoured and cleared.
+  const baseCols = (await getTableColumns(connection, driver, table, cache))
+    .filter(c => c.toLowerCase() !== sidCol.toLowerCase());
+  const qCols = baseCols.map(c => qid(driver, c)).join(', ');
+  const srcCols = baseCols.map(c => `a.${qid(driver, c)}`).join(', ');
+
+  // Winner rows (oid, winning state) as a reusable subquery over the intact
+  // delta tables (must be read before the cleanup deletes below).
+  const winnersSub = `
+    SELECT a.${oidCol} AS oid, a.${sidCol} AS st
+    FROM ${aTable} a
+    INNER JOIN (
+      SELECT ${oidCol} AS moid, MAX(${sidCol}) AS ms
+      FROM ${aTable} WHERE ${sidCol} IN (${graduableList}) GROUP BY ${oidCol}
+    ) m ON m.moid = a.${oidCol} AND m.ms = a.${sidCol}
+    WHERE a.${sidCol} IN (${graduableList})
       AND NOT EXISTS (
-        SELECT 1 FROM ${aTable} a2
-        JOIN ${states} s2 ON s2.${col(driver, 'state_id')} = a2.${sidCol}
-        JOIN ${lineages} sl ON sl.${lname} = s2.${lname}
-          AND sl.${lid} = a1.${sidCol}
-          AND sl.${lid} <= a2.${sidCol}
-        WHERE a2.${oidCol} = a1.${oidCol}
-          AND a2.${sidCol} IN (${graduableList})
-          AND a2.${sidCol} <> a1.${sidCol}
-      )
-  `;
-  const aWinnerRows = await connection.query<{ oid: number | bigint; state_id: number | bigint }>(aWinnersSql);
+        SELECT 1 FROM ${dTable} d
+        WHERE d.${drowCol} = a.${oidCol} AND d.${sidCol} IN (${graduableList})
+          AND d.${sidCol} > a.${sidCol}
+      )`;
 
-  // BULK STEP 2: find every winning D-row across all OIDs in one query.
-  const dWinnersSql = `
-    SELECT d1.${drowCol} AS oid, d1.${sidCol} AS state_id, d1.${delAtCol} AS deleted_at
-    FROM ${dTable} d1
-    WHERE d1.${sidCol} IN (${graduableList})
-      AND NOT EXISTS (
-        SELECT 1 FROM ${dTable} d2
-        JOIN ${states} s2 ON s2.${col(driver, 'state_id')} = d2.${sidCol}
-        JOIN ${lineages} sl ON sl.${lname} = s2.${lname}
-          AND sl.${lid} = d1.${sidCol}
-          AND sl.${lid} <= d2.${sidCol}
-        WHERE d2.${drowCol} = d1.${drowCol}
-          AND d2.${sidCol} IN (${graduableList})
-          AND d2.${sidCol} <> d1.${sidCol}
-      )
-  `;
-  const dWinnerRows = await connection.query<{ oid: number | bigint; state_id: number | bigint; deleted_at: number | bigint | null }>(dWinnersSql);
+  // 1. Replace base rows for the winners with the winning A-row's column values
+  //    (delete-then-insert handles both existing and new base OIDs).
+  await connection.execute(
+    `DELETE FROM ${baseTable} WHERE ${oidCol} IN (SELECT oid FROM (${winnersSub}) w)`);
+  const ins = await connection.execute(
+    `INSERT INTO ${baseTable} (${qCols})
+     SELECT ${srcCols} FROM ${aTable} a
+     INNER JOIN (${winnersSub}) w ON w.oid = a.${oidCol} AND w.st = a.${sidCol}`);
+  result.upserts = ins.rowsAffected;
 
-  // Build OID → winner map.
-  //
-  // Cross-lineage caveat: aWinnersSql / dWinnersSql only check supersession
-  // within a single lineage_name tree (the JOIN binds sl.lineage_name to
-  // s2.lineage_name). When the same OID has graduable rows in TWO distinct
-  // lineage_name trees that BOTH terminate at version tips (e.g. two posted
-  // versions both modified OID 99, ending up at states with different
-  // lineage_names but a shared DEFAULT ancestor), each tree contributes its
-  // own "winner" and the previous code silently overwrote one with the
-  // other via `winners.set(oid, w)`. Net effect: the loser's A/D rows would
-  // still be DELETED at the cleanup step, but its column values would never
-  // graduate to base. To stay safe, collect ALL candidate state_ids per OID
-  // first; if a single OID has multiple A-winners (or multiple D-winners)
-  // we'll resolve ancestry below and only delete delta rows for the
-  // resolved winner's state.
-  interface Winners {
-    aStateIds: number[];
-    dStateIds: number[];
-    dDeletedAt?: number | null;
-  }
-  const winners = new Map<number, Winners>();
-  for (const r of aWinnerRows) {
-    const oid = Number(r.oid);
-    const w = winners.get(oid) ?? { aStateIds: [], dStateIds: [] };
-    w.aStateIds.push(Number(r.state_id));
-    winners.set(oid, w);
-  }
-  for (const r of dWinnerRows) {
-    const oid = Number(r.oid);
-    const w = winners.get(oid) ?? { aStateIds: [], dStateIds: [] };
-    w.dStateIds.push(Number(r.state_id));
-    // Last-seen DELETED_AT is fine for the warn-only Pro-authored caveat;
-    // ancestry resolution below picks the winning d-state explicitly.
-    w.dDeletedAt = r.deleted_at != null ? Number(r.deleted_at) : null;
-    winners.set(oid, w);
-  }
-  if (winners.size === 0) return result;
+  // 2. Delete base rows whose net result in the prefix is a delete: an OID with
+  //    a graduable delete marker (keyed on SDE_STATE_ID OR DELETED_AT so the
+  //    state-0 base-shadow markers are honoured — C0) and no surviving winner.
+  const delBase = await connection.execute(
+    `DELETE FROM ${baseTable}
+     WHERE ${oidCol} IN (
+       SELECT DISTINCT d.${drowCol} FROM ${dTable} d
+       WHERE (d.${sidCol} IN (${graduableList}) OR d.${delAtCol} IN (${graduableList}))
+         AND d.${drowCol} NOT IN (SELECT oid FROM (${winnersSub}) w)
+     )`);
+  result.deletes = delBase.rowsAffected;
 
-  // Collect every (ancestor, descendant) pair we need to resolve across
-  // BOTH the multi-winner case AND the A-vs-D winner-mismatch case. Then
-  // make a SINGLE batched query (chunked to avoid VALUES-list bloat)
-  // instead of N sequential round-trips. Previous per-pair await loop was
-  // O(pairs) round-trips inside a SERIALIZABLE transaction — at hundreds
-  // of pairs this held locks for tens of seconds.
-
-  const pairsNeeded = new Set<string>();
-  const pairKey = (anc: number, desc: number) => `${anc}:${desc}`;
-
-  for (const w of winners.values()) {
-    if (w.aStateIds.length > 1) {
-      for (const s of w.aStateIds) for (const t of w.aStateIds) {
-        if (s !== t) pairsNeeded.add(pairKey(t, s));
-      }
-    }
-    if (w.dStateIds.length > 1) {
-      for (const s of w.dStateIds) for (const t of w.dStateIds) {
-        if (s !== t) pairsNeeded.add(pairKey(t, s));
-      }
-    }
-  }
-  // The A-vs-D winner-mismatch pairs are added below after each side has
-  // been resolved to a single winner — we don't know the pair until then,
-  // so we resolve same-side first, then a second batch for cross-side.
-
-  const ancestryRel = await batchResolveAncestry(connection, driver, pairsNeeded);
-  const isAncestor = (anc: number, desc: number) =>
-    anc === desc || ancestryRel.has(pairKey(anc, desc));
-
-  // Flatten multi-winner OIDs to single-winner OIDs using the in-memory
-  // ancestry relation, warning + skipping when winners are non-comparable.
-  function pickNewest(candidates: number[]): number | null {
-    if (candidates.length === 1) return candidates[0]!;
-    for (const s of candidates) {
-      let isNewest = true;
-      for (const t of candidates) {
-        if (t === s) continue;
-        if (!isAncestor(t, s)) { isNewest = false; break; }
-      }
-      if (isNewest) return s;
-    }
-    return null;
-  }
-
-  for (const [oid, w] of winners) {
-    if (w.aStateIds.length > 1) {
-      const winner = pickNewest(w.aStateIds);
-      if (winner === null) {
-        result.warnings.push(
-          `OID ${oid} has concurrent graduable A-rows in non-comparable lineages (states ${w.aStateIds.join(', ')}). Skipping; reconcile required before this OID can graduate.`,
-        );
-        winners.delete(oid);
-        continue;
-      }
-      w.aStateIds = [winner];
-    }
-    if (w.dStateIds.length > 1) {
-      const winner = pickNewest(w.dStateIds);
-      if (winner === null) {
-        result.warnings.push(
-          `OID ${oid} has concurrent graduable D-rows in non-comparable lineages (states ${w.dStateIds.join(', ')}). Skipping; reconcile required before this OID can graduate.`,
-        );
-        winners.delete(oid);
-        continue;
-      }
-      w.dStateIds = [winner];
-    }
-  }
-  if (winners.size === 0) return result;
-
-  // Cross-side pairs (A-winner vs D-winner at distinct states) — collect
-  // them now that each OID has at most one A and one D winner. One more
-  // batched query.
-  const crossPairs = new Set<string>();
-  for (const w of winners.values()) {
-    const a = w.aStateIds[0];
-    const d = w.dStateIds[0];
-    if (a !== undefined && d !== undefined && a !== d) {
-      crossPairs.add(pairKey(a, d));
-    }
-  }
-  const crossRel = crossPairs.size > 0
-    ? await batchResolveAncestry(connection, driver, crossPairs)
-    : new Set<string>();
-  const isAncestorCross = (anc: number, desc: number) =>
-    anc === desc || crossRel.has(pairKey(anc, desc));
-
-  // Apply tie-breakers (in memory, no more I/O).
-  const upsertTargets: Array<{ oid: number; aStateId: number }> = [];
-  const deleteTargets: number[] = [];
-
-  for (const [oid, w] of winners) {
-    const aStateId = w.aStateIds[0];
-    const dStateId = w.dStateIds[0];
-    if (aStateId !== undefined && dStateId !== undefined) {
-      // Co-located D+A at the same state → UPDATE (UPSERT-A).
-      if (aStateId === dStateId) {
-        upsertTargets.push({ oid, aStateId });
-      } else if (isAncestorCross(aStateId, dStateId)) {
-        // D is descendant of A → D is newer → DELETE.
-        deleteTargets.push(oid);
-      } else {
-        // A is descendant-of-or-incomparable-to D → UPSERT-A.
-        upsertTargets.push({ oid, aStateId });
-      }
-    } else if (aStateId !== undefined) {
-      upsertTargets.push({ oid, aStateId });
-    } else if (dStateId !== undefined) {
-      // Pro-authored caveat: if DELETED_AT is outside the prefix and differs
-      // from SDE_STATE_ID, warn (Section 3.3.0).
-      if (w.dDeletedAt != null && w.dDeletedAt !== dStateId && !graduableSnapshot.has(w.dDeletedAt)) {
-        result.warnings.push(
-          `D-row for OID ${oid}: DELETED_AT=${w.dDeletedAt} differs from SDE_STATE_ID=${dStateId} and is outside the graduable prefix. Pro-authored pre-image semantics may not match egdb.js behaviour. See spec section 3.3.0.`,
-        );
-      }
-      deleteTargets.push(oid);
-    }
-  }
-
-  const onProgress = (compressProgressHook as { graduateTable?: (info: { table: string; total: number; done: number }) => void }).graduateTable;
-  const total = winners.size;
-  onProgress?.({ table: table.name, total, done: 0 });
-
-  // BULK STEP 3: chunked writes. Each chunk = one set of OIDs that share the
-  // same A-winner state (so the UPDATE/INSERT joins cleanly).
-  const BATCH = 500;
-
-  // Group upserts by aStateId so each chunk's JOIN matches a single state.
-  const byState = new Map<number, number[]>();
-  for (const { oid, aStateId } of upsertTargets) {
-    const arr = byState.get(aStateId) ?? [];
-    arr.push(oid);
-    byState.set(aStateId, arr);
-  }
-
-  // Only fetch column metadata if we have upserts to perform.
-  let columns: string[] | null = null;
-  let baseCols: string[] = [];
-  let qCols = '';
-  let setClause = '';
-  let srcCols = '';
-  if (byState.size > 0) {
-    columns = await getTableColumns(connection, driver, table, cache);
-    baseCols = columns.filter(c => c.toLowerCase() !== sidCol.toLowerCase());
-    qCols = baseCols.map(c => qid(driver, c)).join(', ');
-    setClause = baseCols
-      .filter(c => c.toLowerCase() !== oidCol.toLowerCase())
-      .map(c => `${qid(driver, c)} = a.${qid(driver, c)}`)
-      .join(', ');
-    srcCols = baseCols.map(c => `a.${qid(driver, c)}`).join(', ');
-  }
-
-  let upsertedSoFar = 0;
-  for (const [aStateId, oids] of byState) {
-    for (let i = 0; i < oids.length; i += BATCH) {
-      const chunk = oids.slice(i, i + BATCH);
-      const oidList = buildIntegerList(chunk, 'graduateTable.upsertChunk');
-
-      if (driver === 'sqlserver') {
-        // Bulk UPDATE: rows already in base.
-        const updSql = `
-          UPDATE base WITH (UPDLOCK, HOLDLOCK)
-          SET ${setClause}
-          FROM ${baseTable} base
-          INNER JOIN ${aTable} a ON a.${qid(driver, oidCol)} = base.${qid(driver, oidCol)}
-          WHERE a.${qid(driver, oidCol)} IN (${oidList})
-            AND a.${qid(driver, sidCol)} = @p0
-        `;
-        const upd = await connection.execute(updSql, [aStateId]);
-        result.upserts += upd.rowsAffected;
-        upsertedSoFar += upd.rowsAffected;
-
-        // Bulk INSERT: rows not yet in base.
-        const insSql = `
-          INSERT INTO ${baseTable} (${qCols})
-          SELECT ${srcCols}
-          FROM ${aTable} a WITH (HOLDLOCK)
-          WHERE a.${qid(driver, oidCol)} IN (${oidList})
-            AND a.${qid(driver, sidCol)} = @p0
-            AND NOT EXISTS (
-              SELECT 1 FROM ${baseTable} b WITH (HOLDLOCK)
-              WHERE b.${qid(driver, oidCol)} = a.${qid(driver, oidCol)}
-            )
-        `;
-        const ins = await connection.execute(insSql, [aStateId]);
-        result.upserts += ins.rowsAffected;
-        upsertedSoFar += ins.rowsAffected;
-      } else {
-        const updateSet = baseCols
-          .filter(c => c.toLowerCase() !== oidCol.toLowerCase())
-          .map(c => `${qid(driver, c)} = EXCLUDED.${qid(driver, c)}`)
-          .join(', ');
-        const sql = `
-          INSERT INTO ${baseTable} (${qCols})
-          SELECT ${baseCols.map(c => qid(driver, c)).join(', ')}
-          FROM ${aTable}
-          WHERE ${qid(driver, oidCol)} IN (${oidList}) AND ${qid(driver, sidCol)} = $1
-          ON CONFLICT (${qid(driver, oidCol)}) DO UPDATE SET ${updateSet}
-        `;
-        const upserted = await connection.execute(sql, [aStateId]);
-        result.upserts += upserted.rowsAffected;
-        upsertedSoFar += upserted.rowsAffected;
-      }
-      onProgress?.({ table: table.name, total, done: upsertedSoFar });
-    }
-  }
-
-  // Bulk DELETE from base for graduated deletes.
-  if (deleteTargets.length > 0) {
-    for (let i = 0; i < deleteTargets.length; i += BATCH) {
-      const chunk = deleteTargets.slice(i, i + BATCH);
-      const oidList = buildIntegerList(chunk, 'graduateTable.deleteChunk');
-      const del = await connection.execute(
-        `DELETE FROM ${baseTable} WHERE ${qid(driver, oidCol)} IN (${oidList})`,
-      );
-      result.deletes += del.rowsAffected;
-    }
-  }
-
-  // Bulk DELETE all delta rows for OIDs we resolved. By this point every
-  // surviving winner has a single target (upsert or delete); the multi-
-  // lineage non-comparable case removed those OIDs from `winners` earlier
-  // with a warning. Deleting their delta rows here keeps the A/D tables
-  // tidy regardless of which action was applied to base.
-  const allOids = Array.from(winners.keys());
-  if (allOids.length > 0) {
-    for (let i = 0; i < allOids.length; i += BATCH) {
-      const chunk = allOids.slice(i, i + BATCH);
-      const oidList = buildIntegerList(chunk, 'graduateTable.cleanupAChunk');
-      const delA = await connection.execute(
-        `DELETE FROM ${aTable} WHERE ${oidCol} IN (${oidList}) AND ${sidCol} IN (${graduableList})`,
-      );
-      result.aRowsRemoved += delA.rowsAffected;
-      const delD = await connection.execute(
-        `DELETE FROM ${dTable} WHERE ${drowCol} IN (${oidList}) AND ${sidCol} IN (${graduableList})`,
-      );
-      result.dRowsRemoved += delD.rowsAffected;
-    }
-  }
-  onProgress?.({ table: table.name, total, done: total });
+  // 3. Remove the graduated deltas. Every graduable A-row is now in base; every
+  //    delete marker whose SDE_STATE_ID OR DELETED_AT is graduable is applied —
+  //    including the state-0 base-shadow markers. Leaving those behind would
+  //    hide the freshly-graduated base row with no A-row to restore it (the
+  //    feature would vanish from every version, and publicly — C0).
+  const delA = await connection.execute(
+    `DELETE FROM ${aTable} WHERE ${sidCol} IN (${graduableList})`);
+  result.aRowsRemoved = delA.rowsAffected;
+  const delD = await connection.execute(
+    `DELETE FROM ${dTable} WHERE ${sidCol} IN (${graduableList}) OR ${delAtCol} IN (${graduableList})`);
+  result.dRowsRemoved = delD.rowsAffected;
 
   result.status = 'graduated';
   return result;
@@ -853,40 +583,33 @@ async function findPruneCandidates(
   const driver = connection.driver;
   const states = sysTable(driver, 'SDE_states');
   const versions = sysTable(driver, 'SDE_versions');
-  const lineages = sysTable(driver, 'SDE_state_lineages');
   const sid = col(driver, 'state_id');
   const pid = col(driver, 'parent_state_id');
-  const lid = col(driver, 'lineage_id');
-  const lname = col(driver, 'lineage_name');
 
-  // "Not in any version's closure" uses the same idiom as
-  // computeGraduablePrefix: each version tip's effective closure is
-  //   JOIN SDE_states vs ON vs.state_id = v.state_id
-  //   JOIN SDE_state_lineages sl ON sl.lineage_name = vs.lineage_name
-  //     AND sl.lineage_id <= vs.state_id
-  // UNION the tip itself (ArcGIS-authored states often have no self-row).
-  // The earlier shape `WHERE lineage_name IN (SELECT state_id FROM versions)`
-  // treated the tip's state_id as if it were a lineage_name and returned
-  // zero rows on any DB where lineage_name != state_id (the normal case).
-  // That made every linear ancestor of a tip a candidate; only the
-  // branch-point / lockedExpanded filters saved correctness, and a long
-  // linear DEFAULT history would have been pruned.
+  // Root fix (COMPRESS_HARDENING_PLAN.md §5.1): "referenced" is decided by the
+  // AUTHORITATIVE parent_state_id walk, NOT the SDE_state_lineages closure. A
+  // state is a prune candidate iff it is:
+  //   - NOT reachable as an ancestor of any version tip (the parent-walk union),
+  //   - NOT the base state 0 (N5),
+  //   - a LEAF (no child) — leaves-only + iterate never orphans a child (C4/N4),
+  //   - not in a locked branch (filtered below).
+  // Using the parent walk makes prune correct regardless of closure health, and
+  // leaves-only guarantees no dangling parent_state_id can result.
+  const rec = driver === 'sqlserver' ? '' : 'RECURSIVE ';
+  const maxrec = driver === 'sqlserver' ? ' OPTION (MAXRECURSION 0)' : '';
   const sql = `
+    WITH ${rec}reachable AS (
+      SELECT ${sid} AS rs, ${pid} AS rp FROM ${states}
+        WHERE ${sid} IN (SELECT ${sid} FROM ${versions} WHERE ${sid} IS NOT NULL)
+      UNION ALL
+      SELECT st.${sid}, st.${pid} FROM ${states} st
+        JOIN reachable r ON st.${sid} = r.rp WHERE r.rp <> 0
+    )
     SELECT s.${sid} AS state_id
     FROM ${states} s
-    WHERE s.${sid} NOT IN (SELECT ${sid} FROM ${versions} WHERE ${sid} IS NOT NULL)
-      AND s.${sid} NOT IN (
-        SELECT sl.${lid}
-        FROM ${lineages} sl
-        JOIN ${states} vs ON vs.${lname} = sl.${lname}
-        WHERE vs.${sid} IN (SELECT ${sid} FROM ${versions} WHERE ${sid} IS NOT NULL)
-          AND sl.${lid} <= vs.${sid}
-        UNION
-        SELECT ${sid} FROM ${versions} WHERE ${sid} IS NOT NULL
-      )
-      AND (
-        SELECT COUNT(*) FROM ${states} c WHERE c.${pid} = s.${sid}
-      ) <= 1
+    WHERE s.${sid} <> 0
+      AND s.${sid} NOT IN (SELECT rs FROM reachable)
+      AND NOT EXISTS (SELECT 1 FROM ${states} c WHERE c.${pid} = s.${sid})${maxrec}
   `;
   const rows = await connection.query<{ state_id: number | bigint }>(sql);
   return rows
@@ -918,11 +641,16 @@ export async function pruneStates(
   const mvExists = await hasMvtablesModified(connection);
   const driver = connection.driver;
 
+  const versionedTables = tables.filter(t => t.isVersioned && t.registrationId);
+
+  // Leaves-only prune reclaims one tree level per pass, so iterate until a pass
+  // makes no progress. Recomputing candidates + lock expansion each round picks
+  // up newly-exposed leaves and respects any lock that landed during the run.
+  for (;;) {
+  const removedBefore = result.statesRemoved;
   const lockedExpanded = await readLockedBranches(connection);
   const candidates = await findPruneCandidates(connection, lockedExpanded);
-  if (candidates.length === 0) return result;
-
-  const versionedTables = tables.filter(t => t.isVersioned && t.registrationId);
+  if (candidates.length === 0) break;
 
   for (const stateId of candidates) {
     let stateStillEligible = true;
@@ -1023,6 +751,10 @@ export async function pruneStates(
       throw e;
     }
   }
+  // Stop if this pass removed nothing (e.g. everything left is locked) —
+  // otherwise the outer loop would spin on the same non-deletable candidates.
+  if (result.statesRemoved === removedBefore) break;
+  }
 
   return result;
 }
@@ -1055,11 +787,17 @@ async function findCollapsePairs(
   const sid = col(driver, 'state_id');
   const pid = col(driver, 'parent_state_id');
 
+  // The parent P survives and inherits the child's edits, so P must NOT be a
+  // version tip (a version at P would silently gain C's edits — C2) and must NOT
+  // be the base state 0 (collapsing into base makes C's edits unconditionally
+  // visible to every version — N5). The child must be a non-tip leaf-ish node.
   const sql = `
     SELECT c.${sid} AS child, p.${sid} AS parent
     FROM ${states} c
     INNER JOIN ${states} p ON p.${sid} = c.${pid}
     WHERE c.${sid} NOT IN (SELECT ${sid} FROM ${versions} WHERE ${sid} IS NOT NULL)
+      AND p.${sid} NOT IN (SELECT ${sid} FROM ${versions} WHERE ${sid} IS NOT NULL)
+      AND p.${sid} <> 0
       AND (SELECT COUNT(*) FROM ${states} p2 WHERE p2.${pid} = p.${sid}) = 1
       AND (SELECT COUNT(*) FROM ${states} cc WHERE cc.${pid} = c.${sid}) <= 1
   `;
@@ -1097,19 +835,23 @@ export async function collapseLineages(
 
     let didCollapse = false;
     for (const { parent, child } of pairs) {
-      // Per-table delta-row rewrites.
-      for (const table of versionedTables) {
-        const regId = table.registrationId!;
-        const qSchema = qid(driver, table.schema);
-        const aTable = `${qSchema}.${qid(driver, `a${regId}`)}`;
-        const dTable = `${qSchema}.${qid(driver, `D${regId}`)}`;
-        const oidCol = col(driver, 'OBJECTID');
-        const sidCol = col(driver, 'SDE_STATE_ID');
-        const drowCol = col(driver, 'SDE_DELETES_ROW_ID');
-        const delAtCol = col(driver, 'DELETED_AT');
+      // ONE transaction for the whole pair — delta rewrites AND metadata — so a
+      // failure (e.g. the states_cuk dance below) rolls back atomically instead
+      // of leaving the child's edits committed at the parent with the state tree
+      // unchanged (N3). A collapse touches few rows, so a single tx is cheap.
+      try {
+        await connection.beginTransaction();
 
-        try {
-          await connection.beginTransaction();
+        // Per-table delta-row rewrites.
+        for (const table of versionedTables) {
+          const regId = table.registrationId!;
+          const qSchema = qid(driver, table.schema);
+          const aTable = `${qSchema}.${qid(driver, `a${regId}`)}`;
+          const dTable = `${qSchema}.${qid(driver, `D${regId}`)}`;
+          const oidCol = col(driver, 'OBJECTID');
+          const sidCol = col(driver, 'SDE_STATE_ID');
+          const drowCol = col(driver, 'SDE_DELETES_ROW_ID');
+          const delAtCol = col(driver, 'DELETED_AT');
 
           // Dedupe BEFORE rewrite (spec Section 3.2 step 3). Within a P→C
           // chain, C is closer to the tip, so C wins; delete the loser
@@ -1148,17 +890,9 @@ export async function collapseLineages(
             [parent, child],
           );
           result.rowsRewritten += dUpd2.rowsAffected;
-
-          await connection.commitTransaction();
-        } catch (e) {
-          if (connection.inTransaction()) await connection.rollbackTransaction();
-          throw e;
         }
-      }
 
-      // Single metadata transaction per collapse (atomic with state delete).
-      try {
-        await connection.beginTransaction();
+        // Metadata (same transaction).
         const states = sysTable(driver, 'SDE_states');
         const lineages = sysTable(driver, 'SDE_state_lineages');
         const versions = sysTable(driver, 'SDE_versions');
@@ -1223,6 +957,17 @@ export async function collapseLineages(
         await connection.execute(
           `UPDATE ${versions} SET ${sid} = ${paramRef(driver, 0)} WHERE ${sid} = ${paramRef(driver, 1)}`,
           [parent, child],
+        );
+        // C3 / states_cuk dance: the child C and its own child G may share a
+        // lineage_name (a linear run from SDE_state_new_edit). Re-pointing G's
+        // parent to P would momentarily give G and the still-present C the same
+        // (parent_state_id, lineage_name) → states_cuk violation. Negate C's
+        // lineage_name first (C is about to be deleted, so the negative value is
+        // transient and unique) to keep the pair distinct during the re-point.
+        // Mirrors Esri's SDE_state_def_trim_states.
+        await connection.execute(
+          `UPDATE ${states} SET ${lname} = -${lname} WHERE ${sid} = ${paramRef(driver, 0)}`,
+          [child],
         );
         // Re-point any other state's parent_state_id from child to parent
         // (i.e. the child's child becomes a direct child of the parent).

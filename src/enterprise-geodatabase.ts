@@ -1623,8 +1623,32 @@ export class EnterpriseGeodatabase {
    * ```
    */
   async compress(options?: CompressOptions): Promise<CompressResult> {
+    // --- Safety guards (COMPRESS_HARDENING_PLAN.md step 0) ---------------------
+    // compress() has known-unfixed data-loss vectors and must not be reachable by
+    // accident while hardening is in flight. Refuse unless the caller explicitly
+    // acknowledges the risk.
+    if (!options?.acknowledgeExperimentalUnsafe) {
+      throw new Error(
+        'compress() is experimental and has known-unfixed data-loss defects; it must not run ' +
+        'unacknowledged. Pass { acknowledgeExperimentalUnsafe: true } to run it anyway. ' +
+        'See openparcels/handoff/COMPRESS_HARDENING_PLAN.md before doing so.',
+      );
+    }
+    // Running inside a caller-owned transaction breaks compress's documented
+    // per-phase critical sections (graduation would run at the caller's isolation
+    // and never commit per table). Refuse rather than corrupt silently.
+    if (this.connection.inTransaction()) {
+      throw new Error('compress() must not be called inside an open transaction.');
+    }
+
     const allTables = await this.listTables();
-    let tables = allTables.filter(t => t.isVersioned);
+    const allVersioned = allTables.filter(t => t.isVersioned);
+    // N2 (COMPRESS_HARDENING_PLAN.md): `options.tables` may ONLY scope graduation.
+    // Prune and collapse delete/re-point STATES, so they must always operate on
+    // EVERY versioned table — otherwise an excluded table keeps A/D rows tagged
+    // with a state that prune deleted (invisible forever) or pointing at a
+    // collapsed-away child. `tables` (possibly filtered) drives graduation only.
+    let tables = allVersioned;
     if (options?.tables && options.tables.length > 0) {
       const tableNames = new Set(options.tables.map(t => t.toLowerCase()));
       tables = tables.filter(t => tableNames.has(t.name.toLowerCase()));
@@ -1661,12 +1685,12 @@ export class EnterpriseGeodatabase {
     }
 
     // Phase 1: prune unreferenced, non-branch-point, unlocked states.
-    const pruneResult = await pruneStates(this.connection, tables);
+    const pruneResult = await pruneStates(this.connection, allVersioned);
     totalAddsRemoved += pruneResult.deltaRowsRemoved;
     const statesRemoved = pruneResult.statesRemoved;
 
     // Phase 2: collapse linear state chains (child into parent).
-    const collapseResult = await collapseLineages(this.connection, tables);
+    const collapseResult = await collapseLineages(this.connection, allVersioned);
 
     const allTablesSkipped = graduationByTable.length > 0
       && graduationByTable.every(t => t.status === 'skipped-version-set-changed');
