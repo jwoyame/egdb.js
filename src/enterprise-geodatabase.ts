@@ -1505,6 +1505,18 @@ export class EnterpriseGeodatabase {
         );
         lineage = newState;
       }
+      // SDE_state_new_edit maintains the closure ITSELF and inserts
+      // (parentLineage, newState) when it creates the state. Reassigning
+      // lineage_name above does not retract that row, so the version's unposted
+      // state would still sit in the parent's closure -- the exact leak that
+      // exposed un-reviewed edits to Esri *_evw and the publish ETL on live, and
+      // which a training run caught still happening. Retract it explicitly.
+      await this.connection.execute(
+        this.connection.driver === 'sqlserver'
+          ? `DELETE FROM sde.SDE_state_lineages WHERE lineage_name = @p0 AND lineage_id = @p1`
+          : `DELETE FROM sde.sde_state_lineages WHERE lineage_name = $1 AND lineage_id = $2`,
+        [parentLineage, newState],
+      );
 
       const replayed: Array<{ table: string; updates: number; deletes: number }> = [];
       for (const p of plan) {
