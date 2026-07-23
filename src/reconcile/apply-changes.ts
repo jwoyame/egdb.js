@@ -277,16 +277,35 @@ export async function applyParentChanges(
     const upd = changes.filter((c) => c.changeType === 'update');
     const del = changes.filter((c) => c.changeType === 'delete');
 
+    // Every copy MUST move exactly one row per OBJECTID. A short copy would leave
+    // a delete marker with no A-row behind it -- a feature that silently vanishes
+    // from the version -- so fail loudly and roll back rather than report a
+    // success that quietly dropped data. trim-post asserts the same thing per
+    // row; the bulk path must not lose that guarantee.
+    const copyOrThrow = async (fromStates: number[], oids: number[]) => {
+      const moved = await copyTipRows(connection, tableInfo, fromStates, childStateId, oids);
+      if (moved !== oids.length) {
+        throw new Error(
+          `Reconcile failed to copy A-rows for ${tableInfo.name}: moved ${moved} of ${oids.length} ` +
+          `expected rows into state ${childStateId}. The reconcile was NOT applied.`,
+        );
+      }
+    };
+
     // Inserts: copy the parent's tip row per OBJECTID straight in.
     for (const part of chunk(ins)) {
-      await copyTipRows(connection, tableInfo, uniq(part.map((c) => c.stateId)), childStateId,
-        uniq(part.map((c) => c.objectId)));
+      await copyOrThrow(uniq(part.map((c) => c.stateId)), uniq(part.map((c) => c.objectId)));
     }
     appliedCount += ins.length;
 
     // Updates: skip any OBJECTID the child already modified in its own state --
     // the same guard the row-by-row path applied via readATableRow, so the
     // child's edit is never clobbered. The rest get delete-marker + A-row.
+    //
+    // NOTE (load-bearing): `alreadyMine` is read AFTER this table's inserts have
+    // written A-rows at childStateId. That is only safe because get-changes emits
+    // each OBJECTID exactly once per table, so the insert and update OID sets are
+    // disjoint and an insert can never make an update look "already mine".
     if (upd.length > 0) {
       const alreadyMine = new Set(
         await selectObjectIdsWithARows(connection, tableInfo, [childStateId]),
@@ -295,7 +314,7 @@ export async function applyParentChanges(
       for (const part of chunk(todo)) {
         const oids = uniq(part.map((c) => c.objectId));
         await insertDeleteMarkers(connection, tableInfo, oids, childStateId);
-        await copyTipRows(connection, tableInfo, uniq(part.map((c) => c.stateId)), childStateId, oids);
+        await copyOrThrow(uniq(part.map((c) => c.stateId)), oids);
       }
       // Count matches the previous behaviour: an update is "applied" even when
       // the child's own edit caused it to be skipped.

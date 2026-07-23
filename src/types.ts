@@ -57,6 +57,29 @@ export interface ConnectionConfig {
     requestTimeout?: number;
   };
   /**
+   * Time zone the DATABASE SERVER writes its naive datetime columns in.
+   *
+   * ArcSDE stores wall-clock local time in columns like SDE_versions.creation_time
+   * with no offset. Drivers hand those back tagged as UTC, so an app that then
+   * renders them in local time subtracts the offset a SECOND time -- a version
+   * created at 8:11am displays as 3:11am. Setting this makes the server convert
+   * to true UTC (`AT TIME ZONE <this> AT TIME ZONE 'UTC'`), which is DST-correct
+   * per record: a February row resolves at -05:00, a July row at -04:00.
+   *
+   * This is a property of the SERVER, not of the organisation's locale, and it
+   * cannot be auto-detected reliably -- SQL Server's CURRENT_TIMEZONE() returns a
+   * display name that AT TIME ZONE rejects, and resolving by current UTC offset is
+   * ambiguous across many zones -- so it is configured per connection.
+   *
+   * Use the naming the driver expects: a Windows zone id on SQL Server (e.g.
+   * 'US Eastern Standard Time', or 'US Mountain Standard Time' for Arizona, which
+   * has no DST), an IANA name on PostgreSQL (e.g. 'America/New_York').
+   *
+   * When unset, timestamps are returned exactly as the driver produced them --
+   * today's behaviour -- so existing deployments are unaffected.
+   */
+  serverTimeZone?: string;
+  /**
    * Logger for library warnings and errors. Defaults to `consoleLogger`.
    * See `src/logger.ts`.
    */

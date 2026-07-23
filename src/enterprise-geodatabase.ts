@@ -429,6 +429,20 @@ export class EnterpriseGeodatabase {
    * List geodatabase versions
    */
   async listVersions(): Promise<VersionInfo[]> {
+    // SDE_versions.creation_time is naive wall-clock in the SERVER's time zone.
+    // When the caller tells us that zone, convert it to true UTC here so callers
+    // (and their UI) don't apply the offset a second time -- see
+    // ConnectionConfig.serverTimeZone. DST is handled per row by AT TIME ZONE,
+    // so a February row resolves at -05:00 and a July row at -04:00. Unset =>
+    // return the column untouched (previous behaviour).
+    const tz = this.config.serverTimeZone;
+    const creationTimeExpr = tz
+      ? (this.config.driver === 'sqlserver'
+        ? `CAST(creation_time AT TIME ZONE @p0 AT TIME ZONE 'UTC' AS datetime2(3)) AS creation_time`
+        : `(creation_time AT TIME ZONE $1) AS creation_time`)
+      : 'creation_time';
+    const params = tz ? [tz] : [];
+
     const sql = this.config.driver === 'sqlserver'
       ? `
         SELECT
@@ -436,7 +450,7 @@ export class EnterpriseGeodatabase {
           owner,
           description,
           parent_name,
-          creation_time,
+          ${creationTimeExpr},
           state_id
         FROM sde.SDE_versions
         ORDER BY name
@@ -447,7 +461,7 @@ export class EnterpriseGeodatabase {
           owner,
           description,
           parent_name,
-          creation_time,
+          ${creationTimeExpr},
           state_id
         FROM sde.sde_versions
         ORDER BY name
@@ -461,7 +475,7 @@ export class EnterpriseGeodatabase {
         parent_name?: string;
         creation_time?: Date;
         state_id?: number | bigint;
-      }>(sql);
+      }>(sql, params);
 
       return rows.map((row) => ({
         name: row.name,
@@ -1315,9 +1329,40 @@ export class EnterpriseGeodatabase {
    *
    * Returns per-table counts plus the old/new state ids.
    */
+  /**
+   * !! NOT SAFE FOR A LIVE FABRIC YET -- requires `unsafeExperimental: true`. !!
+   *
+   * A review found four unresolved defects; each can corrupt or prematurely
+   * publish data, so this must not be wired to any route (not even a
+   * training-gated one) until they are fixed and re-reviewed:
+   *
+   *  1. LINEAGE LEAK. createChildState inherits the PARENT's lineage_name, so
+   *     addStatesToLineage below writes the version's private, UNPOSTED edit
+   *     state into DEFAULT's closure -- which Esri *_evw and the publish ETL
+   *     read. Observed live: an unposted split became closure-visible and had
+   *     to be removed by hand. Needs its own lineage, or no closure write.
+   *  2. EXCEPT CAN DROP REAL EDITS. String comparison uses the column collation
+   *     ('MCCLURY' == 'McClury', trailing blanks ignored), and rows are compared
+   *     against the parent's ENTIRE history, so an edit that restores a previous
+   *     value looks "redundant" and is silently discarded. Must compare against
+   *     the parent's TIP with case/whitespace-sensitive semantics.
+   *  3. NO CONCURRENCY GUARD. The plan is read outside any lock and
+   *     updateVersionState repoints with no `AND state_id = <old>` check, so a
+   *     save landing mid-operation is orphaned. Needs lockVersion + an
+   *     optimistic guard, like postVersion.
+   *  4. SAME-STATE DELETE MARKERS. insertDeleteMarkers writes
+   *     (SDE_STATE_ID, DELETED_AT) = (newState, newState), i.e. it deletes the
+   *     A-row just written at that state; per this file's trim-post notes that
+   *     makes the row vanish from Esri readers. Needs the superseded row's state
+   *     (0 for base) plus emitBaseShadowMarkers compensation.
+   *
+   * Also: addStatesToLineage loops one INSERT per state inside the transaction,
+   * and the copies here are unchunked, so both reintroduce the round-trip
+   * pathology this was written to remove.
+   */
   async rebaseVersion(
     versionName: string,
-    options?: { dryRun?: boolean },
+    options?: { dryRun?: boolean; unsafeExperimental?: boolean },
   ): Promise<{
     version: string;
     fromState: number;
@@ -1326,6 +1371,17 @@ export class EnterpriseGeodatabase {
     droppedRedundant: number;
     dryRun: boolean;
   }> {
+    // Refuse by default. A dry run is read-only and always allowed; anything that
+    // writes requires the caller to opt in explicitly, so this cannot be reached
+    // by accident while the defects above stand.
+    if (!options?.dryRun && !options?.unsafeExperimental) {
+      throw new Error(
+        'rebaseVersion is experimental and NOT safe for a live fabric (lineage leak, ' +
+        'EXCEPT can drop edits, no concurrency guard, same-state delete markers). ' +
+        'Pass { unsafeExperimental: true } to run it anyway, or { dryRun: true } to inspect the plan.',
+      );
+    }
+
     const version = await this.getVersion(versionName);
     if (!version || version.stateId == null) {
       throw new Error(`Version not found: ${versionName}`);

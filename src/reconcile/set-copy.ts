@@ -27,18 +27,32 @@ export interface ColumnMeta {
   dataType: string;
 }
 
+/**
+ * Quote an identifier. PostgreSQL folds unquoted identifiers to lower case and
+ * the SDE tables are created that way, so a quoted "OBJECTID" would not resolve
+ * there -- every other pg path in this codebase uses lower case, and so must we.
+ */
 function quoteId(driver: 'sqlserver' | 'postgresql', name: string): string {
-  return driver === 'sqlserver' ? `[${name}]` : `"${name}"`;
+  return driver === 'sqlserver' ? `[${name}]` : `"${name.toLowerCase()}"`;
 }
 
-// Column metadata is invariant for the life of a connection, but the old code
-// re-read it per copied row. Cache it: this alone removes O(rows) metadata
-// queries from reconcile.
-const columnCache = new Map<string, ColumnMeta[]>();
+// Column metadata is invariant for a given connection, but the old code re-read
+// it per copied row. Cache it -- this alone removes O(rows) metadata queries from
+// reconcile.
+//
+// Keyed by the CONNECTION object, not by schema+table: one process can hold
+// connections to several databases that share a schema name and registration ids
+// (openparcels runs live `parcel_fabric` and training `parcel_fabric_test` side by
+// side). A global schema:table key would let whichever database populated the
+// cache first dictate the column list for the other, producing a wrong-column
+// INSERT on a live reconcile.
+const columnCache = new WeakMap<IDatabaseConnection, Map<string, ColumnMeta[]>>();
 
 /** Clear the column-metadata cache (tests, or after a schema change). */
-export function clearColumnCache(): void {
-  columnCache.clear();
+export function clearColumnCache(connection?: IDatabaseConnection): void {
+  if (connection) columnCache.delete(connection);
+  // Without a connection there is nothing global to clear: entries are
+  // per-connection and die with the connection.
 }
 
 export async function getTableColumnsCached(
@@ -46,8 +60,10 @@ export async function getTableColumnsCached(
   schema: string,
   tableName: string,
 ): Promise<ColumnMeta[]> {
-  const key = `${connection.driver}:${schema}:${tableName}`.toLowerCase();
-  const hit = columnCache.get(key);
+  let perConn = columnCache.get(connection);
+  if (!perConn) { perConn = new Map(); columnCache.set(connection, perConn); }
+  const key = `${schema}:${tableName}`.toLowerCase();
+  const hit = perConn.get(key);
   if (hit) return hit;
 
   const sql = connection.driver === 'sqlserver'
@@ -58,7 +74,7 @@ export async function getTableColumnsCached(
 
   const rows = await connection.query<{ COLUMN_NAME: string; DATA_TYPE: string }>(sql, [schema, tableName]);
   const cols = rows.map((r) => ({ name: r.COLUMN_NAME, dataType: (r.DATA_TYPE || '').toLowerCase() }));
-  columnCache.set(key, cols);
+  perConn.set(key, cols);
   return cols;
 }
 
@@ -192,15 +208,19 @@ export async function insertDeleteMarkers(
   const driver = connection.driver;
   const qSchema = quoteId(driver, tableInfo.schema);
   const dTable = `${qSchema}.${quoteId(driver, `D${regId}`)}`;
-  const oidList = buildIntegerList(objectIds, 'insertDeleteMarkers.oids');
+  // Validate FIRST, then build the VALUES list from the validated integers, so
+  // the guard is load-bearing rather than a discarded call a cleanup could drop.
+  const validated = buildIntegerList(objectIds, 'insertDeleteMarkers.oids')
+    .split(',')
+    .map((s) => `(${s.trim()})`)
+    .join(',');
   const param = driver === 'sqlserver' ? '@p0' : '$1';
 
   const sql = driver === 'sqlserver'
     ? `INSERT INTO ${dTable} (SDE_STATE_ID, SDE_DELETES_ROW_ID, DELETED_AT)
-       SELECT ${param}, v.oid, ${param} FROM (VALUES ${objectIds.map((o) => `(${o})`).join(',')}) AS v(oid)`
+       SELECT ${param}, v.oid, ${param} FROM (VALUES ${validated}) AS v(oid)`
     : `INSERT INTO ${dTable} (sde_state_id, sde_deletes_row_id, deleted_at)
-       SELECT ${param}, v.oid, ${param} FROM (VALUES ${objectIds.map((o) => `(${o})`).join(',')}) AS v(oid)`;
-  void oidList;
+       SELECT ${param}, v.oid, ${param} FROM (VALUES ${validated}) AS v(oid)`;
 
   const res = await connection.execute(sql, [toState]);
   return res.rowsAffected;

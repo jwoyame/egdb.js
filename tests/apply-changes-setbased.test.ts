@@ -56,6 +56,13 @@ function makeMockConnection(childAlreadyHas: number[] = []): {
     async scalar() { return null; },
     async execute(sql: string, params?: unknown[]): Promise<ExecuteResult> {
       calls.push({ sql, params });
+      // Report what the statement would really move, so the "copy must move one
+      // row per OBJECTID" assertion is exercised rather than tripped by the mock:
+      // count the OBJECTID IN-list for copies, the VALUES tuples for markers.
+      const inList = /\[OBJECTID\] IN \(([^)]*)\)/i.exec(sql);
+      if (inList) return { rowsAffected: inList[1]!.split(',').length };
+      const values = /VALUES ((?:\(\d+\),?)+)/i.exec(sql);
+      if (values) return { rowsAffected: values[1]!.split('),').length };
       return { rowsAffected: 1 };
     },
     async executeInsert() { return []; },
@@ -135,6 +142,25 @@ describe('applyParentChanges - set-based fast path', () => {
 
     // favor_edit keeps the child's row: nothing is written for it at all.
     expect(calls.filter((c) => /INSERT INTO/i.test(c.sql)).length).toBe(0);
+  });
+
+  it('throws rather than leaving delete markers with no A-rows when a copy comes up short', async () => {
+    // A short copy (source state collapsed by a concurrent compress, a row that
+    // moved) would otherwise commit markers with nothing behind them, silently
+    // vanishing features while still reporting success.
+    const { conn } = makeMockConnection();
+    const short = {
+      ...conn,
+      async execute() { return { rowsAffected: 1 }; }, // claims 1 row for a 3-row copy
+    } as unknown as IDatabaseConnection;
+
+    await expect(
+      applyParentChanges(
+        short, [makeTable()],
+        changes({ inserts: [change(1, 'insert'), change(2, 'insert'), change(3, 'insert')] }),
+        [], CHILD_STATE, {},
+      ),
+    ).rejects.toThrow(/moved 1 of 3/);
   });
 
   it('mixes bulk and per-row correctly when only some rows conflict', async () => {
