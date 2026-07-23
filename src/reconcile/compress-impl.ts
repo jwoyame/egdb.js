@@ -367,13 +367,39 @@ export async function graduateTable(
       )`;
 
   // 1. Replace base rows for the winners with the winning A-row's column values
-  //    (delete-then-insert handles both existing and new base OIDs).
+  //    (delete-then-insert handles both existing and new base OIDs). The INSERT
+  //    writes an EXPLICIT OBJECTID, so bracket it with SET IDENTITY_INSERT when
+  //    the base OBJECTID is an identity column (N11); turn it back OFF even on
+  //    error (session-scoped, and only one table may hold it ON at a time).
   await connection.execute(
     `DELETE FROM ${baseTable} WHERE ${oidCol} IN (SELECT oid FROM (${winnersSub}) w)`);
-  const ins = await connection.execute(
+  const insertSql =
     `INSERT INTO ${baseTable} (${qCols})
      SELECT ${srcCols} FROM ${aTable} a
-     INNER JOIN (${winnersSub}) w ON w.oid = a.${oidCol} AND w.st = a.${sidCol}`);
+     INNER JOIN (${winnersSub}) w ON w.oid = a.${oidCol} AND w.st = a.${sidCol}`;
+  // Esri base OBJECTIDs are commonly IDENTITY columns, and this INSERT supplies
+  // OBJECTID explicitly (N11). SET IDENTITY_INSERT is session-scoped and does NOT
+  // survive across separate pooled/transaction requests, so it must ride in the
+  // SAME batch as the INSERT. It is also NON-transactional: a ROLLBACK does not
+  // reset it, and a leaked ON on a pooled connection (shared with the app's own
+  // fabric writes) would break every later INSERT into this base table. So the
+  // OFF must run even when the INSERT fails — a BEGIN TRY/CATCH guarantees it for
+  // both statement- and batch-aborting errors (a connection-fatal error kills the
+  // session, taking the flag with it). Safe standalone and inside compress()'s
+  // per-table SERIALIZABLE transaction alike.
+  const identityOid = await baseObjectIdIsIdentity(connection, driver, table, oidCol);
+  const ins = await connection.execute(
+    identityOid
+      ? `SET IDENTITY_INSERT ${baseTable} ON;
+         BEGIN TRY
+           ${insertSql};
+         END TRY
+         BEGIN CATCH
+           SET IDENTITY_INSERT ${baseTable} OFF;
+           THROW;
+         END CATCH;
+         SET IDENTITY_INSERT ${baseTable} OFF;`
+      : insertSql);
   result.upserts = ins.rowsAffected;
 
   // 2. Delete base rows whose net result in the prefix is a delete: an OID with
@@ -452,6 +478,33 @@ async function getTableColumns(
   }
   cache.set(key, names);
   return names;
+}
+
+/**
+ * Does the base table's OBJECTID column carry an IDENTITY property? Esri base
+ * tables commonly do, and graduation INSERTs an EXPLICIT OBJECTID, which SQL
+ * Server rejects unless bracketed by SET IDENTITY_INSERT (N11). PostgreSQL
+ * accepts explicit values into a serial/DEFAULT-nextval OBJECTID (the Esri-on-PG
+ * shape) without a session toggle, so this is a SQL-Server-only concern → false
+ * elsewhere. (A base declared GENERATED ALWAYS AS IDENTITY would need OVERRIDING
+ * SYSTEM VALUE, but Esri does not create that shape.)
+ */
+async function baseObjectIdIsIdentity(
+  connection: IDatabaseConnection,
+  driver: Driver,
+  table: TableInfo,
+  oidCol: string,
+): Promise<boolean> {
+  if (driver !== 'sqlserver') return false;
+  const rows = await connection.query<{ is_identity: number | boolean }>(
+    `SELECT c.is_identity
+     FROM sys.columns c
+     JOIN sys.objects o ON o.object_id = c.object_id
+     JOIN sys.schemas s ON s.schema_id = o.schema_id
+     WHERE s.name = @p0 AND o.name = @p1 AND c.name = @p2`,
+    [table.schema, table.name, oidCol],
+  );
+  return rows.length > 0 && (rows[0]!.is_identity === 1 || rows[0]!.is_identity === true);
 }
 
 // ---------------------------------------------------------------------------
@@ -742,8 +795,15 @@ export async function collapseLineages(
     const pairs = await findCollapsePairs(connection, lockedExpanded);
     if (pairs.length === 0) break;
 
+    // Collapse exactly ONE pair per round, then recompute. The batch returned by
+    // findCollapsePairs can contain OVERLAPPING pairs on a linear run — e.g.
+    // 1<-2<-3<-4 yields both (1,2) and (2,3). Processing the stale (2,3) after
+    // (1,2) has already deleted state 2 re-points state 4's parent onto a dead
+    // state (dangling parent_state_id — bug N4). Recomputing after each collapse
+    // keeps the pair list live and mirrors the reference model's one-at-a-time
+    // collapse exactly.
     let didCollapse = false;
-    for (const { parent, child } of pairs) {
+    for (const { parent, child } of pairs.slice(0, 1)) {
       // ONE transaction for the whole pair — delta rewrites AND metadata — so a
       // failure (e.g. the states_cuk dance below) rolls back atomically instead
       // of leaving the child's edits committed at the parent with the state tree
@@ -778,6 +838,30 @@ export async function collapseLineages(
              WHERE ${sidCol} = ${paramRef(driver, 0)}
                AND ${drowCol} IN (
                  SELECT ${drowCol} FROM ${dTable} WHERE ${sidCol} = ${paramRef(driver, 1)}
+               )`,
+            [parent, child],
+          );
+
+          // Cross A/D dedupe — the tip-ward child's operation is the NET result.
+          // A state must never hold both an A-row and a D-row for one OID (the
+          // versioned read only lets a delete suppress an add at a STRICTLY
+          // greater state, so an add and delete landing on the SAME collapsed
+          // state would resurrect a deleted feature — the add would win). So:
+          //   • C deletes what P added  → net delete: drop P's A-row.
+          //   • C (re)adds what P deleted → net add:  drop P's D-row.
+          await connection.execute(
+            `DELETE FROM ${aTable}
+             WHERE ${sidCol} = ${paramRef(driver, 0)}
+               AND ${oidCol} IN (
+                 SELECT ${drowCol} FROM ${dTable} WHERE ${sidCol} = ${paramRef(driver, 1)}
+               )`,
+            [parent, child],
+          );
+          await connection.execute(
+            `DELETE FROM ${dTable}
+             WHERE ${sidCol} = ${paramRef(driver, 0)}
+               AND ${drowCol} IN (
+                 SELECT ${oidCol} FROM ${aTable} WHERE ${sidCol} = ${paramRef(driver, 1)}
                )`,
             [parent, child],
           );

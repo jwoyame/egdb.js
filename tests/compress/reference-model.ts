@@ -239,13 +239,32 @@ export function compressRef(f: Fabric): CompressRefResult {
       if (parent === 0 || tips.has(parent) || kids.length !== 1) continue;
       const child = kids[0]!;
       if (tips.has(child)) continue;
+      // Esri collapse compacts LINEAR runs only, never a branch point: the child
+      // must itself have at most one child. A state with 2+ children is where
+      // versions diverge and is kept (mirrors findCollapsePairs' `cc <= 1`).
+      if ((childrenOf.get(child)?.length ?? 0) > 1) continue;
       pair = { parent, child }; break;
     }
     if (!pair) break;
     const { parent, child } = pair;
     for (const t of f.tables.values()) {
-      for (const [k, a] of [...t.adds]) if (a.state === child) { t.adds.delete(k); t.adds.set(akey(a.oid, parent), { ...a, state: parent }); }
-      for (const d of t.dels) { if (d.state === child) d.state = parent; if (d.deletedAt === child) d.deletedAt = parent; }
+      // Child C is tip-ward of parent P, so C's operation on an OID is the NET
+      // result at the merged state. A merged state must hold at most one of
+      // {add, delete} per OID — otherwise a delete-after-add collapsed onto the
+      // add's state would resurrect the feature (the read only lets a delete at a
+      // STRICTLY greater state suppress an add). Resolve per OID, child wins.
+      const childAdds = new Map<Oid, Record<string, unknown>>();
+      for (const a of t.adds.values()) if (a.state === child) childAdds.set(a.oid, a.values);
+      const childDels = new Set<Oid>();
+      for (const d of t.dels) if (d.state === child) childDels.add(d.oid);
+      const clearAt = (oid: Oid, states: StateId[]) => {
+        for (const s of states) t.adds.delete(akey(oid, s));
+        t.dels = t.dels.filter(d => !(d.oid === oid && states.includes(d.state)));
+      };
+      for (const [oid, values] of childAdds) { clearAt(oid, [parent, child]); t.adds.set(akey(oid, parent), { oid, state: parent, values }); }
+      for (const oid of childDels) { if (childAdds.has(oid)) continue; clearAt(oid, [parent, child]); t.dels.push({ oid, state: parent, deletedAt: parent }); }
+      // Re-point DELETED_AT of any surviving marker that pointed at the child.
+      for (const d of t.dels) if (d.deletedAt === child) d.deletedAt = parent;
     }
     for (const s of f.states.values()) if (s.parentStateId === child) s.parentStateId = parent;
     for (const [v, tip] of f.versions) if (tip === child) f.versions.set(v, parent);

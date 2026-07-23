@@ -9,7 +9,7 @@ import { computeGraduablePrefix, graduateTable, collapseLineages } from '../../s
 import { Fabric } from './reference-model';
 import { connectScratch, resetFabric, HAVE_DB, PARCELS } from './db';
 import { materialize } from './fabric-builder';
-import { snapshotVisible, assertVisibleDataUnchanged, assertNoShadowMarkerOrphans } from './invariants';
+import { snapshotVisible, assertVisibleDataUnchanged, assertNoShadowMarkerOrphans, assertStructuralInvariants } from './invariants';
 import type { SqlServerConnection } from '../../src/connections/sqlserver';
 
 const d = HAVE_DB ? describe : describe.skip;
@@ -78,5 +78,34 @@ d('compress graduate/collapse bugs (DB-backed)', () => {
 
     const after = await snapshotVisible(conn);
     assertVisibleDataUnchanged(before, after);
+  });
+
+  it('C0×collapse: collapsing a state whose base-shadow marker DELETED_AT lands on it does not resurrect', async () => {
+    // Bounds the residual C0 family the vet flagged: a trim-post UPDATE of a BASE
+    // row emits an A-row at the edit state PLUS a base-shadow marker
+    // (oid, SDE_STATE_ID=0, DELETED_AT=<edit state>) that retires the base row.
+    // 0 <- 1 <- 2 <- 3 (DEFAULT@3). Base {100:'old'}. Update-in-place at state 2:
+    // A-row 100@2 'new' + shadow (100,0,DELETED_AT=2). Collapse rewrites the
+    // shadow's DELETED_AT 2->1 while the A-row rides along; the read must still
+    // resolve 'new' (the A-row wins), never resurrect the retired 'old' base row.
+    const f = new Fabric();
+    st(f, 1, 0, 1);
+    st(f, 2, 1, 1);
+    st(f, 3, 2, 1);
+    f.versions.set('DEFAULT', 3);
+    const t = f.table('parcels');
+    t.base.set(100, { VAL: 'old' });
+    t.adds.set('100:2', { oid: 100, state: 2, values: { VAL: 'new' } });
+    t.dels.push({ oid: 100, state: 0, deletedAt: 2 }); // base-shadow marker
+    await materialize(conn, f);
+
+    const before = await snapshotVisible(conn);
+    expect(before.get('test.DEFAULT')!.get(100)).toBe('new');
+
+    await collapseLineages(conn, [PARCELS]);
+
+    const after = await snapshotVisible(conn);
+    assertVisibleDataUnchanged(before, after);   // still 'new', 'old' never returns
+    await assertStructuralInvariants(conn);       // incl. assertNoShadowMarkerOrphans
   });
 });

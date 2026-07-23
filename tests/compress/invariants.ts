@@ -30,23 +30,23 @@ export async function versionTips(conn: IDatabaseConnection): Promise<Array<{ na
 }
 
 /** Resolve the visible (OBJECTID -> VAL) set for one version tip, egdb semantics. */
-export async function dbVisible(conn: IDatabaseConnection, tip: number): Promise<Map<number, string | null>> {
+export async function dbVisible(conn: IDatabaseConnection, tip: number, regId: number = REG_ID): Promise<Map<number, string | null>> {
   const sql = `
     ${ancCte(tip)}
     SELECT b.OBJECTID AS oid, b.VAL AS val
-    FROM dbo.base${REG_ID} b
-    WHERE b.OBJECTID NOT IN (SELECT SDE_DELETES_ROW_ID FROM dbo.D${REG_ID} WHERE DELETED_AT IN (SELECT state_id FROM anc))
-      AND b.OBJECTID NOT IN (SELECT OBJECTID FROM dbo.a${REG_ID} WHERE SDE_STATE_ID IN (SELECT state_id FROM anc))
+    FROM dbo.base${regId} b
+    WHERE b.OBJECTID NOT IN (SELECT SDE_DELETES_ROW_ID FROM dbo.D${regId} WHERE DELETED_AT IN (SELECT state_id FROM anc))
+      AND b.OBJECTID NOT IN (SELECT OBJECTID FROM dbo.a${regId} WHERE SDE_STATE_ID IN (SELECT state_id FROM anc))
     UNION ALL
     SELECT a.OBJECTID AS oid, a.VAL AS val
-    FROM dbo.a${REG_ID} a
+    FROM dbo.a${regId} a
     INNER JOIN (
-      SELECT OBJECTID AS moid, MAX(SDE_STATE_ID) AS ms FROM dbo.a${REG_ID}
+      SELECT OBJECTID AS moid, MAX(SDE_STATE_ID) AS ms FROM dbo.a${regId}
       WHERE SDE_STATE_ID IN (SELECT state_id FROM anc) GROUP BY OBJECTID
     ) m ON m.moid = a.OBJECTID AND m.ms = a.SDE_STATE_ID
     WHERE a.SDE_STATE_ID IN (SELECT state_id FROM anc)
       AND NOT EXISTS (
-        SELECT 1 FROM dbo.D${REG_ID} d
+        SELECT 1 FROM dbo.D${regId} d
         WHERE d.SDE_DELETES_ROW_ID = a.OBJECTID
           AND d.SDE_STATE_ID IN (SELECT state_id FROM anc)
           AND d.SDE_STATE_ID > a.SDE_STATE_ID
@@ -60,9 +60,9 @@ export async function dbVisible(conn: IDatabaseConnection, tip: number): Promise
 
 export type VisibleSnapshot = Map<string, Map<number, string | null>>;
 
-export async function snapshotVisible(conn: IDatabaseConnection): Promise<VisibleSnapshot> {
+export async function snapshotVisible(conn: IDatabaseConnection, regId: number = REG_ID): Promise<VisibleSnapshot> {
   const out: VisibleSnapshot = new Map();
-  for (const { name, tip } of await versionTips(conn)) out.set(name, await dbVisible(conn, tip));
+  for (const { name, tip } of await versionTips(conn)) out.set(name, await dbVisible(conn, tip, regId));
   return out;
 }
 
@@ -132,10 +132,27 @@ export async function assertNoShadowMarkerOrphans(conn: IDatabaseConnection): Pr
   expect(rows.map(r => Number(r.oid)), 'orphaned base-shadow markers (C0)').toEqual([]);
 }
 
+/**
+ * No single state holds BOTH an A-row and a (non-shadow) D-row for one OID — an
+ * SDE state is one atomic edit, so an OID is added XOR deleted there, never both.
+ * Collapse's cross-A/D dedupe RELIES on this being true of its inputs; asserting
+ * it after compress makes that load-bearing assumption explicit rather than
+ * silent (shadow markers with SDE_STATE_ID=0 are excluded — they legitimately
+ * co-exist with an A-row at a real state to retire the base row).
+ */
+export async function assertNoSameStateAddAndDelete(conn: IDatabaseConnection): Promise<void> {
+  const rows = await conn.query<{ oid: number; st: number }>(
+    `SELECT a.OBJECTID AS oid, a.SDE_STATE_ID AS st FROM dbo.a${REG_ID} a
+       JOIN dbo.D${REG_ID} d ON d.SDE_DELETES_ROW_ID = a.OBJECTID AND d.SDE_STATE_ID = a.SDE_STATE_ID
+      WHERE d.SDE_STATE_ID <> 0;`);
+  expect(rows.map(r => `${Number(r.oid)}@${Number(r.st)}`), 'a state holds both an add and a delete for one OID').toEqual([]);
+}
+
 /** Run all structural invariants that must hold after any compress. */
 export async function assertStructuralInvariants(conn: IDatabaseConnection): Promise<void> {
   await assertNoDanglingParents(conn);
   await assertStateZeroIntact(conn);
   await assertNoReferencesToDeadStates(conn);
   await assertNoShadowMarkerOrphans(conn);
+  await assertNoSameStateAddAndDelete(conn);
 }
