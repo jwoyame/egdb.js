@@ -312,11 +312,13 @@ data shape are named. Rev 1's blanket version misfires for C, G and H.
 
 ## Sequencing
 
-1. Snapshot/provision/guards + **the test seam** (including exposing
-   `buildVersionedSelect` for A2). Prove restore works before a single assertion.
-1.5. **Baseline pass** — BASE → compress → record legitimate deltas and
-   `prefix_before`. Every structural assertion is measured against this.
-2. A1/A2/A3/A15a/A15b + the cheap ones (A13, A14, A18, A19, A20) and S1.
+1. Snapshot/provision/guards + **the test seam** (exposing
+   `buildVersionedQuery` for A2). Prove restore works before a single assertion.
+1.5. **Baseline pass** — BASE → capture the A15a violation set **pre-compress**
+   → compress → record the legitimate base delta and `prefix_baseline`. Every
+   structural assertion is measured against this. (`prefix_before` is a
+   *scenario-run* measurement, not a baseline one — see Part 0.)
+2. A1/A2/A3/A15a/A15b + the cheap ones (A13, A14, A18, A19, A20, A21) and S1.
    Green S1 proves the plumbing.
 3. **A4–A7 with the S14 branch pairing, inherited arm forced.** A and B must go
    red in that arm. *If they pass, the harness is wrong.*
