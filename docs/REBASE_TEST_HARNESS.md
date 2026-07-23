@@ -1,4 +1,4 @@
-# rebaseVersion test harness — design (rev 2)
+# rebaseVersion test harness — design (rev 3)
 
 ## Why this exists
 
