@@ -1342,30 +1342,63 @@ export class EnterpriseGeodatabase {
    * Rebasing instead branches a fresh state off the parent's tip and replays ONLY
    * what actually differs, so the version ends up with exactly the editor's work.
    *
-   * STILL GATED behind `unsafeExperimental` pending a live-fabric re-review.
-   * The four defects a review found have been fixed -- each is called out at its
-   * fix site below -- but this writes directly to the version graph, so it wants
-   * a second look and a training run before it is wired to any route:
-   *   1. lineage leak      -> the new state is forced onto its OWN lineage, and
-   *                           only that state is written to the closure, so a
-   *                           version's unposted edits can never enter DEFAULT's.
-   *   2. dropping edits     -> comparison is against the parent's TIP only, under
-   *                           a binary collation, so a case/whitespace fix or a
-   *                           revert-to-previous-value is no longer "redundant".
-   *   3. concurrency        -> lockVersion + re-read inside the lock + an
-   *                           optimistic `AND state_id = <old>` on the repoint.
-   *   4. delete markers     -> markers carry the SUPERSEDED row's state (0 for a
-   *                           base row), never the new state.
-   * Copies and markers are chunked, and the closure write is a single row.
+   * !!! NOT PRODUCTION READY. DO NOT UNGATE. DO NOT WIRE TO A ROUTE. !!!
    *
-   * Redundant rows are identified structurally: a child row byte-identical to the
-   * parent's tip carries no information (a previous reconcile copied it in), so
-   * dropping it cannot lose an edit. `droppedRedundant` reports how many were
-   * discarded -- on a dry run against a version nobody reconciled it should be 0.
+   * A first review found four defects; the fixes for them introduced further
+   * ones, which a second review caught. A training run passed every check it
+   * made and still proved little, because it never posted, never compressed, and
+   * used data with no prior reconcile -- exactly where the remaining bugs live.
+   * Treat a green training run here as weak evidence.
    *
-   * The version's OLD states are left untouched and simply become unreferenced,
-   * so this is REVERSIBLE (repoint the version back) until a compress reclaims
-   * them -- which is also how the leftovers get cleaned up, natively.
+   * OPEN, each independently disqualifying:
+   *
+   *  A. POST IS IMPOSSIBLE AFTER A REBASE. `isReconciled` (post.ts) is a pure
+   *     closure lookup for (child lineage_name, parent state). Seeding only
+   *     [newState] below leaves that row absent, so postVersion refuses with
+   *     "no longer reconciled" -- the version can only be cleared by the very
+   *     full reconcile this exists to avoid. The closure must be SEEDED with the
+   *     parent's ancestry under the new lineage (one set-based INSERT..SELECT,
+   *     which is what SDE_state_new_edit itself does when it allocates a
+   *     lineage), not truncated to one row.
+   *  B. COMPRESS GRADUATION STOPS DATABASE-WIDE. computeGraduablePrefix
+   *     intersects every version tip's closure; a one-row closure makes that
+   *     intersection empty, so compress graduates nothing for the whole
+   *     geodatabase while any rebased version exists -- and posted work reaches
+   *     the public layer via compress. Silent.
+   *  C. NON-DETERMINISTIC. If the parent tip already has a child,
+   *     SDE_state_new_edit allocates a fresh lineage and copies the parent's
+   *     closure into it, so the code takes a different branch and yields a
+   *     correct closure. Same input, two structurally different outcomes.
+   *  D. TIP-ONLY COMPARISON FALSE-KEEPS. Stale reconcile residue that the parent
+   *     has since changed again differs from the parent's TIP, so it is replayed
+   *     and supersedes DEFAULT's NEWER row -- reverting it on post. The test must
+   *     be three-way against the COMMON ANCESTOR, and a row differing from both
+   *     is a CONFLICT, which this never detects (reconcileVersion does).
+   *  E. CREATE-THEN-DELETE RESURRECTS; DELETE-AFTER-RECONCILE VANISHES. The
+   *     pureDeletes heuristic is a set difference; it needs a per-OID temporal
+   *     test (max D-state vs max A-state).
+   *  F. PARENT IS NOT LOCKED. Only the child is locked; parentStates/parent tip
+   *     are read before the transaction and never revalidated, so a concurrent
+   *     post can strand rows dropped as "redundant" against a tip the new state
+   *     does not descend from. postVersion locks the parent; this must too.
+   *  G. PURE-DELETE MARKERS ARE INVISIBLE TO EGDB'S OWN READER. The adds-half
+   *     predicate needs D.SDE_STATE_ID > A.SDE_STATE_ID; a marker at the
+   *     superseded state can never satisfy it. The previous form broke Esri
+   *     instead. Both markers are needed, not one or the other.
+   *  H. LATENT BASE-TABLE DELETION. Markers carry a DEFAULT-lineage state, and
+   *     graduateTable treats SDE_STATE_ID in the graduable prefix as graduable --
+   *     so once (A) is fixed, an UNPOSTED version's delete can graduate into
+   *     `DELETE FROM <base>`. Today only the broken closure masks it. This is the
+   *     most dangerous interaction in the change; fix (A) and (H) together.
+   *
+   * Lesser: markers are not idempotent (a re-run duplicates them); parentStates
+   * is inlined as a huge IN-list (10k+ states pre-compress) where
+   * emitBaseShadowMarkers deliberately avoids that; CHUNK=2000 may exceed SQL
+   * Server's 1000-row table-value-constructor limit; begin/rollbackTransaction
+   * ignore the `wasInTx` pattern every other write path here uses; no
+   * open-EditSession/fork check (a save would silently undo the rebase); the
+   * dry-run reports updates under a `deletes` label; `droppedRedundant` counts
+   * OBJECTIDs and reveals nothing about the false-keep in (D).
    */
   async rebaseVersion(
     versionName: string,
@@ -1383,8 +1416,10 @@ export class EnterpriseGeodatabase {
     // by accident while the defects above stand.
     if (!options?.dryRun && !options?.unsafeExperimental) {
       throw new Error(
-        'rebaseVersion is experimental and NOT safe for a live fabric (lineage leak, ' +
-        'EXCEPT can drop edits, no concurrency guard, same-state delete markers). ' +
+        'rebaseVersion is NOT production ready: post refuses after a rebase (truncated ' +
+        'closure), compress graduation stalls database-wide, the comparison can revert ' +
+        'newer parent edits, and delete handling resurrects/loses features. See the ' +
+        'open-defect list on the method. ' +
         'Pass { unsafeExperimental: true } to run it anyway, or { dryRun: true } to inspect the plan.',
       );
     }
