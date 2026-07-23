@@ -1,4 +1,4 @@
-# rebaseVersion test harness — design (rev 3)
+# rebaseVersion test harness — design (rev 4)
 
 ## Why this exists
 
@@ -49,6 +49,11 @@ Two reasons this must be a physical capture rather than declared API intent:
 
 Rows that appear in the child's states *later* are residue by construction.
 
+`expectedInVersion` is still a derived value, and applying the ledger for A5
+needs a tip rule (max state per OID). **Write that rule independently of
+`copyTipRows`** — sharing the DUT's implementation would reintroduce circularity
+through the back door.
+
 **Undecidable rows.** Some expectations cannot be fixed at build time:
 conflicts (S12 — the expectation is on the *operation*, not the rows); S7×S3
 composed (editor restores a prior value *and* the parent has since changed that
@@ -95,12 +100,30 @@ rounds ended.
 
 So, before scenarios run:
 
-1. Restore BASE → run `compress()` → record the legitimate
-   (disappeared / changed / appeared) base delta and `prefix_before`.
-2. Restore BASE again → run the scenario.
+1. Restore BASE. **Capture the A15a closure-violation set HERE, pre-compress** —
+   compress prunes closure rows, so a post-compress baseline understates the
+   pre-existing dirt and would manufacture false "new" violations in every
+   scenario. That is exactly the muting hazard this pass exists to prevent.
+2. Run `compress()` → record the legitimate (disappeared / changed / appeared)
+   base delta, and `prefix_baseline`.
+3. Restore BASE again → run the scenario.
 
 **Every structural assertion is `scenario delta − baseline delta`.** Absolutes
 are only used where the baseline is provably empty.
+
+Two subtraction hazards to close:
+
+- **A6's `prefix_before` is measured in the scenario run** (after fixtures,
+  before the rebase) — *not* carried over from the baseline. Fixture versions
+  legitimately shrink the all-tips intersection, so the baseline value would
+  false-fail the `⊆` check. The baseline value only calibrates the precondition.
+  "Non-trivial" means concretely `prefix_before ∩ parent-chain(parent tip) ≠ ∅`.
+  Also record `prefix_scenario ⊆ prefix_baseline` as a sanity check.
+- **A7's subtraction can cancel the very damage it looks for.** If a fixture OID
+  also appears in the baseline base-delta, an OID legitimately graduating in the
+  baseline masks the same OID disappearing in the scenario — H/S19 goes green.
+  **Fixture OIDs must be disjoint from the baseline base-delta, and the harness
+  must assert that disjointness** rather than assume it.
 
 ## Preconditions
 
@@ -194,10 +217,12 @@ month. This is a prerequisite, not a nice-to-have.
 | **S25** | Geometry-only edit | Validates the storage-type precondition empirically |
 | **S26** | Cross-table referential: parcel kept, its lines/points in other tables/states | Partial replay |
 | **S27** | **Rebasing a version that itself HAS a child version** | Repointing V leaves V's child descending from V's *old* state: the child's resolution silently diverges from its parent, and `deleteVersion`/compress reference-counting still sees the old states as referenced. Real corruption path, uncovered by S20 (which is the inverse) |
-| **S28** | Parent **deleted** an OID after the branch point; child carries residue for it | **Defect I** — `selectChangedObjectIds` never consults the parent's D-table, so the row is replayed and resurrected |
+| **S28** | Parent **updated THEN deleted** an OID after the child's reconcile; child carries residue for it | **Defect I** — `selectChangedObjectIds` never consults the parent's D-table, so the row is replayed and resurrected. **The update-then-delete shape is required**: if the child's residue is byte-identical to the parent's A-tip, `EXCEPT` drops it and nothing resurrects — S28 would go green for the wrong reason |
 
 Demoted to unit tests (no fabric needed): **S13** scale → prove the 1000-row
-`VALUES` limit and `CHUNK=2000` against the SQL builders, plus one 2,001-OID
+`VALUES` limit, `CHUNK=2000`, **and the `parentStates` IN-list** against the SQL
+builders — `getStatesInRange(parent, 0)` inlines 10k+ states into every per-table
+query in the plan loop, which is a separate limit from CHUNK. Plus one 2,001-OID
 integration run. **S6** collation → unit-test `comparableExpr` against the
 fabric's actual collation.
 
@@ -227,6 +252,7 @@ fixed together with no evidence that either worked.
 | A5 | **Post lands exactly the ledger's edits** | Materialise DEFAULT-before per table (`OID + HASHBYTES`), apply the **ledger** to get the expected set, two-way `EXCEPT` against DEFAULT-after. **The DUT's own diff must not appear in the expectation** |
 | A6 | Compress prefix **grows or holds** | `prefix_before ⊆ prefix_after`. **Precondition: `prefix_before` must be non-empty and non-trivial, else the scenario reports INCONCLUSIVE, not pass** — on a fabric with sparse closures the intersection may already be empty, and B would go undetected |
 | A7 | **Full compress is safe** | Classify base rows post-compress into disappeared / changed / **appeared**, **minus the baseline delta**; each residual must map to the ledger's *posted* set. "Appeared" is the dual of H/S19 and matches this repo's worst incident — keep it first-class. Restrict to graduation-relevant scenarios |
+| A8 | *(folded into A2)* | DEFAULT-untouched-pre-post is now covered by A2's all-versions sweep plus A18; kept here so its absence is not read as an accidental deletion |
 | A9 | Reader parity | egdb vs `_evw` for insert, update, delete |
 | A10 | Marker hygiene | No duplicates; none whose A-row is missing; none carrying a parent-lineage state compress could graduate. (S16 folds into this) |
 | A11 | Conflict contract | Refuse or report; never silently decide |
@@ -234,19 +260,23 @@ fixed together with no evidence that either worked.
 | **A13** | No `SDE_state_locks` row for `newState` | Cheap |
 | **A14** | No A/D row references a state absent from `SDE_states` | Cheap |
 | **A15a** | Closure ⊆ parent-chain ancestry, **as a delta vs baseline** | Rebase must introduce no *new* violations. Absolute form false-fails: compress/prune history and the base-0-orphan recovery both leave legitimate stale rows. Apply the readers' own `lineage_id <= tip` filter |
-| **A15b** | **parent-chain(parent tip) ⊆ closure(V)**, scoped to V | The *opposite* containment, and the one defect A actually violates — it is what `isReconciled` and `computeGraduablePrefix` require. A15a alone cannot see it |
+| **A15b** | **parent-chain(parent tip) ⊆ closure(V)**, scoped to V (resolve V's `lineage_name` from `SDE_states`, not from the state id — the fresh-lineage arm assigns a different name) | The *opposite* containment, and the one defect A actually violates — it is what `isReconciled` and `computeGraduablePrefix` require. A15a alone cannot see it |
 | **A16** | Dry-run plan == what was written | Directly tests the mislabelled `deletes` counter |
 | **A17** | Reversibility | Repoint to `fromState`; content == pre-rebase. Low signal but it is the documented rollback and nothing tests it |
 | **A18** | **Base tables byte-unchanged by the rebase** | Rebase must never touch base. Row count + aggregate hash per table. Catches the worst class instantly |
-| **A19** | **`parent_state_id(newState) == parent.stateId`**, re-read after the operation | Makes **F deterministically red with no seam**. The seam is still needed for S9/A12, but F must not depend on it |
+| **A19** | `parent_state_id(newState)` == the parent's **current** `SDE_versions.state_id`, re-read **after** the operation | NOT the planned `parent.stateId`: `createChildState` passes that value straight into `SDE_state_new_edit`, so comparing against it is true by construction and can never go red. Comparing against the parent's re-read tip is what detects a parent that moved mid-operation |
+| **A21** | **Efficacy: the rebase actually did something** | Post-rebase change count == ledger cardinality. Every other assertion is safety-only, so a rebase that drops nothing — a pure no-op — passes the entire harness while failing the feature's whole purpose |
 | **A20** | **No other version moved** | `SDE_versions` (owner, name, state_id) for every row ≠ V unchanged. One query; catches collateral damage |
 
 **A2 mechanics.** "Diff entirely in SQL under both readers" is not directly
 implementable: egdb's resolution is a **TypeScript reader, not a SQL view**, so
 there is nothing to `EXCEPT` against. Therefore:
 
-- The seam must expose the reader's generated SQL (`buildVersionedSelect`) so
-  both sides are SQL.
+- The seam must expose the reader's generated SQL. The method is
+  `private buildVersionedQuery(stateIds, where, outFields)`
+  (`enterprise-table.ts:447`) — there is no `buildVersionedSelect`. It takes an
+  explicit state list, so the harness must state who computes it: deliberately
+  egdb's own resolution, with `_evw` as the independent arm.
 - `_evw` requires `sde.set_current_version` per version — session-scoped and
   serial; budget for that.
 - **Routine path: one aggregate hash per (version, table).** Drop to per-OID
@@ -274,7 +304,7 @@ data shape are named. Rev 1's blanket version misfires for C, G and H.
 | C | Only if **asserted** | Recording the branch is a log line, not a gate. Assert that **both S14 arms yield equivalent closures** |
 | D | Only after A5 is ledger-based | Otherwise circular |
 | E | Yes, both readers | With the ledger oracle S4a also goes red under egdb's reader (ledger says absent, rebase resurrects with no marker). That is not a reason to skip `_evw` |
-| F | Yes, **without the seam** | A19 (re-read `parent_state_id(newState)`) makes it deterministic. Seam still needed for S9/A12 |
+| F | Yes, **via S8 + the seam** | Attribute to S8. A19 alone does not make F red: the earlier claim relied on comparing `parent_state_id(newState)` to the *planned* `parent.stateId`, which `createChildState` sets by construction. F needs the interleave |
 | G | Only with S17's uncompressed-A-row shape | A restored fabric is mostly base-resident → green for the wrong reason |
 | H | **No — masked by A** | Needs S18's simulated closure fix. Re-run S18 with the simulation **removed** once the real A-fix lands, using the same helper — otherwise the simulation is just the fix written twice |
 | I (new) | Expected yes | S28 + invariant (ii) |
