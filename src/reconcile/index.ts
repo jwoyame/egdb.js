@@ -108,6 +108,7 @@ export {
   selectDeletedObjectIds,
   selectObjectIdsWithARows,
   selectObjectIdsPresentInParent,
+  insertSupersedeMarkers,
   copyTipRows,
   insertDeleteMarkers,
   getTableColumnsCached,

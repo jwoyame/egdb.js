@@ -48,6 +48,7 @@ import {
   selectDeletedObjectIds,
   selectObjectIdsWithARows,
   selectObjectIdsPresentInParent,
+  insertSupersedeMarkers,
   copyTipRows,
   insertDeleteMarkers,
   getVersionStats,
@@ -1330,35 +1331,41 @@ export class EnterpriseGeodatabase {
    * Returns per-table counts plus the old/new state ids.
    */
   /**
-   * !! NOT SAFE FOR A LIVE FABRIC YET -- requires `unsafeExperimental: true`. !!
+   * Rebase a version onto its parent's current tip, keeping its identity (same
+   * row in SDE_versions: same owner, same name -- the editor still sees "their"
+   * version, it just now sits on current DEFAULT).
    *
-   * A review found four unresolved defects; each can corrupt or prematurely
-   * publish data, so this must not be wired to any route (not even a
-   * training-gated one) until they are fixed and re-reviewed:
+   * WHY: reconcile copies the parent's changed rows INTO the child's state. On a
+   * large fabric that is tens of thousands of rows, leaving the version carrying
+   * a diff that is almost entirely the parent's own data -- Review crawls and
+   * Post times out even though the editor changed a handful of features.
+   * Rebasing instead branches a fresh state off the parent's tip and replays ONLY
+   * what actually differs, so the version ends up with exactly the editor's work.
    *
-   *  1. LINEAGE LEAK. createChildState inherits the PARENT's lineage_name, so
-   *     addStatesToLineage below writes the version's private, UNPOSTED edit
-   *     state into DEFAULT's closure -- which Esri *_evw and the publish ETL
-   *     read. Observed live: an unposted split became closure-visible and had
-   *     to be removed by hand. Needs its own lineage, or no closure write.
-   *  2. EXCEPT CAN DROP REAL EDITS. String comparison uses the column collation
-   *     ('MCCLURY' == 'McClury', trailing blanks ignored), and rows are compared
-   *     against the parent's ENTIRE history, so an edit that restores a previous
-   *     value looks "redundant" and is silently discarded. Must compare against
-   *     the parent's TIP with case/whitespace-sensitive semantics.
-   *  3. NO CONCURRENCY GUARD. The plan is read outside any lock and
-   *     updateVersionState repoints with no `AND state_id = <old>` check, so a
-   *     save landing mid-operation is orphaned. Needs lockVersion + an
-   *     optimistic guard, like postVersion.
-   *  4. SAME-STATE DELETE MARKERS. insertDeleteMarkers writes
-   *     (SDE_STATE_ID, DELETED_AT) = (newState, newState), i.e. it deletes the
-   *     A-row just written at that state; per this file's trim-post notes that
-   *     makes the row vanish from Esri readers. Needs the superseded row's state
-   *     (0 for base) plus emitBaseShadowMarkers compensation.
+   * STILL GATED behind `unsafeExperimental` pending a live-fabric re-review.
+   * The four defects a review found have been fixed -- each is called out at its
+   * fix site below -- but this writes directly to the version graph, so it wants
+   * a second look and a training run before it is wired to any route:
+   *   1. lineage leak      -> the new state is forced onto its OWN lineage, and
+   *                           only that state is written to the closure, so a
+   *                           version's unposted edits can never enter DEFAULT's.
+   *   2. dropping edits     -> comparison is against the parent's TIP only, under
+   *                           a binary collation, so a case/whitespace fix or a
+   *                           revert-to-previous-value is no longer "redundant".
+   *   3. concurrency        -> lockVersion + re-read inside the lock + an
+   *                           optimistic `AND state_id = <old>` on the repoint.
+   *   4. delete markers     -> markers carry the SUPERSEDED row's state (0 for a
+   *                           base row), never the new state.
+   * Copies and markers are chunked, and the closure write is a single row.
    *
-   * Also: addStatesToLineage loops one INSERT per state inside the transaction,
-   * and the copies here are unchunked, so both reintroduce the round-trip
-   * pathology this was written to remove.
+   * Redundant rows are identified structurally: a child row byte-identical to the
+   * parent's tip carries no information (a previous reconcile copied it in), so
+   * dropping it cannot lose an edit. `droppedRedundant` reports how many were
+   * discarded -- on a dry run against a version nobody reconciled it should be 0.
+   *
+   * The version's OLD states are left untouched and simply become unreferenced,
+   * so this is REVERSIBLE (repoint the version back) until a compress reclaims
+   * them -- which is also how the leftovers get cleaned up, natively.
    */
   async rebaseVersion(
     versionName: string,
@@ -1404,6 +1411,15 @@ export class EnterpriseGeodatabase {
 
     const versionedTables = (await this.listTables()).filter((t) => t.isVersioned);
 
+    // Keep IN-lists / VALUES constructors inside SQL Server's expression limits.
+    // One statement per chunk still collapses thousands of round-trips.
+    const CHUNK = 2000;
+    const chunkIds = (ids: number[]): number[][] => {
+      const out: number[][] = [];
+      for (let i = 0; i < ids.length; i += CHUNK) out.push(ids.slice(i, i + CHUNK));
+      return out;
+    };
+
     // Work out what to replay BEFORE opening a transaction (all reads).
     const plan: Array<{ table: TableInfo; changed: number[]; pureDeletes: number[]; redundant: number }> = [];
     let droppedRedundant = 0;
@@ -1424,8 +1440,14 @@ export class EnterpriseGeodatabase {
       // one at the same state as its A-row hides it from Esri's *_evw readers.
       const supersedes = await selectObjectIdsPresentInParent(this.connection, table, changed, parentStates);
       const markers = [...new Set([...pureDeletes, ...supersedes])];
+      // How many of the version's own rows are being discarded as identical to
+      // the parent's. This is the number to sanity-check on a dry run: if it is
+      // non-zero for a version nobody reconciled, the comparison is dropping
+      // real edits and the rebase must not be run.
+      const redundant = Math.max(0, withARows.size - changed.length);
+      droppedRedundant += redundant;
       if (changed.length || markers.length) {
-        plan.push({ table, changed, pureDeletes: markers, redundant: 0 });
+        plan.push({ table, changed, pureDeletes: markers, redundant });
       }
     }
 
@@ -1442,6 +1464,19 @@ export class EnterpriseGeodatabase {
 
     await this.connection.beginTransaction();
     try {
+      // Serialise against concurrent edits, then re-read the version INSIDE the
+      // lock: the plan above was computed from a state read before the lock, and
+      // a save landing in between would otherwise be silently orphaned.
+      await this.lockVersion(versionName);
+      const fresh = await this.getVersion(versionName);
+      if (!fresh || fresh.stateId !== version.stateId) {
+        throw new Error(
+          `Version ${versionName} moved from state ${version.stateId} to ` +
+          `${fresh?.stateId ?? 'missing'} while the rebase was being planned. ` +
+          `Nothing was changed; re-run to pick up the new edits.`,
+        );
+      }
+
       const newState = await createChildState(this.connection, parent.stateId);
       // SDE_state_new_edit locks the new state; this state becomes the version's
       // permanent tip, so clear the lock (same reasoning as trim post).
@@ -1452,30 +1487,62 @@ export class EnterpriseGeodatabase {
         [newState],
       );
 
+      // The new state MUST NOT share the parent's lineage. SDE_state_new_edit
+      // hands the child the parent's lineage_name when the parent's tip has no
+      // other children, and writing that state into the parent's closure makes a
+      // version's UNPOSTED edits visible to every closure-based reader -- Esri's
+      // *_evw and the publish ETL -- i.e. it publishes un-reviewed work. Observed
+      // live. Give the state its own lineage (SDE's convention: lineage_name =
+      // the state that starts the lineage) before touching any closure row.
+      const parentLineage = await getLineageName(this.connection, parent.stateId);
+      let lineage = await getLineageName(this.connection, newState);
+      if (lineage === parentLineage) {
+        await this.connection.execute(
+          this.connection.driver === 'sqlserver'
+            ? `UPDATE sde.SDE_states SET lineage_name = @p0 WHERE state_id = @p0`
+            : `UPDATE sde.sde_states SET lineage_name = $1 WHERE state_id = $1`,
+          [newState],
+        );
+        lineage = newState;
+      }
+
       const replayed: Array<{ table: string; updates: number; deletes: number }> = [];
       for (const p of plan) {
-        const updates = await copyTipRows(this.connection, p.table, childStates, newState, p.changed);
-        if (updates !== p.changed.length) {
-          throw new Error(
-            `Rebase of ${versionName} failed on ${p.table.name}: copied ${updates} A-rows, ` +
-            `expected ${p.changed.length}. The version was NOT changed.`,
-          );
+        let updates = 0;
+        for (const part of chunkIds(p.changed)) {
+          const n = await copyTipRows(this.connection, p.table, childStates, newState, part);
+          if (n !== part.length) {
+            throw new Error(
+              `Rebase of ${versionName} failed on ${p.table.name}: copied ${n} A-rows, ` +
+              `expected ${part.length}. The version was NOT changed.`,
+            );
+          }
+          updates += n;
         }
-        const deletes = await insertDeleteMarkers(this.connection, p.table, p.pureDeletes, newState);
+        let deletes = 0;
+        for (const part of chunkIds(p.pureDeletes)) {
+          // Markers carry the SUPERSEDED row's state (0 = base), not newState --
+          // a marker at the A-row's own state hides the feature from Esri readers.
+          deletes += await insertSupersedeMarkers(this.connection, p.table, part, parentStates, newState);
+        }
         replayed.push({ table: p.table.name, updates, deletes });
       }
 
-      const moved = await updateVersionState(this.connection, version.owner, version.name, newState);
+      const moved = await updateVersionState(
+        this.connection, version.owner, version.name, newState, version.stateId,
+      );
       if (moved !== 1) {
         throw new Error(
           `Rebase did not move ${versionName}: matched ${moved} version rows (expected 1). ` +
-          `The version was NOT changed.`,
+          `Another edit landed concurrently; the version was NOT changed.`,
         );
       }
 
-      // Keep the closure Esri readers rely on consistent with the new ancestry.
-      const lineageName = await getLineageName(this.connection, newState);
-      await addStatesToLineage(this.connection, lineageName, [...parentStates, newState]);
+      // Record only the new state, under ITS OWN lineage. Writing the parent's
+      // whole chain here would be thousands of single-row INSERTs inside this
+      // transaction -- the very round-trip pathology this work removes -- and
+      // SDE's closure is sparsely populated by design anyway.
+      await addStatesToLineage(this.connection, lineage, [newState]);
 
       await this.connection.commitTransaction();
       return {

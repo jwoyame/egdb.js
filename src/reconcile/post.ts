@@ -236,13 +236,25 @@ export async function updateVersionState(
   connection: IDatabaseConnection,
   versionOwner: string,
   versionName: string,
-  newStateId: number
+  newStateId: number,
+  /**
+   * Optimistic guard: when given, the update only applies while the version is
+   * STILL on this state. Without it a save landing between "read the version's
+   * state" and "repoint it" is silently orphaned -- the new state is never
+   * carried forward and the pointer moves off it, losing the editor's work.
+   * Any caller that computed a plan from a state it read earlier must pass it;
+   * a 0-row result then means "someone else moved it", not "version missing".
+   */
+  expectedStateId?: number
 ): Promise<number> {
+  const guarded = expectedStateId != null;
   const sql = connection.driver === 'sqlserver'
-    ? `UPDATE sde.SDE_versions SET state_id = @p0 WHERE owner = @p1 AND name = @p2`
-    : `UPDATE sde.sde_versions SET state_id = $1 WHERE owner = $2 AND name = $3`;
+    ? `UPDATE sde.SDE_versions SET state_id = @p0 WHERE owner = @p1 AND name = @p2${guarded ? ' AND state_id = @p3' : ''}`
+    : `UPDATE sde.sde_versions SET state_id = $1 WHERE owner = $2 AND name = $3${guarded ? ' AND state_id = $4' : ''}`;
 
-  const r = await connection.execute(sql, [newStateId, versionOwner, versionName]);
+  const params: unknown[] = [newStateId, versionOwner, versionName];
+  if (guarded) params.push(expectedStateId);
+  const r = await connection.execute(sql, params);
   return r.rowsAffected;
 }
 

@@ -83,10 +83,23 @@ export async function getTableColumnsCached(
  * CLR types are not comparable, so `EXCEPT` over a table containing a Shape
  * column fails outright; cast them to varbinary so the row comparison works.
  */
+const TEXT_TYPES = new Set(['char', 'varchar', 'nchar', 'nvarchar']);
+
 function comparableExpr(driver: 'sqlserver' | 'postgresql', col: ColumnMeta): string {
   const q = quoteId(driver, col.name);
-  if (driver === 'sqlserver' && (col.dataType === 'geometry' || col.dataType === 'geography')) {
-    return `CAST(${q} AS varbinary(max)) AS ${q}`;
+  if (driver === 'sqlserver') {
+    if (col.dataType === 'geometry' || col.dataType === 'geography') {
+      return `CAST(${q} AS varbinary(max)) AS ${q}`;
+    }
+    // Compare text BINARY, not under the column's collation. A fabric's default
+    // collation is typically case- and trailing-space-insensitive, so 'McClury'
+    // would equal 'MCCLURY' and 'MAIN ST ' would equal 'MAIN ST' -- meaning an
+    // editor's capitalisation or whitespace correction compares EQUAL to the
+    // parent's row and gets discarded as redundant. Silent data loss; force a
+    // binary collation so any real difference is seen.
+    if (TEXT_TYPES.has(col.dataType)) {
+      return `${q} COLLATE Latin1_General_BIN2 AS ${q}`;
+    }
   }
   return q;
 }
@@ -137,11 +150,24 @@ export async function selectChangedObjectIds(
   }
 
   const parentList = buildIntegerList(parentStates, 'selectChangedObjectIds.parent');
+  const plain = cols.map((c) => quoteId(driver, c.name)).join(', ');
+  // Compare against the parent's TIP row per OBJECTID, never its whole history.
+  // Matching ANY historical parent row would discard a legitimate edit that
+  // restores a previous value (exactly what the per-op Reverse feature produces)
+  // as though a reconcile had copied it in.
+  //
+  // Rows whose parent version lives only in the BASE table are simply not in
+  // this set, so they come out as "changed" -- the safe direction: a redundant
+  // replay is a no-op, whereas a missed change is lost work.
   const sql = `
+    WITH parentTip AS (
+      SELECT ${plain}, ROW_NUMBER() OVER (PARTITION BY ${oidCol} ORDER BY ${stateCol} DESC) AS rn
+      FROM ${aTable} WHERE ${stateCol} IN (${parentList})
+    )
     SELECT DISTINCT ${oidCol} AS OBJECTID FROM (
       SELECT ${cmp} FROM ${aTable} WHERE ${stateCol} IN (${childList})
       EXCEPT
-      SELECT ${cmp} FROM ${aTable} WHERE ${stateCol} IN (${parentList})
+      SELECT ${cmp} FROM parentTip WHERE rn = 1
     ) AS changed`;
   const rows = await connection.query<{ OBJECTID: number | string }>(sql);
   return rows.map((r) => Number(r.OBJECTID));
@@ -223,6 +249,59 @@ export async function insertDeleteMarkers(
        SELECT ${param}, v.oid, ${param} FROM (VALUES ${validated}) AS v(oid)`;
 
   const res = await connection.execute(sql, [toState]);
+  return res.rowsAffected;
+}
+
+/**
+ * Insert delete markers that supersede the row a version currently resolves to.
+ *
+ * A marker's SDE_STATE_ID must be the state of the row being SUPERSEDED (0 when
+ * that row lives in the base table) and DELETED_AT the state doing the
+ * superseding. Writing (newState, newState) instead -- i.e. "delete the row at
+ * newState" -- targets the A-row just written there, and Esri's *_evw readers
+ * suppress on the add's own state, so the feature disappears from the version
+ * when read through ArcGIS even though egdb's own reader still shows it.
+ *
+ * `supersededFromStates` is the parent's state set: the superseded row is that
+ * OBJECTID's tip within it, or the base table if it has none.
+ */
+export async function insertSupersedeMarkers(
+  connection: IDatabaseConnection,
+  tableInfo: TableInfo,
+  objectIds: number[],
+  supersededFromStates: number[],
+  atState: number,
+): Promise<number> {
+  if (objectIds.length === 0) return 0;
+  const regId = requireRegistrationId(tableInfo);
+  const driver = connection.driver;
+  const qSchema = quoteId(driver, tableInfo.schema);
+  const dTable = `${qSchema}.${quoteId(driver, `D${regId}`)}`;
+  const aTable = `${qSchema}.${quoteId(driver, `a${regId}`)}`;
+  const oidCol = quoteId(driver, 'OBJECTID');
+  const stateCol = quoteId(driver, 'SDE_STATE_ID');
+
+  const validated = buildIntegerList(objectIds, 'insertSupersedeMarkers.oids')
+    .split(',').map((s) => `(${s.trim()})`).join(',');
+  const param = driver === 'sqlserver' ? '@p0' : '$1';
+  const dCols = driver === 'sqlserver'
+    ? '(SDE_STATE_ID, SDE_DELETES_ROW_ID, DELETED_AT)'
+    : '(sde_state_id, sde_deletes_row_id, deleted_at)';
+
+  // COALESCE(..., 0): no parent A-row => the superseded row is the base row.
+  const from = supersededFromStates.length > 0
+    ? `LEFT JOIN (SELECT ${oidCol} AS oid, MAX(${stateCol}) AS st FROM ${aTable}
+         WHERE ${stateCol} IN (${buildIntegerList(supersededFromStates, 'insertSupersedeMarkers.states')})
+         GROUP BY ${oidCol}) p ON p.oid = v.oid`
+    : '';
+  const stExpr = supersededFromStates.length > 0 ? 'COALESCE(p.st, 0)' : '0';
+
+  const sql = `INSERT INTO ${dTable} ${dCols}
+    SELECT ${stExpr}, v.oid, ${param}
+    FROM (VALUES ${validated}) AS v(oid)
+    ${from}`;
+
+  const res = await connection.execute(sql, [atState]);
   return res.rowsAffected;
 }
 
