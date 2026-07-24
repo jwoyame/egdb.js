@@ -48,6 +48,12 @@ async function connectTo(database: string): Promise<SqlServerConnection> {
   return c;
 }
 
+/** A SECOND independent connection (own session) to an already-created scratch DB —
+ * for concurrency tests that need two sessions contending for the same applock. */
+export async function connectRaw(dbName: string): Promise<SqlServerConnection> {
+  return connectTo(dbName);
+}
+
 /**
  * Ensure a scratch database + synthetic schema exist; return a connection to it.
  * Pass a UNIQUE `dbName` per test file — vitest runs files in parallel, and a
