@@ -778,6 +778,79 @@ async function findCollapsePairs(
 }
 
 /**
+ * Compute the full collapse plan from the STATIC post-prune tree in ONE query:
+ * the ordered list of (anchor, deleted-state) pairs the iterative collapse would
+ * produce. This is derivable without iterating because collapse never changes a
+ * surviving state's child count (a branch point keeps its children; a linear
+ * anchor keeps exactly one). A state is COLLAPSED AWAY iff it is not a version
+ * tip, not locked, not state 0, has ≤1 child, AND its parent is a "valid absorbing
+ * target" (non-tip, non-locked, non-zero, exactly one child). Its ANCHOR is the
+ * nearest surviving ancestor (walk up parent_state_id). Emitting (anchor, child)
+ * for every deleted state in ASCENDING state_id order and feeding it to the SAME
+ * per-pair logic reproduces the one-at-a-time result exactly (a child's state_id
+ * always exceeds its parent's, so ascending order = the tip-most edit wins the
+ * per-pair dedupe), without re-running readLockedBranches + findCollapsePairs
+ * after every pair (two recursive CTEs per round → O(states) rounds, ~hours on a
+ * real fabric).
+ */
+async function computeCollapsePlan(
+  connection: IDatabaseConnection,
+  lockedExpanded: Set<number>,
+): Promise<Array<{ parent: number; child: number }>> {
+  const driver = connection.driver;
+  const states = sysTable(driver, 'SDE_states');
+  const versions = sysTable(driver, 'SDE_versions');
+  const sid = col(driver, 'state_id');
+  const pid = col(driver, 'parent_state_id');
+  const rec = driver === 'sqlserver' ? '' : 'RECURSIVE ';
+  const maxrec = driver === 'sqlserver' ? ' OPTION (MAXRECURSION 0)' : '';
+  // -1 sentinel (no state has id -1) so an empty lock set works in BOTH `IN` and
+  // `NOT IN` — `NOT IN (NULL)` would be UNKNOWN and wrongly exclude every row.
+  const lockList = lockedExpanded.size ? buildIntegerList([...lockedExpanded], 'computeCollapsePlan') : '-1';
+  const sql = `
+    WITH ${rec}cc AS (
+      SELECT ${pid} AS p, COUNT(*) AS c FROM ${states} WHERE ${sid} <> 0 GROUP BY ${pid}
+    ),
+    tips AS (SELECT DISTINCT ${sid} AS s FROM ${versions} WHERE ${sid} IS NOT NULL),
+    surv AS (
+      -- A state survives iff it is state 0, a tip, locked, a branch point (≥2
+      -- children), OR its parent is NOT a valid absorbing target — i.e. the
+      -- parent is 0, a tip, locked, or itself a branch point. That last clause is
+      -- essential: the single child of a branch point cannot be collapsed (its
+      -- parent has 2+ children), so it survives and anchors its own run.
+      SELECT s.${sid} AS s FROM ${states} s
+      WHERE s.${sid} = 0
+        OR s.${sid} IN (SELECT s FROM tips)
+        OR s.${sid} IN (${lockList})
+        OR COALESCE((SELECT c FROM cc WHERE cc.p = s.${sid}), 0) >= 2
+        OR s.${pid} = 0
+        OR s.${pid} IN (SELECT s FROM tips)
+        OR s.${pid} IN (${lockList})
+        OR COALESCE((SELECT c FROM cc WHERE cc.p = s.${pid}), 0) >= 2
+    ),
+    del AS (
+      -- Given the survivor rule already folds in validTarget(parent), the
+      -- non-survivors ARE exactly the collapsed-away states. Keep the parent for
+      -- the anchor walk.
+      SELECT s.${sid} AS s, s.${pid} AS par FROM ${states} s
+      WHERE s.${sid} <> 0 AND s.${sid} NOT IN (SELECT s FROM surv)
+    ),
+    anc AS (
+      SELECT d.s AS orig, d.par AS cur,
+             CASE WHEN d.par IN (SELECT s FROM surv) THEN 1 ELSE 0 END AS found
+      FROM del d
+      UNION ALL
+      SELECT a.orig, pc.${pid} AS cur,
+             CASE WHEN pc.${pid} IN (SELECT s FROM surv) THEN 1 ELSE 0 END
+      FROM anc a JOIN ${states} pc ON pc.${sid} = a.cur WHERE a.found = 0
+    )
+    SELECT orig AS child, cur AS anchor FROM anc WHERE found = 1 ORDER BY orig ASC${maxrec}
+  `;
+  const rows = await connection.query<{ child: number | bigint; anchor: number | bigint }>(sql);
+  return rows.map(r => ({ parent: Number(r.anchor), child: Number(r.child) }));
+}
+
+/**
  * Collapse linear runs of states.
  *
  * Note on collapse direction: per spec Section 3.2, child C collapses into
@@ -797,21 +870,16 @@ export async function collapseLineages(
   const versionedTables = tables.filter(t => t.isVersioned && t.registrationId);
   const mvExists = await hasMvtablesModified(connection);
 
-  // Iterate until no more collapses are possible.
-  for (;;) {
-    const lockedExpanded = await readLockedBranches(connection);
-    const pairs = await findCollapsePairs(connection, lockedExpanded);
-    if (pairs.length === 0) break;
-
-    // Collapse exactly ONE pair per round, then recompute. The batch returned by
-    // findCollapsePairs can contain OVERLAPPING pairs on a linear run — e.g.
-    // 1<-2<-3<-4 yields both (1,2) and (2,3). Processing the stale (2,3) after
-    // (1,2) has already deleted state 2 re-points state 4's parent onto a dead
-    // state (dangling parent_state_id — bug N4). Recomputing after each collapse
-    // keeps the pair list live and mirrors the reference model's one-at-a-time
-    // collapse exactly.
-    let didCollapse = false;
-    for (const { parent, child } of pairs.slice(0, 1)) {
+  // Compute locks + the full ordered collapse plan ONCE, then execute the SAME
+  // per-pair logic below for each planned (anchor, child) pair. The plan already
+  // reflects the whole cascade (children ordered by ascending state_id so the
+  // tip-most edit wins the per-pair dedupe), so no per-round recomputation is
+  // needed — the old for(;;) re-ran two recursive CTEs per pair (O(states) rounds,
+  // ~hours on a real fabric). Each pair is still its own atomic transaction.
+  const lockedExpanded = await readLockedBranches(connection);
+  const plan = await computeCollapsePlan(connection, lockedExpanded);
+  {
+    for (const { parent, child } of plan) {
       // ONE transaction for the whole pair — delta rewrites AND metadata — so a
       // failure (e.g. the states_cuk dance below) rolls back atomically instead
       // of leaving the child's edits committed at the parent with the state tree
@@ -925,10 +993,15 @@ export async function collapseLineages(
           `UPDATE ${lineages} SET ${lid} = ${paramRef(driver, 0)} WHERE ${lid} = ${paramRef(driver, 1)}`,
           [parent, child],
         );
-        await connection.execute(
-          `DELETE FROM ${lineages} WHERE ${lname} = ${paramRef(driver, 0)}`,
-          [child],
-        );
+        // N6: do NOT delete closure rows by lineage_name = child. lineage_name
+        // shares the state_id id-space, so on a DIVERGENT fabric the collapsed
+        // child's id can equal a lineage_name still used by a LIVE branch, and
+        // deleting by it would wipe that branch's closure (publish-ETL
+        // invisibility). A collapsed state is never a branch root (branch roots
+        // have ≥2 children → they survive), so on a well-formed fabric there are
+        // no lineage_name = child rows and this delete only ever no-ops; any that
+        // exist on a divergent fabric are left for the closure-repair pass.
+        // Mirrors the prune N6 fix.
         if (mvExists) {
           // SDE_mvtables_modified PK is typically (state_id, registration_id).
           // Same dedupe pattern as SDE_state_lineages above.
@@ -983,14 +1056,11 @@ export async function collapseLineages(
         );
         await connection.commitTransaction();
         result.collapses += 1;
-        didCollapse = true;
       } catch (e) {
         if (connection.inTransaction()) await connection.rollbackTransaction();
         throw e;
       }
     }
-
-    if (!didCollapse) break;
   }
 
   return result;

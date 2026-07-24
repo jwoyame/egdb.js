@@ -264,7 +264,6 @@ describe('pruneStates', () => {
 
 describe('collapseLineages', () => {
   it('runs independent SDE_STATE_ID and DELETED_AT updates per collapse', async () => {
-    let pairsCallCount = 0;
     const { connection, calls } = makeMock({
       executeResponses: [{ match: /./, result: { rowsAffected: 1 } }],
     });
@@ -274,16 +273,9 @@ describe('collapseLineages', () => {
       params?: unknown[],
     ) => {
       const norm = sql.replace(/\s+/g, ' ');
-      if (/UNION/.test(norm) && /SDE_state_locks/.test(norm)) {
-        return [] as T[]; // no locks
-      }
-      if (/INNER JOIN .* p ON p\..*= c\./.test(norm)) {
-        pairsCallCount += 1;
-        if (pairsCallCount === 1) {
-          return [{ parent: 100, child: 101 }] as T[];
-        }
-        return [] as T[]; // second iter, no more pairs
-      }
+      if (/SDE_state_locks/.test(norm)) return [] as T[]; // readLockedBranches: no locks
+      // computeCollapsePlan returns the whole (anchor, child) plan up front.
+      if (/surv AS/.test(norm) && /orig AS child/.test(norm)) return [{ child: 101, anchor: 100 }] as T[];
       return origQuery<T>(sql, params);
     };
 
