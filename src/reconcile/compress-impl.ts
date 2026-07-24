@@ -98,6 +98,63 @@ export async function assertSelfRowInvariant(_connection: IDatabaseConnection): 
   // Intentionally no-op. See countMissingSelfRows() and the comment above.
 }
 
+/** Thrown by `assertCompressPreconditions` when the fabric is not safe to compress. */
+export class CompressPreconditionError extends Error {
+  constructor(public readonly violations: string[]) {
+    super(`compress precondition check failed — refusing to run:\n  - ${violations.join('\n  - ')}`);
+    this.name = 'CompressPreconditionError';
+  }
+}
+
+/**
+ * Hard-abort structural precondition gate (COMPRESS_HARDENING_PLAN.md §5.3,
+ * NIGHTLY_COMPRESS_ROADMAP.md Step B). An UNATTENDED nightly run has no human to
+ * read a warning, so if the fabric is already structurally unsound compress must
+ * REFUSE (throw) rather than operate on it and risk propagating/worsening the
+ * damage — detection-after-commit cannot undo an irreversible base write. Runs
+ * before any phase. Checks only unambiguous, corruption-relevant invariants:
+ *   - state 0 (base) present + the load-bearing (0,0) closure row;
+ *   - no dangling parent_state_id (C6 — a dangling pointer can otherwise fool a
+ *     parent-walk gate into passing while the tree is corrupt);
+ *   - states_cuk holds (no duplicated (parent_state_id, lineage_name)) — catches
+ *     a fabric whose UNIQUE constraint was dropped, which collapse's lineage_name
+ *     dance and the whole state tree rely on.
+ * (The per-version closure-divergence threshold gate is graduation-specific and
+ * only meaningful once closure repair — Step D — defines an acceptable delta; it
+ * is intentionally NOT enforced here yet.)
+ */
+export async function assertCompressPreconditions(connection: IDatabaseConnection): Promise<void> {
+  const driver = connection.driver;
+  const states = sysTable(driver, 'SDE_states');
+  const lineages = sysTable(driver, 'SDE_state_lineages');
+  const sid = col(driver, 'state_id');
+  const pid = col(driver, 'parent_state_id');
+  const lid = col(driver, 'lineage_id');
+  const lname = col(driver, 'lineage_name');
+  const violations: string[] = [];
+
+  const s0 = await connection.query(`SELECT 1 FROM ${states} WHERE ${sid} = 0`);
+  if (s0.length === 0) violations.push('state 0 (base) is missing');
+
+  const l0 = await connection.query(`SELECT 1 FROM ${lineages} WHERE ${lname} = 0 AND ${lid} = 0`);
+  if (l0.length === 0) violations.push('the (0,0) SDE_state_lineages row is missing');
+
+  const dangling = await connection.query<{ c: number | bigint }>(
+    `SELECT COUNT(*) AS c FROM ${states} s WHERE s.${pid} <> 0
+       AND NOT EXISTS (SELECT 1 FROM ${states} p WHERE p.${sid} = s.${pid})`);
+  const nd = Number(dangling[0]?.c ?? 0);
+  if (nd > 0) violations.push(`${nd} state(s) have a dangling parent_state_id (parent row does not exist)`);
+
+  const dup = await connection.query<{ c: number | bigint }>(
+    `SELECT COUNT(*) AS c FROM (
+       SELECT ${pid} AS p, ${lname} AS l FROM ${states} GROUP BY ${pid}, ${lname} HAVING COUNT(*) > 1
+     ) d`);
+  const ndup = Number(dup[0]?.c ?? 0);
+  if (ndup > 0) violations.push(`${ndup} (parent_state_id, lineage_name) pair(s) are duplicated (states_cuk violated)`);
+
+  if (violations.length > 0) throw new CompressPreconditionError(violations);
+}
+
 // ---------------------------------------------------------------------------
 // Lock and lineage discovery
 // ---------------------------------------------------------------------------

@@ -473,6 +473,16 @@ export interface CompressOptions {
    * is exempt (read-only) and does not require this.
    */
   acknowledgeExperimentalUnsafe?: boolean;
+  /**
+   * Which phases to run. When provided, ONLY the phases set to `true` run
+   * (`{ prune: true }` = prune only). When OMITTED, defaults to PRUNE-ONLY — the
+   * safe default: prune only removes states/deltas the authoritative parent-walk
+   * already ignores, whereas graduation writes the base table irreversibly and
+   * collapse rewrites the state tree. The incremental rollout (prune-only first,
+   * then +collapse, then +graduation once closure repair is in) is expressed by
+   * passing explicit `phases`. See openparcels/handoff/NIGHTLY_COMPRESS_ROADMAP.md.
+   */
+  phases?: { prune?: boolean; graduate?: boolean; collapse?: boolean };
 }
 
 /** Compression result */

@@ -61,12 +61,31 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
     const before18 = await snapshotVisible(conn, 18);
     const before19 = await snapshotVisible(conn, 19);
 
-    const res = await egdb.compress({ acknowledgeExperimentalUnsafe: true });
+    const res = await egdb.compress({ acknowledgeExperimentalUnsafe: true, phases: { prune: true, graduate: true, collapse: true } });
     expect(res).toBeDefined();
 
     assertVisibleDataUnchanged(before18, await snapshotVisible(conn, 18));
     assertVisibleDataUnchanged(before19, await snapshotVisible(conn, 19));
     await assertStructuralInvariants(conn);
+  });
+
+  it('phases: omitted defaults to prune-only; explicit toggles run exactly what is set', async () => {
+    // Prune-only default must NOT graduate (base tables untouched) and must NOT
+    // collapse (state count only drops by pruned states, not collapsed ones).
+    await materialize(conn, generate(72, 18).fabric);
+    await copy18to19(conn);
+    const base18Before = await conn.query<{ n: number }>(`SELECT COUNT(*) AS n FROM dbo.base18;`);
+    const r = await egdb.compress({ acknowledgeExperimentalUnsafe: true }); // omitted → prune-only
+    expect(r.graduatedUpserts, 'prune-only must not graduate').toBe(0);
+    expect(r.lineagesCollapsed, 'prune-only must not collapse').toBe(0);
+    const base18After = await conn.query<{ n: number }>(`SELECT COUNT(*) AS n FROM dbo.base18;`);
+    expect(Number(base18After[0]!.n), 'base unchanged by prune-only').toBe(Number(base18Before[0]!.n));
+
+    // Explicit collapse-only: no graduation, but collapses may occur.
+    await resetFabric(conn); await materialize(conn, generate(72, 18).fabric);
+    const r2 = await egdb.compress({ acknowledgeExperimentalUnsafe: true, phases: { collapse: true } });
+    expect(r2.graduatedUpserts, 'collapse-only must not graduate').toBe(0);
+    expect(r2.statesRemoved, 'collapse-only must not prune').toBe(0);
   });
 
   it('N2: scoping graduation to one table still prunes/collapses the excluded one safely', async () => {
@@ -77,7 +96,7 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
 
     // Graduate base18 only; prune & collapse must still run over base19 (N2) so it
     // is never left with delta rows tagged to a pruned/collapsed-away state.
-    await egdb.compress({ acknowledgeExperimentalUnsafe: true, tables: ['base18'] });
+    await egdb.compress({ acknowledgeExperimentalUnsafe: true, tables: ['base18'], phases: { prune: true, graduate: true, collapse: true } });
 
     assertVisibleDataUnchanged(before18, await snapshotVisible(conn, 18));
     assertVisibleDataUnchanged(before19, await snapshotVisible(conn, 19));

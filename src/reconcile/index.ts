@@ -83,6 +83,8 @@ export {
   pruneStates,
   collapseLineages,
   InconsistentLineageError,
+  assertCompressPreconditions,
+  CompressPreconditionError,
 } from './compress-impl';
 export type {
   GraduateTableResult,

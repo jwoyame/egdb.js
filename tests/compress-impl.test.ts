@@ -275,7 +275,7 @@ describe('collapseLineages', () => {
       const norm = sql.replace(/\s+/g, ' ');
       if (/SDE_state_locks/.test(norm)) return [] as T[]; // readLockedBranches: no locks
       // computeCollapsePlan returns the whole (anchor, child) plan up front.
-      if (/surv AS/.test(norm) && /orig AS child/.test(norm)) return [{ child: 101, anchor: 100 }] as T[];
+      if (/surv AS/.test(norm) && /st AS child, anchor/.test(norm)) return [{ child: 101, anchor: 100 }] as T[];
       return origQuery<T>(sql, params);
     };
 

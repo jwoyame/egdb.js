@@ -57,6 +57,7 @@ import {
   graduateTable,
   pruneStates,
   collapseLineages,
+  assertCompressPreconditions,
 } from './reconcile';
 import type { GraduateTableResult } from './reconcile';
 import type { StaleLockCleanupResult } from './reconcile';
@@ -1641,6 +1642,18 @@ export class EnterpriseGeodatabase {
       throw new Error('compress() must not be called inside an open transaction.');
     }
 
+    // Hard-abort precondition gate: refuse to run on a structurally unsound fabric
+    // (dangling parent_state_id, missing state 0 / (0,0) closure row, or a
+    // states_cuk violation). An unattended run must not operate on a corrupt tree.
+    await assertCompressPreconditions(this.connection);
+
+    // Phase selection. Explicit `phases` runs exactly what's set true; omitted
+    // defaults to PRUNE-ONLY (the safe default — see CompressOptions.phases).
+    const phases = options?.phases ?? { prune: true };
+    const runPrune = !!phases.prune;
+    const runGraduate = !!phases.graduate;
+    const runCollapse = !!phases.collapse;
+
     const allTables = await this.listTables();
     const allVersioned = allTables.filter(t => t.isVersioned);
     // N2 (COMPRESS_HARDENING_PLAN.md): `options.tables` may ONLY scope graduation.
@@ -1657,40 +1670,49 @@ export class EnterpriseGeodatabase {
     // Phase 3 (Esri terminology): graduate delta rows into base tables.
     // Per-table, SERIALIZABLE so the in-fence subset revalidation and the
     // base writes form a single critical section against concurrent
-    // createVersion.
-    const graduableSnapshot = await computeGraduablePrefix(this.connection);
+    // createVersion. Only computed/run when graduation is enabled — it locks
+    // SDE_versions, so skip that side effect entirely when off.
     const columnCache = new Map<string, string[]>();
     const graduationByTable: GraduateTableResult[] = [];
     let graduatedUpserts = 0;
     let graduatedDeletes = 0;
     let totalAddsRemoved = 0;
     let totalDeletesRemoved = 0;
-    for (const t of tables) {
-      const wasInTx = this.connection.inTransaction();
-      if (!wasInTx) await this.connection.beginTransaction({ isolation: 'serializable' });
-      try {
-        const r = await graduateTable(this.connection, t, graduableSnapshot, columnCache);
-        if (!wasInTx) await this.connection.commitTransaction();
-        graduationByTable.push(r);
-        graduatedUpserts += r.upserts;
-        graduatedDeletes += r.deletes;
-        totalAddsRemoved += r.aRowsRemoved;
-        totalDeletesRemoved += r.dRowsRemoved;
-      } catch (e) {
-        if (!wasInTx && this.connection.inTransaction()) {
-          await this.connection.rollbackTransaction();
+    if (runGraduate) {
+      const graduableSnapshot = await computeGraduablePrefix(this.connection);
+      for (const t of tables) {
+        const wasInTx = this.connection.inTransaction();
+        if (!wasInTx) await this.connection.beginTransaction({ isolation: 'serializable' });
+        try {
+          const r = await graduateTable(this.connection, t, graduableSnapshot, columnCache);
+          if (!wasInTx) await this.connection.commitTransaction();
+          graduationByTable.push(r);
+          graduatedUpserts += r.upserts;
+          graduatedDeletes += r.deletes;
+          totalAddsRemoved += r.aRowsRemoved;
+          totalDeletesRemoved += r.dRowsRemoved;
+        } catch (e) {
+          if (!wasInTx && this.connection.inTransaction()) {
+            await this.connection.rollbackTransaction();
+          }
+          throw e;
         }
-        throw e;
       }
     }
 
     // Phase 1: prune unreferenced, non-branch-point, unlocked states.
-    const pruneResult = await pruneStates(this.connection, allVersioned);
-    totalAddsRemoved += pruneResult.deltaRowsRemoved;
-    const statesRemoved = pruneResult.statesRemoved;
+    let statesRemoved = 0;
+    let pruneResult = { statesRemoved: 0, deltaRowsRemoved: 0, statesSkipped: 0, deltaRowsLostToLateLocks: 0 };
+    if (runPrune) {
+      pruneResult = await pruneStates(this.connection, allVersioned);
+      totalAddsRemoved += pruneResult.deltaRowsRemoved;
+      statesRemoved = pruneResult.statesRemoved;
+    }
 
     // Phase 2: collapse linear state chains (child into parent).
-    const collapseResult = await collapseLineages(this.connection, allVersioned);
+    const collapseResult = runCollapse
+      ? await collapseLineages(this.connection, allVersioned)
+      : { collapses: 0, rowsRewritten: 0 };
 
     const allTablesSkipped = graduationByTable.length > 0
       && graduationByTable.every(t => t.status === 'skipped-version-set-changed');
