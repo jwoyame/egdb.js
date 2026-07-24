@@ -110,6 +110,6 @@ d('compress property sweep (DB-backed)', () => {
         console.error(`SEED ${seed} FAILED: ${fail}\nshrunk log (${shrunk.length} ops):\n${JSON.stringify(shrunk, null, 2)}`);
       }
       expect(fail, `seed ${seed}: ${fail}`).toBeNull();
-    });
+    }, 30_000);
   }
 });

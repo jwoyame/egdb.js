@@ -283,7 +283,6 @@ export async function graduateTable(
   columnCache?: ColumnCache,
 ): Promise<GraduateTableResult> {
   const cache = columnCache ?? new Map<string, string[]>();
-  const driver = connection.driver;
   const result: GraduateTableResult = {
     table: table.name,
     status: 'no-graduable-rows',
@@ -295,6 +294,31 @@ export async function graduateTable(
   };
 
   if (!table.isVersioned || !table.registrationId) return result;
+
+  // Graduation needs a transaction: the SDE_versions fence lock (below) only holds
+  // inside one, and the graduable-prefix temp table (materializeStateSet) must
+  // survive across the follow-up statements on one pooled session. Manage our own
+  // when the caller (compress) has not already opened one.
+  const ownTx = !connection.inTransaction();
+  if (ownTx) await connection.beginTransaction({ isolation: 'serializable' });
+  try {
+    await graduateTableBody(connection, table, graduableSnapshot, cache, result);
+    if (ownTx) await connection.commitTransaction();
+  } catch (e) {
+    if (ownTx && connection.inTransaction()) await connection.rollbackTransaction();
+    throw e;
+  }
+  return result;
+}
+
+async function graduateTableBody(
+  connection: IDatabaseConnection,
+  table: TableInfo,
+  graduableSnapshot: Set<number>,
+  cache: ColumnCache,
+  result: GraduateTableResult,
+): Promise<void> {
+  const driver = connection.driver;
 
   // Take a shared lock on SDE_versions so concurrent createVersion blocks
   // until this txn commits. Without this, a snapshot-isolation read can be
@@ -321,12 +345,12 @@ export async function graduateTable(
   const recomputed = await computeGraduablePrefix(connection);
   if (!isSubsetOf(graduableSnapshot, recomputed)) {
     result.status = 'skipped-version-set-changed';
-    return result;
+    return;
   }
 
-  if (graduableSnapshot.size === 0) return result;
+  if (graduableSnapshot.size === 0) return;
 
-  const regId = table.registrationId;
+  const regId = table.registrationId!;
   const qSchema = qid(driver, table.schema);
   const aTable = `${qSchema}.${qid(driver, `a${regId}`)}`;
   const dTable = `${qSchema}.${qid(driver, `D${regId}`)}`;
@@ -335,7 +359,12 @@ export async function graduateTable(
   const sidCol = col(driver, 'SDE_STATE_ID');
   const drowCol = col(driver, 'SDE_DELETES_ROW_ID');
   const delAtCol = col(driver, 'DELETED_AT');
-  const graduableList = buildIntegerList(Array.from(graduableSnapshot), 'graduateTable');
+  // Materialise the graduable prefix into an indexed staging table and reference
+  // it as a semi-join. Inlining the ids as a literal IN-list overflows the SQL
+  // Server query planner (error 8623) once the prefix is large — a real fabric's
+  // shared prefix is ~10k states and winnersSub embeds the list ~9×.
+  const gradRef = await materializeStateSet(connection, driver, Array.from(graduableSnapshot));
+  const graduableList = `SELECT sid FROM ${gradRef}`;
 
   // The graduable prefix is a single chain (computeGraduablePrefix intersects
   // the tips' parent_state_id root-paths), so within it states are totally
@@ -426,8 +455,8 @@ export async function graduateTable(
     `DELETE FROM ${dTable} WHERE ${sidCol} IN (${graduableList}) OR ${delAtCol} IN (${graduableList})`);
   result.dRowsRemoved = delD.rowsAffected;
 
+  await dropStateSet(connection, driver);
   result.status = 'graduated';
-  return result;
 }
 
 /**
@@ -507,6 +536,50 @@ async function baseObjectIdIsIdentity(
   return rows.length > 0 && (rows[0]!.is_identity === 1 || rows[0]!.is_identity === true);
 }
 
+// Staging table lives in the `sde` schema — the schema the compress login
+// unambiguously owns (system tables are `sde.*`), avoiding a third-schema CREATE
+// permission assumption on `dbo`.
+const GRAD_STAGE = { sqlserver: 'sde.egdb_grad_stage', postgresql: 'egdb_grad_stage' } as const;
+
+/**
+ * Materialise a (potentially large) state-id set into an indexed staging table
+ * and return a SQL reference to it, so callers can write
+ * `... IN (SELECT sid FROM <ref>)` instead of inlining thousands of literals.
+ * A literal IN-list of a real fabric's graduable prefix (~10k states), embedded
+ * ~9× in the winner query, overflows the SQL Server query planner (error 8623).
+ *
+ * A REAL (catalog) table, not a #temp: with this connection's pooling a session
+ * temp table does NOT survive across separate requests (even inside a
+ * transaction), whereas a catalog table does. It is created fresh (drop-if-
+ * exists), used, then dropped by `dropStateSet`; a crash rolls it back with the
+ * enclosing transaction. The compress login therefore needs CREATE TABLE rights
+ * in the staging schema (the SDE owner has them).
+ */
+async function materializeStateSet(connection: IDatabaseConnection, driver: Driver, ids: number[]): Promise<string> {
+  const ref = GRAD_STAGE[driver];
+  if (driver === 'sqlserver') {
+    await connection.execute(`IF OBJECT_ID('${ref}') IS NOT NULL DROP TABLE ${ref}; CREATE TABLE ${ref} (sid BIGINT NOT NULL PRIMARY KEY);`);
+  } else {
+    await connection.execute(`DROP TABLE IF EXISTS ${ref}; CREATE TABLE ${ref} (sid BIGINT NOT NULL PRIMARY KEY);`);
+  }
+  const CHUNK = 1000; // SQL Server caps a VALUES row-constructor at 1000 rows.
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const values = ids.slice(i, i + CHUNK).map(v => {
+      if (!Number.isInteger(v)) throw new Error(`materializeStateSet: non-integer state id ${v}`);
+      return `(${v})`;
+    }).join(',');
+    await connection.execute(`INSERT INTO ${ref} (sid) VALUES ${values}`);
+  }
+  return ref;
+}
+
+async function dropStateSet(connection: IDatabaseConnection, driver: Driver): Promise<void> {
+  const ref = GRAD_STAGE[driver];
+  await connection.execute(driver === 'sqlserver'
+    ? `IF OBJECT_ID('${ref}') IS NOT NULL DROP TABLE ${ref};`
+    : `DROP TABLE IF EXISTS ${ref};`);
+}
+
 // ---------------------------------------------------------------------------
 // Prune states
 // ---------------------------------------------------------------------------
@@ -532,31 +605,20 @@ export interface PruneResult {
 }
 
 /**
- * Find prune-candidate states per spec Section 3.1:
- *   - NOT a version tip
- *   - NOT in any version's lineage closure
- *   - has at most one direct child (not a branch point)
- *   - NOT in any locked branch's expanded closure
+ * All non-zero states NOT reachable as an ancestor of any version tip, decided by
+ * the AUTHORITATIVE parent_state_id walk (never the SDE_state_lineages closure —
+ * COMPRESS_HARDENING_PLAN.md §5.1). The unreachable set is downward-closed (every
+ * descendant of an unreachable state is itself unreachable, since a reachable
+ * descendant would make its ancestor reachable), so it can be removed WHOLESALE
+ * without ever orphaning a survivor: any state that stays is reachable, and
+ * reachability is ancestor-closed, so its entire parent chain stays too.
  */
-async function findPruneCandidates(
-  connection: IDatabaseConnection,
-  lockedExpanded: Set<number>,
-): Promise<number[]> {
+async function findUnreachableStates(connection: IDatabaseConnection): Promise<number[]> {
   const driver = connection.driver;
   const states = sysTable(driver, 'SDE_states');
   const versions = sysTable(driver, 'SDE_versions');
   const sid = col(driver, 'state_id');
   const pid = col(driver, 'parent_state_id');
-
-  // Root fix (COMPRESS_HARDENING_PLAN.md §5.1): "referenced" is decided by the
-  // AUTHORITATIVE parent_state_id walk, NOT the SDE_state_lineages closure. A
-  // state is a prune candidate iff it is:
-  //   - NOT reachable as an ancestor of any version tip (the parent-walk union),
-  //   - NOT the base state 0 (N5),
-  //   - a LEAF (no child) — leaves-only + iterate never orphans a child (C4/N4),
-  //   - not in a locked branch (filtered below).
-  // Using the parent walk makes prune correct regardless of closure health, and
-  // leaves-only guarantees no dangling parent_state_id can result.
   const rec = driver === 'sqlserver' ? '' : 'RECURSIVE ';
   const maxrec = driver === 'sqlserver' ? ' OPTION (MAXRECURSION 0)' : '';
   const sql = `
@@ -569,23 +631,34 @@ async function findPruneCandidates(
     )
     SELECT s.${sid} AS state_id
     FROM ${states} s
-    WHERE s.${sid} <> 0
-      AND s.${sid} NOT IN (SELECT rs FROM reachable)
-      AND NOT EXISTS (SELECT 1 FROM ${states} c WHERE c.${pid} = s.${sid})${maxrec}
+    WHERE s.${sid} <> 0 AND s.${sid} NOT IN (SELECT rs FROM reachable)${maxrec}
   `;
   const rows = await connection.query<{ state_id: number | bigint }>(sql);
-  return rows
-    .map(r => Number(r.state_id))
-    .filter(s => !lockedExpanded.has(s));
+  return rows.map(r => Number(r.state_id));
 }
 
 /**
- * Prune unreferenced, non-branch-point, unlocked states.
+ * Prune every unreachable, unlocked state in ONE atomic pass.
  *
- * Per spec Section 16 step 4 + Section 7: the closure/lock recheck runs
- * INSIDE each per-table delta-row deletion transaction, BEFORE the DELETE.
- * A separate metadata transaction at the end deletes SDE_state_lineages /
- * SDE_states / SDE_mvtables_modified after every table has committed.
+ * The prunable set = {unreachable from any tip} − {locked branches}. Because the
+ * unreachable set is downward-closed and readLockedBranches returns each lock's
+ * ancestors AND descendants, deleting the whole set at once leaves NO dangling
+ * parent_state_id: every surviving state is reachable or locked, and both of those
+ * sets are parent-closed, so no survivor points at a deleted state. Directly-locked
+ * states are inside lockedExpanded, so none of them is deleted — the SDE_state_locks
+ * → SDE_states FK is never violated.
+ *
+ * This replaces the previous leaves-only-and-iterate loop, which re-ran
+ * readLockedBranches + candidate discovery (two recursive CTEs over ALL states)
+ * once PER TABLE PER STATE — O(dead-depth × fabric-scan), measured at ~2h and
+ * still unfinished on a real 11.5k-state fabric. The set-based delete finishes in
+ * seconds.
+ *
+ * Runs in a single SERIALIZABLE transaction (unless the caller already owns one):
+ * readLockedBranches inside the fence serialises against a concurrent
+ * EditSession.start that would otherwise lock a state mid-prune, and the delta +
+ * metadata deletes commit atomically. With no partial-commit window there is no
+ * late-lock race, so statesSkipped / deltaRowsLostToLateLocks stay 0.
  */
 export async function pruneStates(
   connection: IDatabaseConnection,
@@ -597,127 +670,62 @@ export async function pruneStates(
     statesSkipped: 0,
     deltaRowsLostToLateLocks: 0,
   };
-  // Pre-check ONCE so we never raise a missing-table error mid-transaction
-  // (PostgreSQL would poison the transaction; SQL Server would just throw
-  // and lose the metadata-tx work). See `hasMvtablesModified()`.
-  const mvExists = await hasMvtablesModified(connection);
   const driver = connection.driver;
-
+  // Pre-check ONCE (a missing table mid-transaction poisons a PG transaction).
+  const mvExists = await hasMvtablesModified(connection);
   const versionedTables = tables.filter(t => t.isVersioned && t.registrationId);
 
-  // Leaves-only prune reclaims one tree level per pass, so iterate until a pass
-  // makes no progress. Recomputing candidates + lock expansion each round picks
-  // up newly-exposed leaves and respects any lock that landed during the run.
-  for (;;) {
-  const removedBefore = result.statesRemoved;
-  const lockedExpanded = await readLockedBranches(connection);
-  const candidates = await findPruneCandidates(connection, lockedExpanded);
-  if (candidates.length === 0) break;
+  const wasTx = connection.inTransaction();
+  if (!wasTx) await connection.beginTransaction({ isolation: 'serializable' });
+  try {
+    const lockedExpanded = await readLockedBranches(connection);
+    const unreachable = await findUnreachableStates(connection);
+    const toPrune = unreachable.filter(s => !lockedExpanded.has(s));
+    if (toPrune.length === 0) {
+      if (!wasTx) await connection.commitTransaction();
+      return result;
+    }
 
-  for (const stateId of candidates) {
-    let stateStillEligible = true;
-    let deltaRowsDeletedForThisState = 0;
+    const lineages = sysTable(driver, 'SDE_state_lineages');
+    const states = sysTable(driver, 'SDE_states');
+    const mv = sysTable(driver, 'SDE_mvtables_modified');
+    const sidM = col(driver, 'state_id');
+    const lid = col(driver, 'lineage_id');
+    const sidCol = col(driver, 'SDE_STATE_ID');
+    const delAtCol = col(driver, 'DELETED_AT');
 
-    // Per-table delta-row deletion. Each table is its own transaction, with
-    // an in-fence recheck of the prune predicate.
-    for (const table of versionedTables) {
-      const regId = table.registrationId!;
-      const qSchema = qid(driver, table.schema);
-      const aTable = `${qSchema}.${qid(driver, `a${regId}`)}`;
-      const dTable = `${qSchema}.${qid(driver, `D${regId}`)}`;
-      const sidCol = col(driver, 'SDE_STATE_ID');
-      const delAtCol = col(driver, 'DELETED_AT');
-
-      try {
-        await connection.beginTransaction();
-        const recheckLocks = await readLockedBranches(connection);
-        const recheckCandidates = new Set(await findPruneCandidates(connection, recheckLocks));
-        if (!recheckCandidates.has(stateId)) {
-          await connection.rollbackTransaction();
-          stateStillEligible = false;
-          break;
-        }
-        const delA = await connection.execute(
-          `DELETE FROM ${aTable} WHERE ${sidCol} = ${paramRef(driver, 0)}`,
-          [stateId],
-        );
+    // Chunk the id list to stay within SQL Server's IN-expression limits.
+    const CHUNK = 1000;
+    for (let i = 0; i < toPrune.length; i += CHUNK) {
+      const list = buildIntegerList(toPrune.slice(i, i + CHUNK), 'pruneStates');
+      for (const table of versionedTables) {
+        const regId = table.registrationId!;
+        const qSchema = qid(driver, table.schema);
+        const aTable = `${qSchema}.${qid(driver, `a${regId}`)}`;
+        const dTable = `${qSchema}.${qid(driver, `D${regId}`)}`;
+        const delA = await connection.execute(`DELETE FROM ${aTable} WHERE ${sidCol} IN (${list})`);
         result.deltaRowsRemoved += delA.rowsAffected;
-        deltaRowsDeletedForThisState += delA.rowsAffected;
-        // Use two distinct param slots — even though SQL Server's @p0 can be
-        // referenced twice safely with one bound param, the mssql driver
-        // registers exactly the params passed in the array, and mismatch
-        // (two params bound but one referenced) can throw "too many
-        // arguments" depending on driver config. Bind two; reference two.
-        const delD = await connection.execute(
-          `DELETE FROM ${dTable} WHERE ${sidCol} = ${paramRef(driver, 0)} OR ${delAtCol} = ${paramRef(driver, 1)}`,
-          [stateId, stateId],
-        );
+        const delD = await connection.execute(`DELETE FROM ${dTable} WHERE ${sidCol} IN (${list}) OR ${delAtCol} IN (${list})`);
         result.deltaRowsRemoved += delD.rowsAffected;
-        deltaRowsDeletedForThisState += delD.rowsAffected;
-        await connection.commitTransaction();
-      } catch (e) {
-        if (connection.inTransaction()) await connection.rollbackTransaction();
-        throw e;
       }
+      // Metadata: lineages → mvtables_modified → states (spec Section 16 order).
+      // Delete closure rows by lineage_id ONLY, never by lineage_name (N6). A
+      // lineage_name is allocated from the same id-space as state_id, so a pruned
+      // state's id can collide with a lineage_name still in use by a LIVE branch;
+      // deleting by lineage_name would wipe that live branch's whole closure (the
+      // publish-ETL / _evw invisibility failure). A pruned state's own now-orphaned
+      // lineage_name rows are harmless (nothing reads a dead lineage) and are left
+      // for the separate closure-repair pass. Mirrors compressRef's prune exactly.
+      await connection.execute(`DELETE FROM ${lineages} WHERE ${lid} IN (${list})`);
+      if (mvExists) await connection.execute(`DELETE FROM ${mv} WHERE ${sidM} IN (${list})`);
+      const delS = await connection.execute(`DELETE FROM ${states} WHERE ${sidM} IN (${list})`);
+      result.statesRemoved += delS.rowsAffected;
     }
-
-    if (!stateStillEligible) {
-      result.statesSkipped += 1;
-      continue;
-    }
-
-    // Final metadata transaction: re-evaluate one more time, then drop the
-    // state row. Order matters per Section 16: lineages → mvtables_modified
-    // → states.
-    try {
-      await connection.beginTransaction();
-      const recheckLocks = await readLockedBranches(connection);
-      const recheckCandidates = new Set(await findPruneCandidates(connection, recheckLocks));
-      if (!recheckCandidates.has(stateId)) {
-        await connection.rollbackTransaction();
-        result.statesSkipped += 1;
-        // The per-table delta-row deletes have already committed; we
-        // cannot un-do them here. Surface the count so operators can
-        // detect concurrent EditSession.start races during compress.
-        if (deltaRowsDeletedForThisState > 0) {
-          result.deltaRowsLostToLateLocks += deltaRowsDeletedForThisState;
-        }
-        continue;
-      }
-      const lineages = sysTable(driver, 'SDE_state_lineages');
-      const states = sysTable(driver, 'SDE_states');
-      const mv = sysTable(driver, 'SDE_mvtables_modified');
-      const lid = col(driver, 'lineage_id');
-      const lname = col(driver, 'lineage_name');
-      const sidM = col(driver, 'state_id');
-
-      // Same param-binding rule as above: two slots, two refs.
-      await connection.execute(
-        `DELETE FROM ${lineages} WHERE ${lid} = ${paramRef(driver, 0)} OR ${lname} = ${paramRef(driver, 1)}`,
-        [stateId, stateId],
-      );
-      if (mvExists) {
-        await connection.execute(
-          `DELETE FROM ${mv} WHERE ${sidM} = ${paramRef(driver, 0)}`,
-          [stateId],
-        );
-      }
-      const del = await connection.execute(
-        `DELETE FROM ${states} WHERE ${sidM} = ${paramRef(driver, 0)}`,
-        [stateId],
-      );
-      result.statesRemoved += del.rowsAffected;
-      await connection.commitTransaction();
-    } catch (e) {
-      if (connection.inTransaction()) await connection.rollbackTransaction();
-      throw e;
-    }
+    if (!wasTx) await connection.commitTransaction();
+  } catch (e) {
+    if (!wasTx && connection.inTransaction()) await connection.rollbackTransaction();
+    throw e;
   }
-  // Stop if this pass removed nothing (e.g. everything left is locked) —
-  // otherwise the outer loop would spin on the same non-deletable candidates.
-  if (result.statesRemoved === removedBefore) break;
-  }
-
   return result;
 }
 

@@ -175,11 +175,12 @@ describe('graduateTable - subset revalidation', () => {
 });
 
 describe('pruneStates', () => {
-  it('does nothing when no candidates exist', async () => {
+  it('does nothing when there are no unreachable states', async () => {
     const { connection } = makeMock({
       queryResponses: [
-        { match: /SELECT state_id AS state_id FROM sde.SDE_state_locks UNION/, rows: [] },
-        { match: /FROM sde.SDE_states s WHERE/, rows: [] }, // no candidates
+        { match: /SDE_mvtables_modified/, rows: [] },  // hasMvtablesModified → false
+        { match: /SDE_state_locks/, rows: [] },        // readLockedBranches → no locks
+        { match: /reachable AS/, rows: [] },           // findUnreachableStates → none
       ],
     });
     const result = await pruneStates(connection, []);
@@ -187,115 +188,77 @@ describe('pruneStates', () => {
     expect(result.deltaRowsRemoved).toBe(0);
   });
 
-  it('decides prune candidates by the parent_state_id walk, not the closure (root fix)', async () => {
-    // COMPRESS_HARDENING_PLAN.md §5.1: prune candidacy is judged by the
-    // authoritative parent_state_id walk (a `reachable` recursive CTE), never by
-    // the SDE_state_lineages closure (which has diverged on the live fabric).
-    // Candidates must also be leaves (no child) and exclude the base state 0.
-    let candidateSqls: string[] = [];
+  it('decides prunable states by the parent_state_id walk, not the closure (root fix)', async () => {
+    // COMPRESS_HARDENING_PLAN.md §5.1: prunable = unreachable-from-any-tip via the
+    // authoritative `reachable` recursive CTE, never the SDE_state_lineages
+    // closure. The whole unreachable set is removed at once (no leaves-only filter).
+    const seen: string[] = [];
     const { connection } = makeMock({
       queryResponses: [
-        { match: /UNION/, rows: [] }, // no locks
-        { match: /FROM sde.SDE_states s\b/, rows: [] }, // no candidates
+        { match: /SDE_mvtables_modified/, rows: [] },
+        { match: /SDE_state_locks/, rows: [] },
+        { match: /reachable AS/, rows: [] },
       ],
     });
     const origQuery = connection.query.bind(connection);
-    connection.query = async <T = Record<string, unknown>>(
-      sql: string,
-      params?: unknown[],
-    ) => {
+    connection.query = async <T = Record<string, unknown>>(sql: string, params?: unknown[]) => {
       const norm = sql.replace(/\s+/g, ' ');
-      if (/reachable AS/.test(norm) && /FROM sde.SDE_states s\b/.test(norm)) candidateSqls.push(norm);
+      if (/reachable AS/.test(norm) && /FROM sde.SDE_states s\b/.test(norm)) seen.push(norm);
       return origQuery<T>(sql, params);
     };
     await pruneStates(connection, []);
-    expect(candidateSqls.length).toBeGreaterThan(0);
-    const sql = candidateSqls[0]!;
+    expect(seen.length).toBeGreaterThan(0);
+    const sql = seen[0]!;
     expect(sql).toMatch(/reachable AS \( SELECT/);
     expect(sql).toMatch(/JOIN reachable r ON st.state_id = r.rp/);
-    expect(sql).toMatch(/NOT EXISTS \(SELECT 1 FROM sde.SDE_states c WHERE c.parent_state_id = s.state_id\)/);
-    expect(sql).toMatch(/s.state_id <> 0/);
-    expect(sql).not.toMatch(/JOIN sde.SDE_states vs ON vs.lineage_name = sl.lineage_name/);
+    expect(sql).toMatch(/s.state_id <> 0 AND s.state_id NOT IN \(SELECT rs FROM reachable\)/);
+    expect(sql).not.toMatch(/lineage_name/); // never the closure
   });
 
-  it('binds two params per stateId for the OR-on-two-cols DELETEs', async () => {
-    // Regression for the @p0/@p0 vs [stateId, stateId] mismatch. The DELETE
-    // on the D-table references SDE_STATE_ID and DELETED_AT; the metadata
-    // DELETE on SDE_state_lineages references lineage_id and lineage_name.
-    // Both must use TWO distinct param refs (@p0/@p1 or $1/$2) so the
-    // param-binding count matches what's in the SQL string.
-    let candidatesReturned = false;
+  it('deletes the whole unreachable set with batched IN-list DELETEs', async () => {
     const { connection, calls } = makeMock({
       driver: 'sqlserver',
-      executeResponses: [{ match: /./, result: { rowsAffected: 0 } }],
-    });
-    const origQuery = connection.query.bind(connection);
-    connection.query = async <T = Record<string, unknown>>(
-      sql: string,
-      params?: unknown[],
-    ) => {
-      const norm = sql.replace(/\s+/g, ' ');
-      if (/UNION/.test(norm) && /SDE_state_locks/.test(norm)) {
-        return [] as T[];
-      }
-      if (/FROM sde.SDE_states s WHERE/.test(norm)) {
-        if (!candidatesReturned) {
-          candidatesReturned = true;
-          return [{ state_id: 100 }] as T[];
-        }
-        // In-fence recheck — still eligible.
-        return [{ state_id: 100 }] as T[];
-      }
-      return origQuery<T>(sql, params);
-    };
-    await pruneStates(connection, [FAB_TABLE]);
-
-    const dDelete = calls.find(
-      (c) => c.kind === 'execute' && /DELETE FROM \[PA\]\.\[D42\]/.test(c.sql) && /DELETED_AT/.test(c.sql),
-    );
-    expect(dDelete).toBeDefined();
-    expect(dDelete!.sql).toMatch(/SDE_STATE_ID = @p0 OR DELETED_AT = @p1/);
-    expect(dDelete!.params).toEqual([100, 100]);
-
-    const lineageDelete = calls.find(
-      (c) => c.kind === 'execute' && /DELETE FROM sde.SDE_state_lineages/.test(c.sql),
-    );
-    expect(lineageDelete).toBeDefined();
-    expect(lineageDelete!.sql).toMatch(/lineage_id = @p0 OR lineage_name = @p1/);
-    expect(lineageDelete!.params).toEqual([100, 100]);
-  });
-
-  it('skips a candidate when the in-fence recheck removes it', async () => {
-    let candidatesCallCount = 0;
-    const { connection } = makeMock({
       queryResponses: [
-        { match: /UNION/, rows: [] }, // no locks initially
-        {
-          match: /FROM sde.SDE_states s WHERE/,
-          // first call returns [100], second call (in-fence recheck) returns []
-          rows: [],
-        },
+        { match: /SDE_mvtables_modified/, rows: [] },   // mvExists false
+        { match: /SDE_state_locks/, rows: [] },         // no locks
+        { match: /reachable AS/, rows: [{ state_id: 100 }, { state_id: 101 }] }, // unreachable
+      ],
+      executeResponses: [
+        { match: /DELETE FROM sde.SDE_states WHERE state_id IN/, result: { rowsAffected: 2 } },
+        { match: /./, result: { rowsAffected: 0 } },
       ],
     });
-    // Override query for SDE_states to count calls
-    const origQuery = connection.query.bind(connection);
-    connection.query = async <T = Record<string, unknown>>(
-      sql: string,
-      params?: unknown[],
-    ) => {
-      if (/FROM sde.SDE_states s WHERE/.test(sql.replace(/\s+/g, ' '))) {
-        candidatesCallCount += 1;
-        if (candidatesCallCount === 1) {
-          return [{ state_id: 100 }] as T[];
-        }
-        return [] as T[];
-      }
-      return origQuery<T>(sql, params);
-    };
+    const result = await pruneStates(connection, [FAB_TABLE]);
+    expect(result.statesRemoved).toBe(2);
 
-    const result = await pruneStates(connection, []);
-    expect(result.statesRemoved).toBe(0);
-    expect(result.statesSkipped).toBe(1);
+    expect(calls.some(c => c.kind === 'execute' && /DELETE FROM \[PA\]\.\[a42\] WHERE SDE_STATE_ID IN \(100,101\)/.test(c.sql))).toBe(true);
+    expect(calls.some(c => c.kind === 'execute' && /DELETE FROM \[PA\]\.\[D42\] WHERE SDE_STATE_ID IN \(100,101\) OR DELETED_AT IN \(100,101\)/.test(c.sql))).toBe(true);
+    // Closure delete is keyed on lineage_id ONLY, never lineage_name (N6).
+    expect(calls.some(c => c.kind === 'execute' && /DELETE FROM sde.SDE_state_lineages WHERE lineage_id IN \(100,101\)$/.test(c.sql.trim()))).toBe(true);
+    expect(calls.some(c => c.kind === 'execute' && /SDE_state_lineages.*lineage_name/.test(c.sql))).toBe(false);
+    expect(calls.some(c => c.kind === 'execute' && /DELETE FROM sde.SDE_states WHERE state_id IN \(100,101\)/.test(c.sql))).toBe(true);
+  });
+
+  it('subtracts locked branches from the prunable set', async () => {
+    // readLockedBranches returns {100}; unreachable {100,101} → only 101 is pruned,
+    // and 100 must never appear in any DELETE IN-list.
+    const { connection, calls } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        { match: /SDE_mvtables_modified/, rows: [] },
+        { match: /SDE_state_locks/, rows: [{ state_id: 100 }] }, // lock (expanded) covers 100
+        { match: /reachable AS/, rows: [{ state_id: 100 }, { state_id: 101 }] },
+      ],
+      executeResponses: [
+        { match: /DELETE FROM sde.SDE_states WHERE state_id IN/, result: { rowsAffected: 1 } },
+        { match: /./, result: { rowsAffected: 0 } },
+      ],
+    });
+    const result = await pruneStates(connection, [FAB_TABLE]);
+    expect(result.statesRemoved).toBe(1);
+    expect(calls.some(c => c.kind === 'execute' && /DELETE FROM sde.SDE_states WHERE state_id IN \(101\)/.test(c.sql))).toBe(true);
+    // The locked state 100 is never touched by any delete.
+    expect(calls.some(c => c.kind === 'execute' && /100/.test(c.sql))).toBe(false);
   });
 });
 

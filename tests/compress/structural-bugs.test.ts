@@ -68,5 +68,68 @@ d('compress structural bugs (DB-backed)', () => {
     const live = await liveStateIds(conn);
     expect(dangling).toEqual([]); // no orphaned child left behind
     expect(live.has(0)).toBe(true); // base state intact
+    // Set-based prune removes the WHOLE unreachable subtree {5,6,7,8} at once.
+    for (const s of [5, 6, 7, 8]) expect(live.has(s), `state ${s} should be pruned`).toBe(false);
+  });
+
+  it('prune protects a LOCKED unreachable branch (lock ∪ ancestors ∪ descendants)', async () => {
+    // 0 <- 1 (version v). Orphan chain 5 <- 6 <- 7, all unreachable from any tip.
+    // A lock on state 6 expands to {5 (ancestor), 6, 7 (descendant)} — the entire
+    // orphan branch — so prune must delete NONE of it despite being unreachable.
+    const f = new Fabric();
+    st(f, 1, 0, 1); f.versions.set('v', 1);
+    st(f, 5, 0, 5); st(f, 6, 5, 5); st(f, 7, 6, 5);
+    f.locks.add(6);
+    await materialize(conn, f);
+
+    await pruneStates(conn, [PARCELS]);
+
+    const live = await liveStateIds(conn);
+    for (const s of [5, 6, 7]) expect(live.has(s), `locked-branch state ${s} must survive`).toBe(true);
+    expect(await danglingParents(conn)).toEqual([]);
+  });
+
+  it('prune removes an unlocked sibling of a locked branch without orphaning it', async () => {
+    // 0 <- 1 (v). Orphan: 5 <- {6 (locked), 8 (unlocked leaf)}; 6 <- 7.
+    // Lock on 6 protects {5,6,7} (5 is 6's ancestor). State 8 is a sibling of 6 —
+    // NOT an ancestor or descendant of the lock — so it is unreachable AND
+    // unlocked → pruned. Its parent 5 is locked-protected, so no dangling results.
+    const f = new Fabric();
+    st(f, 1, 0, 1); f.versions.set('v', 1);
+    st(f, 5, 0, 5); st(f, 6, 5, 5); st(f, 7, 6, 5); st(f, 8, 5, 8);
+    f.locks.add(6);
+    await materialize(conn, f);
+
+    await pruneStates(conn, [PARCELS]);
+
+    const live = await liveStateIds(conn);
+    expect(live.has(8), 'unlocked sibling 8 should be pruned').toBe(false);
+    for (const s of [5, 6, 7]) expect(live.has(s), `locked-branch state ${s} must survive`).toBe(true);
+    expect(await danglingParents(conn), 'no dangling after pruning the sibling').toEqual([]);
+  });
+
+  it('N6: prune must NOT delete a live branch closure row keyed by a pruned state id as lineage_name', async () => {
+    // lineage_name shares the id-space with state_id, and on a DIVERGENT fabric a
+    // pruned state's id can equal a lineage_name still used by a live branch.
+    // 0 <- 1 (version v, lineage_name 1). Orphan leaf 9 (prunable). Inject a
+    // divergent closure row (lineage_name = 9, lineage_id = 1) — as if the live
+    // state 1 were catalogued under lineage 9. Deleting closure by lineage_name IN
+    // {9} (the N6 bug) would wipe that row; keying on lineage_id only preserves it.
+    const f = new Fabric();
+    st(f, 1, 0, 1); f.versions.set('v', 1);
+    st(f, 9, 0, 9); // unreachable, prunable; its id (9) doubles as a live lineage_name
+    f.lineages.add('1:1');   // clean self-row for lineage 1
+    f.lineages.add('9:1');   // DIVERGENT: lineage named 9 contains live state 1
+    await materialize(conn, f);
+
+    await pruneStates(conn, [PARCELS]);
+
+    const survived = await conn.query<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM sde.SDE_state_lineages WHERE lineage_name = 9 AND lineage_id = 1;`);
+    expect(Number(survived[0]!.n), 'live lineage_id=1 closure row must survive prune of state 9').toBe(1);
+    // The genuinely dead row (lineage_id = 9) is cleaned up.
+    const deadGone = await conn.query<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM sde.SDE_state_lineages WHERE lineage_id = 9;`);
+    expect(Number(deadGone[0]!.n), 'closure rows for the pruned state (lineage_id=9) removed').toBe(0);
   });
 });
