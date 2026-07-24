@@ -828,23 +828,19 @@ async function computeCollapsePlan(
         OR s.${pid} IN (${lockList})
         OR COALESCE((SELECT c FROM cc WHERE cc.p = s.${pid}), 0) >= 2
     ),
-    del AS (
-      -- Given the survivor rule already folds in validTarget(parent), the
-      -- non-survivors ARE exactly the collapsed-away states. Keep the parent for
-      -- the anchor walk.
-      SELECT s.${sid} AS s, s.${pid} AS par FROM ${states} s
-      WHERE s.${sid} <> 0 AND s.${sid} NOT IN (SELECT s FROM surv)
-    ),
-    anc AS (
-      SELECT d.s AS orig, d.par AS cur,
-             CASE WHEN d.par IN (SELECT s FROM surv) THEN 1 ELSE 0 END AS found
-      FROM del d
+    prop AS (
+      -- Anchor via DOWNWARD propagation: each survivor anchors itself; a deleted
+      -- child inherits its parent's anchor. A deleted state has ≤1 child, so each
+      -- state is visited exactly once — O(states). (The obvious per-deleted-state
+      -- UPWARD walk is O(states²) on a near-linear ~10k-state history and times
+      -- out.) Non-survivors are exactly the collapsed-away states.
+      SELECT s AS st, s AS anchor FROM surv
       UNION ALL
-      SELECT a.orig, pc.${pid} AS cur,
-             CASE WHEN pc.${pid} IN (SELECT s FROM surv) THEN 1 ELSE 0 END
-      FROM anc a JOIN ${states} pc ON pc.${sid} = a.cur WHERE a.found = 0
+      SELECT c.${sid}, p.anchor
+      FROM prop p JOIN ${states} c ON c.${pid} = p.st
+      WHERE c.${sid} NOT IN (SELECT s FROM surv)
     )
-    SELECT orig AS child, cur AS anchor FROM anc WHERE found = 1 ORDER BY orig ASC${maxrec}
+    SELECT st AS child, anchor FROM prop WHERE st NOT IN (SELECT s FROM surv) ORDER BY st ASC${maxrec}
   `;
   const rows = await connection.query<{ child: number | bigint; anchor: number | bigint }>(sql);
   return rows.map(r => ({ parent: Number(r.anchor), child: Number(r.child) }));

@@ -102,6 +102,16 @@ async function danglingCount(conn: IDatabaseConnection): Promise<number> {
   console.log(`versioned tables: ${versioned.length}; states: ${await stateCount(conn)}; dangling(before): ${await danglingCount(conn)}`);
   for (const v of await versions(conn)) console.log(`  version ${v.owner}.${v.name} @ state ${v.state_id}`);
 
+  // Simulate a no-editor nightly window: clear open EditSession locks so collapse
+  // is not (correctly) blocked by their ancestor-branch protection. Disposable
+  // clone only. A real nightly must actually run when no EditSessions are open.
+  if (process.env.CLEAR_LOCKS === '1') {
+    await conn.execute(`DELETE FROM sde.SDE_state_locks;`);
+    console.log('CLEARED SDE_state_locks (simulating a no-editor nightly window)');
+  }
+  const T = () => Date.now();
+  const secs = (t0: number) => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+
   const check = async (label: string, base: Record<string, Sig>) => {
     const now = await allSigs(conn);
     const problems = diff(base, now);
@@ -116,11 +126,13 @@ async function danglingCount(conn: IDatabaseConnection): Promise<number> {
   for (const ver of Object.keys(baseline)) console.log(`  ${ver}: ` + Object.entries(baseline[ver]!).map(([t, s]) => `${t.split('.').pop()}=${s.cnt}`).join(' '));
 
   console.log('\n== PHASE 1: prune only ==');
+  let t = T();
   const pr = await pruneStates(conn, versioned);
-  console.log(`prune: ${pr.statesRemoved} states removed, ${pr.deltaRowsRemoved} delta rows removed; states now ${await stateCount(conn)}`);
+  console.log(`prune: ${pr.statesRemoved} states removed, ${pr.deltaRowsRemoved} delta rows removed; states now ${await stateCount(conn)} [${secs(t)}]`);
   await check('after prune', baseline);
 
   console.log('\n== PHASE 2: graduate ==');
+  t = T();
   const prefix = await computeGraduablePrefix(conn);
   console.log(`graduable prefix size: ${prefix.size}`);
   let gUps = 0, gDel = 0, gA = 0;
@@ -130,13 +142,14 @@ async function danglingCount(conn: IDatabaseConnection): Promise<number> {
     try { const r = await graduateTable(conn, t, prefix); if (!wasTx) await conn.commitTransaction(); gUps += r.upserts; gDel += r.deletes; gA += r.aRowsRemoved; }
     catch (e) { if (!wasTx && conn.inTransaction()) await conn.rollbackTransaction(); throw e; }
   }
-  console.log(`graduate: ${gUps} base upserts, ${gDel} base deletes, ${gA} a-rows graduated`);
+  console.log(`graduate: ${gUps} base upserts, ${gDel} base deletes, ${gA} a-rows graduated [${secs(t)}]`);
   await check('after graduate', baseline);
 
   if (process.env.COMPRESS_COLLAPSE === '1') {
     console.log('\n== PHASE 3: collapse ==');
+    t = T();
     const cr = await collapseLineages(conn, versioned);
-    console.log(`collapse: ${cr.collapses} collapses, ${cr.rowsRewritten} rows rewritten; states now ${await stateCount(conn)}`);
+    console.log(`collapse: ${cr.collapses} collapses, ${cr.rowsRewritten} rows rewritten; states now ${await stateCount(conn)} [${secs(t)}]`);
     await check('after collapse', baseline);
   } else {
     console.log('\n== PHASE 3: collapse SKIPPED (set COMPRESS_COLLAPSE=1 to run) ==');
