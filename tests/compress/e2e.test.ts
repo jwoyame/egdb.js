@@ -86,6 +86,10 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
     const r2 = await egdb.compress({ acknowledgeExperimentalUnsafe: true, phases: { collapse: true } });
     expect(r2.graduatedUpserts, 'collapse-only must not graduate').toBe(0);
     expect(r2.statesRemoved, 'collapse-only must not prune').toBe(0);
+
+    // All-false selection must REFUSE, not silently no-op green.
+    await expect(egdb.compress({ acknowledgeExperimentalUnsafe: true, phases: {} }))
+      .rejects.toThrow(/no phases enabled/);
   });
 
   it('N2: scoping graduation to one table still prunes/collapses the excluded one safely', async () => {

@@ -36,10 +36,26 @@ d('compress precondition gate (DB-backed)', () => {
 
   it('aborts on a dangling parent_state_id (C6)', async () => {
     await materialize(conn, wellFormed());
-    // state 9 points at a non-existent parent 999.
-    await conn.execute(`INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id) VALUES (9, 't', 9, 999);`);
+    // state 9 points at a non-existent parent 5 (5 < 9, so monotonic — isolates the
+    // dangling check from the parent-monotonicity check).
+    await conn.execute(`INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id) VALUES (9, 't', 9, 5);`);
     await expect(assertCompressPreconditions(conn)).rejects.toThrow(CompressPreconditionError);
-    await expect(assertCompressPreconditions(conn)).rejects.toThrow(/dangling parent_state_id/);
+    await expect(assertCompressPreconditions(conn)).rejects.toThrow(/dangling parent_state_id.*: 9/);
+  });
+
+  it('aborts on a non-monotonic parent_state_id (cycle risk)', async () => {
+    await materialize(conn, wellFormed());
+    // state 3's parent is 8 (8 > 3) — a child older than its parent; a cycle would
+    // hang the recursive CTEs. 8 exists so it is NOT dangling — isolates the check.
+    await conn.execute(`INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id) VALUES (8, 't', 8, 2);`);
+    await conn.execute(`INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id) VALUES (3, 't', 3, 8);`);
+    await expect(assertCompressPreconditions(conn)).rejects.toThrow(/parent_state_id >= state_id/);
+  });
+
+  it('aborts on a dangling version tip', async () => {
+    await materialize(conn, wellFormed());
+    await conn.execute(`INSERT INTO sde.SDE_versions (name, owner, state_id) VALUES ('ghost', 't', 4242);`);
+    await expect(assertCompressPreconditions(conn)).rejects.toThrow(/version\(s\) point at a non-existent state/);
   });
 
   it('aborts when state 0 is missing', async () => {

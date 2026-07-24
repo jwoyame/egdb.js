@@ -1653,6 +1653,13 @@ export class EnterpriseGeodatabase {
     const runPrune = !!phases.prune;
     const runGraduate = !!phases.graduate;
     const runCollapse = !!phases.collapse;
+    // Refuse an all-false selection rather than return a green "did nothing"
+    // result — for an unattended, config-driven caller a typo'd phase key
+    // (`{ prun: true }`) would otherwise silently no-op and report success.
+    if (!runPrune && !runGraduate && !runCollapse) {
+      throw new Error('compress() called with no phases enabled. Pass at least one of ' +
+        '{ prune, graduate, collapse } = true, or omit `phases` for the prune-only default.');
+    }
 
     const allTables = await this.listTables();
     const allVersioned = allTables.filter(t => t.isVersioned);

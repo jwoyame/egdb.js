@@ -127,11 +127,16 @@ export async function assertCompressPreconditions(connection: IDatabaseConnectio
   const driver = connection.driver;
   const states = sysTable(driver, 'SDE_states');
   const lineages = sysTable(driver, 'SDE_state_lineages');
+  const versions = sysTable(driver, 'SDE_versions');
   const sid = col(driver, 'state_id');
   const pid = col(driver, 'parent_state_id');
   const lid = col(driver, 'lineage_id');
   const lname = col(driver, 'lineage_name');
   const violations: string[] = [];
+  const sample = (ids: Array<number | bigint>): string => {
+    const n = ids.map(Number);
+    return n.slice(0, 10).join(', ') + (n.length > 10 ? `, …(+${n.length - 10})` : '');
+  };
 
   const s0 = await connection.query(`SELECT 1 FROM ${states} WHERE ${sid} = 0`);
   if (s0.length === 0) violations.push('state 0 (base) is missing');
@@ -139,18 +144,33 @@ export async function assertCompressPreconditions(connection: IDatabaseConnectio
   const l0 = await connection.query(`SELECT 1 FROM ${lineages} WHERE ${lname} = 0 AND ${lid} = 0`);
   if (l0.length === 0) violations.push('the (0,0) SDE_state_lineages row is missing');
 
-  const dangling = await connection.query<{ c: number | bigint }>(
-    `SELECT COUNT(*) AS c FROM ${states} s WHERE s.${pid} <> 0
+  // Dangling parent_state_id (C6). A non-zero parent must reference a live state.
+  const dangling = await connection.query<{ s: number | bigint }>(
+    `SELECT s.${sid} AS s FROM ${states} s WHERE s.${pid} <> 0
        AND NOT EXISTS (SELECT 1 FROM ${states} p WHERE p.${sid} = s.${pid})`);
-  const nd = Number(dangling[0]?.c ?? 0);
-  if (nd > 0) violations.push(`${nd} state(s) have a dangling parent_state_id (parent row does not exist)`);
+  if (dangling.length > 0) violations.push(`${dangling.length} state(s) have a dangling parent_state_id (parent row does not exist): ${sample(dangling.map(r => r.s))}`);
 
-  const dup = await connection.query<{ c: number | bigint }>(
-    `SELECT COUNT(*) AS c FROM (
-       SELECT ${pid} AS p, ${lname} AS l FROM ${states} GROUP BY ${pid}, ${lname} HAVING COUNT(*) > 1
-     ) d`);
-  const ndup = Number(dup[0]?.c ?? 0);
-  if (ndup > 0) violations.push(`${ndup} (parent_state_id, lineage_name) pair(s) are duplicated (states_cuk violated)`);
+  // Parent monotonicity: a child's id is always allocated after its parent's, so
+  // parent_state_id < state_id for every non-zero-parent state. This precludes a
+  // parent_state_id CYCLE — which would otherwise make the recursive CTEs run away
+  // (MAXRECURSION 0) rather than abort cleanly.
+  const nonMono = await connection.query<{ s: number | bigint }>(
+    `SELECT ${sid} AS s FROM ${states} WHERE ${pid} <> 0 AND ${pid} >= ${sid}`);
+  if (nonMono.length > 0) violations.push(`${nonMono.length} state(s) have parent_state_id >= state_id (non-monotonic / cycle risk): ${sample(nonMono.map(r => r.s))}`);
+
+  // states_cuk: no two states share (parent_state_id, lineage_name). Catches a
+  // fabric whose UNIQUE constraint was dropped.
+  const dup = await connection.query<{ p: number | bigint; l: number | bigint }>(
+    `SELECT ${pid} AS p, ${lname} AS l FROM ${states} GROUP BY ${pid}, ${lname} HAVING COUNT(*) > 1`);
+  if (dup.length > 0) violations.push(`${dup.length} (parent_state_id, lineage_name) pair(s) are duplicated (states_cuk violated): ${sample(dup.map(r => r.p))}`);
+
+  // Dangling version tip: a version pointing at a missing state is unreadable AND
+  // silently neuters graduation (computeGraduablePrefix's versionCount includes it
+  // but the JOIN drops it, so the graduable prefix can never be non-empty).
+  const badTip = await connection.query<{ s: number | bigint }>(
+    `SELECT v.${sid} AS s FROM ${versions} v WHERE v.${sid} IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM ${states} s WHERE s.${sid} = v.${sid})`);
+  if (badTip.length > 0) violations.push(`${badTip.length} version(s) point at a non-existent state (dangling tip): ${sample(badTip.map(r => r.s))}`);
 
   if (violations.length > 0) throw new CompressPreconditionError(violations);
 }
