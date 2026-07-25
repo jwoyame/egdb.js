@@ -69,6 +69,11 @@ export async function acquireCompressLock(
     try {
       await connection.query(`SET LOCAL statement_timeout = ${Math.max(1, Math.floor(timeoutMs))}`);
       await connection.query(`SELECT ${fn}(${PG_COMPRESS_LOCK_KEY1}, ${PG_COMPRESS_LOCK_KEY2})`);
+      // SET LOCAL is transaction-scoped, so without this the timeout would cap
+      // EVERY later statement in the editor's transaction (a large post/reconcile
+      // would abort spuriously). Clear it once the lock is held. On a timeout we
+      // throw below and the caller rolls back, so no reset is needed there.
+      await connection.query(`SET LOCAL statement_timeout = 0`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes('statement timeout') || msg.includes('canceling statement')) {

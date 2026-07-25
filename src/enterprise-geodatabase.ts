@@ -1710,7 +1710,16 @@ export class EnterpriseGeodatabase {
     try {
     // Pre-flight (exclusive-first ordering): now that the exclusive lock is held,
     // no NEW editor can start; if a session is ALREADY open it leaves an
-    // SDE_state_lock, so defer rather than work around it.
+    // SDE_state_lock, so defer rather than work around it. First reap locks whose
+    // owning session is provably dead (a crashed editor) so ONE leaked lock does
+    // not make compress defer forever — best-effort: if the reaper can't run (e.g.
+    // missing VIEW SERVER STATE), fall through to the conservative COUNT (defer on
+    // ANY lock — fail-safe) and warn so an operator can reap manually.
+    try {
+      await cleanupStaleLocks(this.connection);
+    } catch (e) {
+      this._logger.warn?.(`compress: stale-lock reaper could not run (${e instanceof Error ? e.message : String(e)}); deferring on any lock present.`);
+    }
     const locksTbl = this.config.driver === 'sqlserver' ? 'sde.SDE_state_locks' : 'sde.sde_state_locks';
     const activeLocks = await this.connection.query<{ c: number | bigint }>(`SELECT COUNT(*) AS c FROM ${locksTbl}`);
     if (Number(activeLocks[0]?.c ?? 0) > 0) {
@@ -1743,8 +1752,10 @@ export class EnterpriseGeodatabase {
     let totalAddsRemoved = 0;
     let totalDeletesRemoved = 0;
     if (runGraduate) {
+      holder.assertHeld();
       const graduableSnapshot = await computeGraduablePrefix(this.connection);
       for (const t of tables) {
+        holder.assertHeld(); // graduate writes BASE (irreversible) — confirm the exclusive lock per table
         const wasInTx = this.connection.inTransaction();
         if (!wasInTx) await this.connection.beginTransaction({ isolation: 'serializable' });
         try {
@@ -1827,7 +1838,12 @@ export class EnterpriseGeodatabase {
     const conn = base.driver === 'sqlserver'
       ? new SqlServerConnection(cfg as SqlServerConfig)
       : new PostgreSQLConnection(cfg as PostgreSQLConfig);
-    await conn.connect();
+    try {
+      await conn.connect();
+    } catch (e) {
+      try { await conn.close(); } catch { /* don't mask the connect error */ }
+      throw e;
+    }
     return conn;
   }
 

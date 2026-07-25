@@ -45,11 +45,18 @@ function dedicatedHolder() {
   await s2.close();
   await conn.execute('DELETE FROM sde.SDE_state_locks;');
 
-  // B. compress defers on an active edit-session lock.
+  // B. a STALE lock (dead SPID) is REAPED by the pre-flight → compress runs.
   const anyState = await conn.query<{ s: number | bigint }>('SELECT TOP 1 state_id AS s FROM sde.SDE_states WHERE state_id <> 0;');
   await conn.execute(`INSERT INTO sde.SDE_state_locks (sde_id, state_id, autolock, lock_type, lock_time) VALUES (999123, ${Number(anyState[0]!.s)}, 'N', 'e', GETDATE());`);
   const rB = await egdb.compress({ acknowledgeExperimentalUnsafe: true });
-  ok(rB.deferred === 'editors-active', `B: compress deferred on active lock (deferred=${rB.deferred})`);
+  ok(rB.deferred === undefined, `B: stale (dead-SPID) lock reaped, compress ran (deferred=${rB.deferred})`);
+  await conn.execute('DELETE FROM sde.SDE_state_locks;');
+
+  // B2. compress DEFERS while a LIVE edit session is open (its lock's SPID is alive).
+  const openSess = await EditSession.start(egdb, 'sde.DEFAULT');
+  const rB2 = await egdb.compress({ acknowledgeExperimentalUnsafe: true });
+  ok(rB2.deferred === 'editors-active', `B2: compress deferred while a session is open (deferred=${rB2.deferred})`);
+  await openSess.close();
   await conn.execute('DELETE FROM sde.SDE_state_locks;');
 
   // C. compress defers when the exclusive lock is held elsewhere.
