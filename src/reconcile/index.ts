@@ -86,6 +86,13 @@ export {
   assertCompressPreconditions,
   CompressPreconditionError,
 } from './compress-impl';
+export {
+  acquireCompressLock,
+  CompressLockHolder,
+  ApplockTimeoutError,
+  COMPRESS_LOCK_RESOURCE,
+  EDITOR_SHARED_LOCK_TIMEOUT_MS,
+} from './applock';
 export type {
   GraduateTableResult,
   PruneResult,

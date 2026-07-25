@@ -55,6 +55,19 @@ export interface ConnectionConfig {
     trustServerCertificate?: boolean;
     connectionTimeout?: number;
     requestTimeout?: number;
+    /**
+     * Override the connection pool sizing. Used by the compress exclusive-lock
+     * holder, which wants a dedicated single connection ({max:1,min:1}) that is
+     * never idle-reaped and never hands out a second session while it holds the
+     * lock. Defaults to {max:20, min:0, idleTimeoutMillis:30000}.
+     */
+    pool?: { max?: number; min?: number; idleTimeoutMillis?: number };
+    /**
+     * Own a PRIVATE connection pool instead of mssql's process-global one, so
+     * closing this connection doesn't tear down every other egdb connection.
+     * Used by the compress exclusive-lock holder.
+     */
+    dedicatedPool?: boolean;
   };
   /**
    * Time zone the DATABASE SERVER writes its naive datetime columns in.
@@ -518,6 +531,14 @@ export interface CompressResult {
    *  Operators should re-run compress.
    */
   allTablesSkippedDueToConcurrentVersionChange?: boolean;
+  /**
+   * Set when compress DID NOT RUN because it deferred to editing activity (N9):
+   * `'editors-active'` = the pre-flight found open edit sessions; `'lock-contended'`
+   * = the exclusive run lock could not be acquired (another compress, or editors
+   * holding the shared lock past the timeout). All other fields are 0. A nightly
+   * caller logs this and tries again next window.
+   */
+  deferred?: 'editors-active' | 'lock-contended';
 }
 
 /**

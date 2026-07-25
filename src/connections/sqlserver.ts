@@ -10,6 +10,11 @@ export class SqlServerConnection implements IDatabaseConnection {
   private pool: sql.ConnectionPool | null = null;
   private config: sql.config;
   private transaction: sql.Transaction | null = null;
+  // When true, this connection owns a PRIVATE ConnectionPool instead of mssql's
+  // process-global one — so closing it doesn't close every other egdb connection.
+  // Required for the compress exclusive-lock holder, which opens/closes its own
+  // dedicated connection while the main connection stays live.
+  private readonly dedicatedPool: boolean;
 
   // Serialises the single `this.transaction` slot against concurrent
   // statements: a transaction holds this exclusively for its whole lifetime,
@@ -37,8 +42,13 @@ export class SqlServerConnection implements IDatabaseConnection {
       // write transaction needs one too; the default max of 10 is tight for a
       // shared single-login server, where a writer could otherwise wait on a
       // free connection while holding the RW write lock. Give some headroom.
-      pool: { max: 20, min: 0, idleTimeoutMillis: 30000 },
+      pool: {
+        max: config.options?.pool?.max ?? 20,
+        min: config.options?.pool?.min ?? 0,
+        idleTimeoutMillis: config.options?.pool?.idleTimeoutMillis ?? 30000,
+      },
     };
+    this.dedicatedPool = config.options?.dedicatedPool ?? false;
   }
 
   get isConnected(): boolean {
@@ -46,7 +56,12 @@ export class SqlServerConnection implements IDatabaseConnection {
   }
 
   async connect(): Promise<void> {
-    this.pool = await sql.connect(this.config);
+    // A dedicated connection owns a PRIVATE pool so close() only tears down this
+    // connection, not mssql's process-global pool that every other egdb connection
+    // shares. Default connections keep the historical global-pool behaviour.
+    this.pool = this.dedicatedPool
+      ? await new sql.ConnectionPool(this.config).connect()
+      : await sql.connect(this.config);
   }
 
   async query<T>(sqlQuery: string, params?: unknown[]): Promise<T[]> {

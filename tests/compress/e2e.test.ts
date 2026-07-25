@@ -11,7 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { EnterpriseGeodatabase } from '../../src/enterprise-geodatabase';
-import { connectScratch, resetFabric, HAVE_DB } from './db';
+import { connectScratch, resetFabric, HAVE_DB, e2eConfig } from './db';
 import { materialize } from './fabric-builder';
 import { installE2ESchema, copy18to19, E2E_TABLES } from './db-e2e';
 import { snapshotVisible, assertVisibleDataUnchanged, assertStructuralInvariants } from './invariants';
@@ -28,9 +28,11 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
     conn = await connectScratch('egdb_compress_e2e');
     await installE2ESchema(conn);
     // Construct over the existing scratch connection (bypass static connect's own
-    // connect()/verifyGeodatabase()); config only needs the driver + logger.
+    // connect()/verifyGeodatabase()). Pass a FULL config (not just driver+logger)
+    // so compress()'s N9 exclusive-lock holder can spin up its own dedicated
+    // connection to the same scratch DB.
     egdb = new (EnterpriseGeodatabase as unknown as new (c: unknown, conn: unknown) => EnterpriseGeodatabase)(
-      { driver: 'sqlserver', logger: silent }, conn);
+      { ...e2eConfig('egdb_compress_e2e'), logger: silent }, conn);
   });
   afterAll(async () => { if (conn) await conn.close(); });
   beforeEach(async () => { await resetFabric(conn); });

@@ -8,6 +8,7 @@
 
 import type { IDatabaseConnection } from '../connections/connection';
 import { buildIntegerList } from '../utils/sql-helpers';
+import { acquireCompressLock, EDITOR_SHARED_LOCK_TIMEOUT_MS } from './applock';
 
 /**
  * Create a child state branching from parentStateId.
@@ -32,6 +33,15 @@ export async function createChildState(
   if (!connection.inTransaction()) {
     throw new Error('createChildState must be called inside a transaction');
   }
+
+  // N9: hold the fabric-wide SHARED compress lock for this editing transaction so
+  // a concurrent compress (which takes it EXCLUSIVE for its whole run) can never
+  // mutate the state tree under an in-flight edit. Bounces (ApplockTimeoutError)
+  // if a compress is running rather than hanging. This covers every path that
+  // creates a state (EditSession.start, trim-post, rebase); the version-op entry
+  // points (post/reconcile/createVersion) also take it, to cover paths that write
+  // deltas WITHOUT creating a state. Re-acquiring a held shared lock is a no-op.
+  await acquireCompressLock(connection, 'Shared', EDITOR_SHARED_LOCK_TIMEOUT_MS);
 
   const driver = connection.driver;
 

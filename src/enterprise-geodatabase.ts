@@ -15,6 +15,8 @@ import { parseGdbItems } from './parsers/gdb-items-parser';
 import type { GdbItemRow } from './parsers/gdb-items-parser';
 import type {
   ConnectionConfig,
+  SqlServerConfig,
+  PostgreSQLConfig,
   GeometryType,
   TableInfo,
   VersionInfo,
@@ -58,6 +60,10 @@ import {
   pruneStates,
   collapseLineages,
   assertCompressPreconditions,
+  CompressLockHolder,
+  ApplockTimeoutError,
+  acquireCompressLock,
+  EDITOR_SHARED_LOCK_TIMEOUT_MS,
 } from './reconcile';
 import type { GraduateTableResult } from './reconcile';
 import type { StaleLockCleanupResult } from './reconcile';
@@ -76,6 +82,11 @@ export class LockTimeoutError extends Error {
 export class EnterpriseGeodatabase {
   /** Version-lock acquisition timeout (milliseconds) */
   private static readonly LOCK_TIMEOUT_MS = 30000;
+  /** How long compress waits for the fabric-wide exclusive run lock before
+   * deferring the run (N9). Editors' SHARED holds are short edit transactions, so
+   * this only ever waits out an in-flight edit; if it can't get the lock in this
+   * window another compress is running or an editor is stuck → defer. */
+  private static readonly COMPRESS_LOCK_TIMEOUT_MS = 30000;
 
   private connection: IDatabaseConnection;
   private config: ConnectionConfig;
@@ -784,6 +795,14 @@ export class EnterpriseGeodatabase {
       nameRule?: 1 | 2;
     }
   ): Promise<VersionInfo> {
+    // N9 note: createVersion is intentionally NOT wrapped in the SHARED compress
+    // lock. `sde.create_version` adds a version row pointing at the parent's
+    // EXISTING tip state — it does not create a new state (the first EDIT does,
+    // via EditSession.start → createChildState, which IS locked). That tip is
+    // already a reachable version tip, hence a prune/collapse survivor, so a new
+    // version appearing mid-compress cannot expose a state compress would touch;
+    // graduation's own version-set-changed fence covers the prefix. Wrapping the
+    // Esri proc in a transaction to take the lock is riskier than this is worth.
     const parent = options?.parent ?? 'sde.DEFAULT';
     const access = options?.access ?? EnterpriseGeodatabase.VersionAccess.PRIVATE;
     const description = options?.description ?? '';
@@ -1043,6 +1062,11 @@ export class EnterpriseGeodatabase {
     const childLineageName = await getLineageName(this.connection, childStateId);
 
     const runApply = async () => {
+      // N9: reconcile writes A/D rows into the version's tip WITHOUT createChildState
+      // and leaves no SDE_state_lock, so it would otherwise be invisible to compress's
+      // pre-flight AND unblocked by the exclusive lock. Take the SHARED lock here
+      // (runApply always runs inside a transaction — caller's or the else-branch's).
+      await acquireCompressLock(this.connection, 'Shared', EDITOR_SHARED_LOCK_TIMEOUT_MS);
       const result = await applyParentChanges(
         this.connection,
         versionedTables,
@@ -1140,6 +1164,10 @@ export class EnterpriseGeodatabase {
     // the same property, so the same shape works for both drivers.
     await this.connection.beginTransaction();
     try {
+      // N9: SHARED compress lock first — post mutates the state tree (both the
+      // trim-post createChildState path and the legacy repoint path), so it must
+      // exclude a concurrent compress. Bounces if a compress is running.
+      await acquireCompressLock(this.connection, 'Shared', EDITOR_SHARED_LOCK_TIMEOUT_MS);
       await this.lockVersion(parentFullName);
 
       // Re-fetch parent INSIDE the lock — its state_id may have advanced
@@ -1661,6 +1689,35 @@ export class EnterpriseGeodatabase {
         '{ prune, graduate, collapse } = true, or omit `phases` for the prune-only default.');
     }
 
+    // --- N9 run-level exclusion (NIGHTLY_COMPRESS_ROADMAP.md Step B) ----------
+    // Hold the fabric-wide EXCLUSIVE lock for the WHOLE run on a dedicated
+    // connection so no editor can mutate the state tree concurrently (an editor's
+    // reciprocal SHARED lock — taken at every state-mutating entry point — blocks
+    // this acquire while their edit tx is open, and blocks NEW editors once we
+    // hold it). Defer (skip this run) rather than fight active editing.
+    const lockConn = await this.createLockConnection();
+    let holder: CompressLockHolder;
+    try {
+      holder = await CompressLockHolder.acquire(lockConn, EnterpriseGeodatabase.COMPRESS_LOCK_TIMEOUT_MS);
+    } catch (e) {
+      if (e instanceof ApplockTimeoutError) {
+        this._logger.warn?.('compress: exclusive run lock held (another compress, or editors holding the shared lock past the wait); deferring this run.');
+        return EnterpriseGeodatabase.deferredResult('lock-contended');
+      }
+      throw e;
+    }
+
+    try {
+    // Pre-flight (exclusive-first ordering): now that the exclusive lock is held,
+    // no NEW editor can start; if a session is ALREADY open it leaves an
+    // SDE_state_lock, so defer rather than work around it.
+    const locksTbl = this.config.driver === 'sqlserver' ? 'sde.SDE_state_locks' : 'sde.sde_state_locks';
+    const activeLocks = await this.connection.query<{ c: number | bigint }>(`SELECT COUNT(*) AS c FROM ${locksTbl}`);
+    if (Number(activeLocks[0]?.c ?? 0) > 0) {
+      this._logger.warn?.(`compress: ${Number(activeLocks[0]!.c)} active edit-session lock(s) present; deferring this run.`);
+      return EnterpriseGeodatabase.deferredResult('editors-active');
+    }
+
     const allTables = await this.listTables();
     const allVersioned = allTables.filter(t => t.isVersioned);
     // N2 (COMPRESS_HARDENING_PLAN.md): `options.tables` may ONLY scope graduation.
@@ -1711,14 +1768,18 @@ export class EnterpriseGeodatabase {
     let statesRemoved = 0;
     let pruneResult = { statesRemoved: 0, deltaRowsRemoved: 0, statesSkipped: 0, deltaRowsLostToLateLocks: 0 };
     if (runPrune) {
+      holder.assertHeld();
       pruneResult = await pruneStates(this.connection, allVersioned);
       totalAddsRemoved += pruneResult.deltaRowsRemoved;
       statesRemoved = pruneResult.statesRemoved;
     }
 
-    // Phase 2: collapse linear state chains (child into parent).
+    // Phase 2: collapse linear state chains (child into parent). Pass assertHeld
+    // so the long (~9,966-tx) collapse aborts promptly if the exclusive lock's
+    // dedicated connection dies mid-run rather than continuing unlocked.
+    holder.assertHeld();
     const collapseResult = runCollapse
-      ? await collapseLineages(this.connection, allVersioned)
+      ? await collapseLineages(this.connection, allVersioned, { assertHeld: () => holder.assertHeld() })
       : { collapses: 0, rowsRewritten: 0 };
 
     const allTablesSkipped = graduationByTable.length > 0
@@ -1742,6 +1803,40 @@ export class EnterpriseGeodatabase {
       rowsRewritten: collapseResult.rowsRewritten,
       statesSkippedByPrune: pruneResult.statesSkipped,
       allTablesSkippedDueToConcurrentVersionChange: allTablesSkipped || undefined,
+    };
+    } finally {
+      await holder.release();
+    }
+  }
+
+  /** A dedicated single-session connection ({max:1,min:1}, never idle-reaped)
+   * used only to HOLD the compress exclusive lock via an open transaction for the
+   * whole run. requestTimeout is raised above the lock wait so the driver doesn't
+   * abort the acquire before sp_getapplock's own @LockTimeout fires. */
+  private async createLockConnection(): Promise<IDatabaseConnection> {
+    const base = this.config;
+    const cfg = {
+      ...base,
+      options: {
+        ...base.options,
+        requestTimeout: EnterpriseGeodatabase.COMPRESS_LOCK_TIMEOUT_MS + 30000,
+        pool: { max: 1, min: 1, idleTimeoutMillis: 3_600_000 },
+        dedicatedPool: true,
+      },
+    };
+    const conn = base.driver === 'sqlserver'
+      ? new SqlServerConnection(cfg as SqlServerConfig)
+      : new PostgreSQLConnection(cfg as PostgreSQLConfig);
+    await conn.connect();
+    return conn;
+  }
+
+  private static deferredResult(reason: 'editors-active' | 'lock-contended'): CompressResult {
+    return {
+      addsRemoved: 0, deletesRemoved: 0, statesRemoved: 0,
+      graduatedUpserts: 0, graduatedDeletes: 0, graduationByTable: [],
+      lineagesCollapsed: 0, rowsRewritten: 0, statesSkippedByPrune: 0,
+      deferred: reason,
     };
   }
 

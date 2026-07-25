@@ -22,7 +22,7 @@ import type { TableInfo } from '../../src/types';
 
 export const HAVE_DB = !!process.env.EGDB_COMPRESS_DB;
 
-const CFG = {
+export const CFG = {
   driver: 'sqlserver' as const,
   server: process.env.EGDB_COMPRESS_HOST ?? '127.0.0.1',
   port: Number(process.env.EGDB_COMPRESS_PORT ?? 11433),
@@ -30,6 +30,9 @@ const CFG = {
   password: process.env.EGDB_COMPRESS_PASSWORD ?? 'YourStrong@Passw0rd',
   options: { trustServerCertificate: true },
 };
+/** Full config bound to a specific scratch DB — for constructing an
+ * EnterpriseGeodatabase whose compress() can spin up its own dedicated lock connection. */
+export const e2eConfig = (database: string) => ({ ...CFG, database });
 export const REG_ID = 18;
 
 /** The single registered table the harness uses. Base = `base18`, deltas a18/D18. */

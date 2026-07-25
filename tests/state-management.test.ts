@@ -48,6 +48,8 @@ function makeMock(opts: MockOptions = {}): {
     async close() {},
     async query<T = Record<string, unknown>>(sql: string, params?: unknown[]) {
       calls.push({ kind: 'query', sql, params });
+      // Grant the N9 shared applock by default (createChildState acquires it first).
+      if (/sp_getapplock|pg_advisory/.test(sql)) return [{ code: 0 }] as T[];
       const match = (opts.queryResponses ?? []).find((r) => r.match.test(sql));
       return (match?.rows ?? []) as T[];
     },
@@ -101,13 +103,15 @@ describe('createChildState', () => {
     const newId = await createChildState(connection, 100);
     expect(newId).toBe(25067);
 
-    // Single batch that allocates the id from SDE_object_ids and calls the
-    // native edit-state proc, threading the parent state id as the param.
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.sql).toMatch(/SDE_get_primary_oid 8, 1/);
-    expect(calls[0]!.sql).toMatch(/SDE_state_new_edit/);
-    expect(calls[0]!.sql).not.toMatch(/SDE_state_id_generator/);
-    expect(calls[0]!.params).toEqual([100]);
+    // Two calls: the N9 SHARED compress applock first, then the single batch that
+    // allocates the id from SDE_object_ids and calls the native edit-state proc.
+    expect(calls).toHaveLength(2);
+    expect(calls[0]!.sql).toMatch(/sp_getapplock/);
+    const edit = calls[1]!;
+    expect(edit.sql).toMatch(/SDE_get_primary_oid 8, 1/);
+    expect(edit.sql).toMatch(/SDE_state_new_edit/);
+    expect(edit.sql).not.toMatch(/SDE_state_id_generator/);
+    expect(edit.params).toEqual([100]);
   });
 
   it('throws when the native state proc returns nothing', async () => {

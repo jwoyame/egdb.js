@@ -937,6 +937,7 @@ async function computeCollapsePlan(
 export async function collapseLineages(
   connection: IDatabaseConnection,
   tables: TableInfo[],
+  opts?: { assertHeld?: () => void },
 ): Promise<CollapseResult> {
   const result: CollapseResult = { collapses: 0, rowsRewritten: 0 };
   const driver = connection.driver;
@@ -952,7 +953,12 @@ export async function collapseLineages(
   const lockedExpanded = await readLockedBranches(connection);
   const plan = await computeCollapsePlan(connection, lockedExpanded);
   {
+    let sinceCheck = 0;
     for (const { parent, child } of plan) {
+      // Periodically confirm the compress exclusive lock is still held (its
+      // dedicated connection could have been dropped mid-run) so the ~9,966-tx
+      // collapse aborts promptly rather than continuing unlocked.
+      if (opts?.assertHeld && ++sinceCheck >= 200) { sinceCheck = 0; opts.assertHeld(); }
       // ONE transaction for the whole pair — delta rewrites AND metadata — so a
       // failure (e.g. the states_cuk dance below) rolls back atomically instead
       // of leaving the child's edits committed at the parent with the state tree
