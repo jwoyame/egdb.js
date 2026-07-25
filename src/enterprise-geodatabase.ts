@@ -64,7 +64,10 @@ import {
   ApplockTimeoutError,
   acquireCompressLock,
   EDITOR_SHARED_LOCK_TIMEOUT_MS,
+  captureVisibleSnapshot,
+  compareSnapshots,
 } from './reconcile';
+import type { SelfCheckResult } from './reconcile';
 import type { GraduateTableResult } from './reconcile';
 import type { StaleLockCleanupResult } from './reconcile';
 
@@ -1729,6 +1732,10 @@ export class EnterpriseGeodatabase {
 
     const allTables = await this.listTables();
     const allVersioned = allTables.filter(t => t.isVersioned);
+
+    // Step C self-check: snapshot every version's visible data (both read paths)
+    // BEFORE the phases run, so we can prove afterward that nothing changed.
+    const beforeSnapshot = options?.verify ? await captureVisibleSnapshot(this.connection, allVersioned) : null;
     // N2 (COMPRESS_HARDENING_PLAN.md): `options.tables` may ONLY scope graduation.
     // Prune and collapse delete/re-point STATES, so they must always operate on
     // EVERY versioned table — otherwise an excluded table keeps A/D rows tagged
@@ -1803,6 +1810,17 @@ export class EnterpriseGeodatabase {
       );
     }
 
+    // Step C self-check: re-snapshot and compare. A parent-walk diff means real
+    // corruption (compress must only reclaim storage) — log at error level.
+    let selfCheck: SelfCheckResult | undefined;
+    if (beforeSnapshot) {
+      const after = await captureVisibleSnapshot(this.connection, allVersioned);
+      selfCheck = compareSnapshots(beforeSnapshot, after);
+      if (!selfCheck.passed) {
+        this._logger.error?.(`compress SELF-CHECK FAILED — a version's visible data changed (egdb read):\n  ${selfCheck.diffs.slice(0, 20).join('\n  ')}`);
+      }
+    }
+
     return {
       addsRemoved: totalAddsRemoved,
       deletesRemoved: totalDeletesRemoved,
@@ -1814,6 +1832,7 @@ export class EnterpriseGeodatabase {
       rowsRewritten: collapseResult.rowsRewritten,
       statesSkippedByPrune: pruneResult.statesSkipped,
       allTablesSkippedDueToConcurrentVersionChange: allTablesSkipped || undefined,
+      selfCheck,
     };
     } finally {
       await holder.release();

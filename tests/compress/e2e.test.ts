@@ -14,6 +14,7 @@ import { EnterpriseGeodatabase } from '../../src/enterprise-geodatabase';
 import { connectScratch, resetFabric, HAVE_DB, e2eConfig } from './db';
 import { materialize } from './fabric-builder';
 import { installE2ESchema, copy18to19, E2E_TABLES } from './db-e2e';
+import { captureVisibleSnapshot, compareSnapshots } from '../../src/reconcile';
 import { snapshotVisible, assertVisibleDataUnchanged, assertStructuralInvariants } from './invariants';
 import { generate } from './op-model';
 import type { SqlServerConnection } from '../../src/connections/sqlserver';
@@ -92,6 +93,27 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
     // All-false selection must REFUSE, not silently no-op green.
     await expect(egdb.compress({ acknowledgeExperimentalUnsafe: true, phases: {} }))
       .rejects.toThrow(/no phases enabled/);
+  });
+
+  it('verify: self-check passes on a clean full compress (egdb-visible data unchanged)', async () => {
+    await materialize(conn, generate(72, 18).fabric);
+    await copy18to19(conn);
+    const res = await egdb.compress({ acknowledgeExperimentalUnsafe: true, verify: true, phases: { prune: true, graduate: true, collapse: true } });
+    expect(res.selfCheck, 'selfCheck present when verify:true').toBeDefined();
+    expect(res.selfCheck!.diffs, 'egdb-visible data unchanged by compress').toEqual([]);
+    expect(res.selfCheck!.passed).toBe(true);
+  });
+
+  it('verify: the self-check DETECTS a visible-data change (snapshot compare)', async () => {
+    // Prove captureVisibleSnapshot/compareSnapshots catch a mutation: snapshot, then
+    // INSERT a brand-new base row (visible in every version), snapshot again → diff.
+    await materialize(conn, generate(72, 18).fabric);
+    const before = await captureVisibleSnapshot(conn, E2E_TABLES);
+    await conn.execute(`INSERT INTO dbo.base18 (OBJECTID, VAL) VALUES (987654, 'INJECTED');`);
+    const after = await captureVisibleSnapshot(conn, E2E_TABLES);
+    const r = compareSnapshots(before, after);
+    expect(r.passed, 'an injected visible row must fail the self-check').toBe(false);
+    expect(r.diffs.length).toBeGreaterThan(0);
   });
 
   it('N2: scoping graduation to one table still prunes/collapses the excluded one safely', async () => {

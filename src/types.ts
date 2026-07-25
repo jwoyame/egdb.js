@@ -496,6 +496,15 @@ export interface CompressOptions {
    * passing explicit `phases`. See openparcels/handoff/NIGHTLY_COMPRESS_ROADMAP.md.
    */
   phases?: { prune?: boolean; graduate?: boolean; collapse?: boolean };
+  /**
+   * Run the post-run SELF-CHECK (NIGHTLY_COMPRESS_ROADMAP.md Step C): snapshot
+   * every version's visible data (both the egdb parent-walk read AND the Esri
+   * closure read) before and after, and compare. Populates `CompressResult.selfCheck`
+   * and logs. A parent-walk diff is real data corruption (fails loud). Off by
+   * default — it is exhaustive (a table scan per version); enable it for
+   * unattended nightly runs.
+   */
+  verify?: boolean;
 }
 
 /** Compression result */
@@ -539,6 +548,13 @@ export interface CompressResult {
    * caller logs this and tries again next window.
    */
   deferred?: 'editors-active' | 'lock-contended';
+  /**
+   * Result of the post-run self-check (only present when `options.verify` was set
+   * and compress actually ran). `passed` is false iff any version's egdb-visible
+   * (parent-walk) data changed — real corruption. (A closure-aware / publish-ETL
+   * check lands with Step D closure repair.)
+   */
+  selfCheck?: { passed: boolean; diffs: string[] };
 }
 
 /**
