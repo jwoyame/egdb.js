@@ -14,7 +14,14 @@
  */
 import { EnterpriseGeodatabase } from '../src/enterprise-geodatabase';
 
-const CFG = { driver: 'sqlserver' as const, server: '127.0.0.1', port: 11433, database: 'parcel_fabric', user: 'sa', password: 'YourStrong@Passw0rd', options: { trustServerCertificate: true, requestTimeout: 600000 } };
+// Defaults target the local Docker clone; override via env for a live read-only run:
+//   CENSUS_PORT=11435 CENSUS_USER=sde CENSUS_PASS='...' npx tsx scripts/closure-census.ts
+const CFG = { driver: 'sqlserver' as const, server: '127.0.0.1',
+  port: Number(process.env.CENSUS_PORT || 11433),
+  database: process.env.CENSUS_DB || 'parcel_fabric',
+  user: process.env.CENSUS_USER || 'sa',
+  password: process.env.CENSUS_PASS || 'YourStrong@Passw0rd',
+  options: { trustServerCertificate: true, requestTimeout: 600000 } };
 
 async function main() {
   const egdb = await EnterpriseGeodatabase.connect(CFG);
