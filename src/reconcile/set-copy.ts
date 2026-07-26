@@ -177,10 +177,9 @@ export async function selectChangedObjectIds(
  * A single column's value rendered as ONE comparable string, for hashing. Geometry
  * is not string-castable, so route it through varbinary; text is forced to a
  * binary collation for the same reason comparableExpr does. Every value is
- * COALESCEd to a sentinel so a NULL is distinct from an empty string and CONCAT_WS
- * (which drops NULLs) cannot silently merge two different rows.
+ * COALESCEd to a sentinel so a NULL is distinct from an empty string.
  */
-function hashPartExpr(driver: 'sqlserver' | 'postgresql', col: ColumnMeta, prefix: string): string {
+function hashValueExpr(driver: 'sqlserver' | 'postgresql', col: ColumnMeta, prefix: string): string {
   const q = prefix + quoteId(driver, col.name);
   const NUL = `'~egdb_null~'`;
   if (driver === 'sqlserver') {
@@ -193,6 +192,20 @@ function hashPartExpr(driver: 'sqlserver' | 'postgresql', col: ColumnMeta, prefi
     return `COALESCE(CAST(${q} AS nvarchar(max)), ${NUL})`;
   }
   return `COALESCE(CAST(${q} AS text), ${NUL})`;
+}
+
+/**
+ * One column rendered as a LENGTH-PREFIXED part: `<byteLen>:<value>`. Prefixing
+ * makes the row serialization injective, so a delimiter character inside a value
+ * cannot shift across a column boundary and collide two different rows into the
+ * same hash (which would silently drop a genuine edit). Byte length (DATALENGTH,
+ * not LEN -- LEN ignores trailing spaces) so 'MAIN ST ' and 'MAIN ST' differ.
+ */
+function hashPartExpr(driver: 'sqlserver' | 'postgresql', col: ColumnMeta, prefix: string): string {
+  const v = hashValueExpr(driver, col, prefix);
+  return driver === 'sqlserver'
+    ? `CONCAT(DATALENGTH(${v}), ':', ${v})`
+    : `CONCAT(octet_length(${v}), ':', ${v})`;
 }
 
 /** Row hash over the payload columns (never SDE_STATE_ID). */
@@ -251,6 +264,11 @@ export async function classifyChildChanges(
   const oidCol = quoteId(driver, 'OBJECTID');
   const stateCol = quoteId(driver, 'SDE_STATE_ID');
 
+  // The A-table's payload columns also hash the BASE row (aliased b.). Standard
+  // SDE registration makes the base table = business columns + no SDE_STATE_ID, so
+  // every payload column exists on both by name; an adds-only column would make
+  // baseHash reference a missing b.<col>. (PG geometry hashes via CAST-as-text and
+  // md5, an untested path -- Putnam is SQL Server; see the rebase defect list.)
   const cols = payloadColumns(await getTableColumnsCached(connection, tableInfo.schema, `a${regId}`));
   const aHash = rowHashExpr(driver, cols, '');
   const baseHash = rowHashExpr(driver, cols, 'b.');
