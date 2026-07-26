@@ -20,7 +20,7 @@ import { installE2ESchema } from '../compress/db-e2e';
 import { materialize } from '../compress/fabric-builder';
 import { dbVisible, snapshotVisible } from '../compress/invariants';
 import { installRebaseProcs, seedIdPool } from './sde-procs';
-import { buildOrphan, expectedAfterRebase, diffMaps } from './rebase-model';
+import { buildOrphan, buildResidueConflict, expectedAfterRebase, diffMaps } from './rebase-model';
 import type { IDatabaseConnection } from '../../src/connections/connection';
 
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
@@ -154,6 +154,49 @@ d('rebaseVersion harness (DB-backed)', () => {
   it('a rebased version is reconciled with DEFAULT (postable) — defect A fixed', async () => {
     const fx = await loadOrphan();
     await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+    expect(await isReconciledInDb(conn, fx.version, fx.parent)).toBe(true);
+  });
+
+  // ---- Defect D: three-way comparison against the common ancestor -------------
+
+  async function loadResidueConflict() {
+    await resetFabric(conn);
+    const fx = buildResidueConflict();
+    await materialize(conn, fx.f);
+    await conn.execute(`UPDATE sde.SDE_versions SET parent_name=@p0 WHERE owner='test' AND name='V';`, [fx.parent]);
+    await seedIdPool(conn);
+    return fx;
+  }
+
+  it('DEFECT D fixed: residue the parent re-edited is a CONFLICT, genuine edits are kept', async () => {
+    const fx = await loadResidueConflict();
+    // Dry run classifies: OID 5 conflict; OID 7 (edit) + 100 (insert) changed;
+    // OID 1 (editor-untouched, DEFAULT-changed) is neither.
+    const plan = await gdb.rebaseVersion(fx.version, { dryRun: true });
+    const conflictOids = plan.conflicts.flatMap((c) => c.objectIds).sort((a, b) => a - b);
+    expect(conflictOids).toEqual([5]);
+    const changedUpdates = plan.replayed.reduce((n, r) => n + r.updates, 0);
+    expect(changedUpdates).toBe(2); // OID 7 and OID 100
+
+    // The tip-only comparison this replaces would have silently replayed OID 5='B'
+    // over DEFAULT's 'C'. The three-way refuses instead.
+    await expect(gdb.rebaseVersion(fx.version, { unsafeExperimental: true }))
+      .rejects.toThrow(/conflict/i);
+
+    // Refusal wrote nothing.
+    const v = await lineageNameOf(conn, fx.version);
+    expect(v.tip).toBe(5); // still on its orphan state
+    expect((await visibleOf(conn, fx.parent)).get(5)).toBe('C'); // DEFAULT intact
+  });
+
+  it('acceptConflicts replays the editor value (favour-edit) and keeps the rest', async () => {
+    const fx = await loadResidueConflict();
+    await gdb.rebaseVersion(fx.version, { unsafeExperimental: true, acceptConflicts: true });
+    const after = await visibleOf(conn, fx.version);
+    expect(after.get(5)).toBe('B');            // editor's value won (favour-edit)
+    expect(after.get(7)).toBe('alex7');        // genuine edit kept
+    expect(after.get(100)).toBe('alex');       // genuine insert kept
+    expect(after.get(1)).toBe('default-new');  // editor-untouched -> DEFAULT's tip
     expect(await isReconciledInDb(conn, fx.version, fx.parent)).toBe(true);
   });
 });

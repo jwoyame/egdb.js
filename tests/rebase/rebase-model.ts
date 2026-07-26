@@ -51,6 +51,48 @@ export function buildOrphan(): RebaseFixture {
 }
 
 /**
+ * DEFECT D fixture. A compress-orphan carrying STALE RECONCILE RESIDUE, mixed
+ * with genuine editor work, so a correct rebase must tell them apart:
+ *
+ *   base (common ancestor, state 0):  OID 1='base1'  OID 5='A'  OID 7='G'
+ *   DEFAULT (0<-10<-11):              OID 1->'default-new' (11), OID 5: 'A'->'B' (10) ->'C' (11)
+ *   Version V (0<-5):                 OID 5='B' (residue), OID 7='alex7' (edit), OID 100='alex' (insert)
+ *
+ * Three-way against the ancestor (base):
+ *   - OID 1: editor untouched, DEFAULT changed -> after rebase = 'default-new'.
+ *   - OID 5: child 'B' != anc 'A', parent 'C' != anc 'A', child != parent -> CONFLICT.
+ *            (Tip-only comparison would REPLAY 'B' and revert DEFAULT's 'C' on post.)
+ *   - OID 7: child 'alex7' != anc 'G', parent == anc (untouched) -> editor change, KEEP.
+ *   - OID 100: insert, absent at anc -> KEEP.
+ */
+export function buildResidueConflict(): RebaseFixture {
+  const f = new Fabric();
+  const t = f.table('parcels');
+  t.base.set(1, { VAL: 'base1' });
+  t.base.set(5, { VAL: 'A' });
+  t.base.set(7, { VAL: 'G' });
+
+  // DEFAULT: 0 <- 10 <- 11
+  f.states.set(10, { stateId: 10, parentStateId: 0, lineageName: 10 });
+  f.states.set(11, { stateId: 11, parentStateId: 10, lineageName: 10 });
+  f.lineages.add('10:0'); f.lineages.add('10:10'); f.lineages.add('10:11');
+  f.versions.set('DEFAULT', 11);
+  t.adds.set('5:10', { oid: 5, state: 10, values: { VAL: 'B' } });   // OID5 A->B
+  t.adds.set('5:11', { oid: 5, state: 11, values: { VAL: 'C' } });   // OID5 B->C (tip)
+  t.adds.set('1:11', { oid: 1, state: 11, values: { VAL: 'default-new' } });
+
+  // Orphan version V: 0 <- 5, holding residue + genuine work.
+  f.states.set(5, { stateId: 5, parentStateId: 0, lineageName: 5 });
+  f.lineages.add('5:0'); f.lineages.add('5:5');
+  f.versions.set('V', 5);
+  t.adds.set('5:5', { oid: 5, state: 5, values: { VAL: 'B' } });      // residue (was DEFAULT's 'B')
+  t.adds.set('7:5', { oid: 7, state: 5, values: { VAL: 'alex7' } });  // genuine edit
+  t.adds.set('100:5', { oid: 100, state: 5, values: { VAL: 'alex' } }); // genuine insert
+
+  return { f, version: 'test.V', parent: 'test.DEFAULT', editorOids: [5, 7, 100] };
+}
+
+/**
  * The version's expected visible set after a correct rebase: the parent tip's
  * visible set, with the editor's own OIDs overlaid from the pre-rebase version
  * view (present -> kept, absent -> deleted).

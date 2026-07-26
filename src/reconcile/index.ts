@@ -116,6 +116,7 @@ export type { StaleLockCleanupResult } from './state-management';
 // Set-based delta copying (replaces the row-by-row copy that could not scale).
 export {
   selectChangedObjectIds,
+  classifyChildChanges,
   selectDeletedObjectIds,
   selectObjectIdsWithARows,
   selectObjectIdsPresentInParent,

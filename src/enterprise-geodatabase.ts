@@ -46,7 +46,7 @@ import {
   countChangesInStates,
   emitBaseShadowMarkers,
   updateVersionState,
-  selectChangedObjectIds,
+  classifyChildChanges,
   selectDeletedObjectIds,
   selectObjectIdsWithARows,
   selectObjectIdsPresentInParent,
@@ -1388,13 +1388,14 @@ export class EnterpriseGeodatabase {
    * branches. isReconciled passes (A), the graduable prefix is no longer emptied
    * (B), and both branches produce identical closures (C).
    *
+   * FIXED (2026-07-26, harness-pinned): D -- change detection is now the reconcile
+   * three-way (classifyChildChanges): the child's value is compared against the
+   * COMMON ANCESTOR, not the parent tip. Stale residue that equals the ancestor is
+   * dropped; an OID both sides changed differently is surfaced as a CONFLICT and
+   * the rebase refuses (unless { acceptConflicts: true }, favour-edit).
+   *
    * STILL OPEN, each independently disqualifying:
    *
-   *  D. TIP-ONLY COMPARISON FALSE-KEEPS. Stale reconcile residue that the parent
-   *     has since changed again differs from the parent's TIP, so it is replayed
-   *     and supersedes DEFAULT's NEWER row -- reverting it on post. The test must
-   *     be three-way against the COMMON ANCESTOR, and a row differing from both
-   *     is a CONFLICT, which this never detects (reconcileVersion does).
    *  E. CREATE-THEN-DELETE RESURRECTS; DELETE-AFTER-RECONCILE VANISHES. The
    *     pureDeletes heuristic is a set difference; it needs a per-OID temporal
    *     test (max D-state vs max A-state).
@@ -1418,18 +1419,18 @@ export class EnterpriseGeodatabase {
    * Server's 1000-row table-value-constructor limit; begin/rollbackTransaction
    * ignore the `wasInTx` pattern every other write path here uses; no
    * open-EditSession/fork check (a save would silently undo the rebase); the
-   * dry-run reports updates under a `deletes` label; `droppedRedundant` counts
-   * OBJECTIDs and reveals nothing about the false-keep in (D).
+   * dry-run reports updates under a `deletes` label.
    */
   async rebaseVersion(
     versionName: string,
-    options?: { dryRun?: boolean; unsafeExperimental?: boolean },
+    options?: { dryRun?: boolean; unsafeExperimental?: boolean; acceptConflicts?: boolean },
   ): Promise<{
     version: string;
     fromState: number;
     toState: number | null;
     replayed: Array<{ table: string; updates: number; deletes: number }>;
     droppedRedundant: number;
+    conflicts: Array<{ table: string; objectIds: number[] }>;
     dryRun: boolean;
   }> {
     // Refuse by default. A dry run is read-only and always allowed; anything that
@@ -1437,10 +1438,10 @@ export class EnterpriseGeodatabase {
     // by accident while the defects above stand.
     if (!options?.dryRun && !options?.unsafeExperimental) {
       throw new Error(
-        'rebaseVersion is NOT production ready: post refuses after a rebase (truncated ' +
-        'closure), compress graduation stalls database-wide, the comparison can revert ' +
-        'newer parent edits, and delete handling resurrects/loses features. See the ' +
-        'open-defect list on the method. ' +
+        'rebaseVersion is NOT production ready: compress graduation can stall ' +
+        'database-wide, delete handling resurrects/loses features, and the parent ' +
+        'is not locked against a concurrent post. See the open-defect list on the ' +
+        'method. ' +
         'Pass { unsafeExperimental: true } to run it anyway, or { dryRun: true } to inspect the plan.',
       );
     }
@@ -1464,6 +1465,14 @@ export class EnterpriseGeodatabase {
     const childStates = (await getStatesInRange(this.connection, version.stateId, 0))
       .filter((s) => s > ancestor);
     const parentStates = await getStatesInRange(this.connection, parent.stateId, 0);
+    // States resolving the value AT the common ancestor: the ancestor and its own
+    // ancestry (base handled by fallback). Empty when the ancestor is base 0 (a
+    // compress-orphan), where the ancestor value IS the base row. This is the
+    // third leg of the three-way comparison that distinguishes an editor's real
+    // change from stale reconcile residue (defect D).
+    const ancestorStates = ancestor > 0
+      ? await getStatesInRange(this.connection, ancestor, 0)
+      : [];
 
     const versionedTables = (await this.listTables()).filter((t) => t.isVersioned);
 
@@ -1479,8 +1488,19 @@ export class EnterpriseGeodatabase {
     // Work out what to replay BEFORE opening a transaction (all reads).
     const plan: Array<{ table: TableInfo; changed: number[]; pureDeletes: number[]; redundant: number }> = [];
     let droppedRedundant = 0;
+    const allConflicts: Array<{ table: string; objectIds: number[] }> = [];
     for (const table of versionedTables) {
-      const changed = await selectChangedObjectIds(this.connection, table, childStates, parentStates);
+      // Three-way against the common ancestor: keep the editor's genuine changes,
+      // drop stale reconcile residue, and surface rows BOTH sides changed as
+      // conflicts (defect D). Replaces the old tip-only selectChangedObjectIds.
+      const { changed, conflicts } = await classifyChildChanges(
+        this.connection, table, childStates, parentStates, ancestorStates,
+      );
+      if (conflicts.length) allConflicts.push({ table: table.name, objectIds: conflicts });
+      // favour-edit: when the caller opts into conflicts, the editor's value wins,
+      // so the conflicting OIDs are replayed alongside the clean changes. Without
+      // opt-in the run refuses below, so `replay` is only ever used post-refusal.
+      const replay = options?.acceptConflicts ? [...changed, ...conflicts] : changed;
       const deleted = await selectDeletedObjectIds(this.connection, table, childStates);
       // A PURE delete is a D-row with NO A-row anywhere in the version's states.
       // Filtering only against `changed` is not enough: a reconcile writes a
@@ -1494,16 +1514,17 @@ export class EnterpriseGeodatabase {
       // what the editor's own edit state held). Without the marker the diff
       // mislabels a retirement as a creation. A brand-new feature gets NO marker:
       // one at the same state as its A-row hides it from Esri's *_evw readers.
-      const supersedes = await selectObjectIdsPresentInParent(this.connection, table, changed, parentStates);
+      const supersedes = await selectObjectIdsPresentInParent(this.connection, table, replay, parentStates);
       const markers = [...new Set([...pureDeletes, ...supersedes])];
       // How many of the version's own rows are being discarded as identical to
       // the parent's. This is the number to sanity-check on a dry run: if it is
       // non-zero for a version nobody reconciled, the comparison is dropping
-      // real edits and the rebase must not be run.
-      const redundant = Math.max(0, withARows.size - changed.length);
+      // real edits and the rebase must not be run. Conflicts are not "redundant"
+      // -- they are held out unless favour-edit folds them into the replay set.
+      const redundant = Math.max(0, withARows.size - replay.length - (options?.acceptConflicts ? 0 : conflicts.length));
       droppedRedundant += redundant;
-      if (changed.length || markers.length) {
-        plan.push({ table, changed, pureDeletes: markers, redundant });
+      if (replay.length || markers.length) {
+        plan.push({ table, changed: replay, pureDeletes: markers, redundant });
       }
     }
 
@@ -1514,8 +1535,27 @@ export class EnterpriseGeodatabase {
         toState: null,
         replayed: plan.map((p) => ({ table: p.table.name, updates: p.changed.length, deletes: p.pureDeletes.length })),
         droppedRedundant,
+        conflicts: allConflicts,
         dryRun: true,
       };
+    }
+
+    // A conflict means the editor AND the parent changed the same feature
+    // differently: replaying the editor's value would silently overwrite the
+    // parent's. Refuse -- a human must reconcile it (or opt in explicitly, which
+    // resolves favour-edit by replaying the editor's value). This is what a plain
+    // reconcile does; a rebase must not be laxer.
+    if (allConflicts.length && !options?.acceptConflicts) {
+      const total = allConflicts.reduce((n, c) => n + c.objectIds.length, 0);
+      const detail = allConflicts
+        .map((c) => `${c.table}: ${c.objectIds.slice(0, 20).join(', ')}${c.objectIds.length > 20 ? ', …' : ''}`)
+        .join('; ');
+      throw new Error(
+        `rebaseVersion: ${total} conflict(s) -- the editor and DEFAULT both changed ` +
+        `these features differently, so a rebase cannot merge them automatically: ${detail}. ` +
+        `Reconcile the version manually, or pass { acceptConflicts: true } to replay the ` +
+        `editor's value (favour-edit).`,
+      );
     }
 
     await this.connection.beginTransaction();
@@ -1647,6 +1687,7 @@ export class EnterpriseGeodatabase {
         toState: newState,
         replayed,
         droppedRedundant,
+        conflicts: allConflicts,
         dryRun: false,
       };
     } catch (error) {

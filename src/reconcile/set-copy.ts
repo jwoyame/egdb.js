@@ -174,6 +174,144 @@ export async function selectChangedObjectIds(
 }
 
 /**
+ * A single column's value rendered as ONE comparable string, for hashing. Geometry
+ * is not string-castable, so route it through varbinary; text is forced to a
+ * binary collation for the same reason comparableExpr does. Every value is
+ * COALESCEd to a sentinel so a NULL is distinct from an empty string and CONCAT_WS
+ * (which drops NULLs) cannot silently merge two different rows.
+ */
+function hashPartExpr(driver: 'sqlserver' | 'postgresql', col: ColumnMeta, prefix: string): string {
+  const q = prefix + quoteId(driver, col.name);
+  const NUL = `'~egdb_null~'`;
+  if (driver === 'sqlserver') {
+    if (col.dataType === 'geometry' || col.dataType === 'geography') {
+      return `COALESCE(CONVERT(varchar(max), CAST(${q} AS varbinary(max)), 1), ${NUL})`;
+    }
+    if (TEXT_TYPES.has(col.dataType)) {
+      return `COALESCE(CAST(${q} AS nvarchar(max)) COLLATE Latin1_General_BIN2, ${NUL})`;
+    }
+    return `COALESCE(CAST(${q} AS nvarchar(max)), ${NUL})`;
+  }
+  return `COALESCE(CAST(${q} AS text), ${NUL})`;
+}
+
+/** Row hash over the payload columns (never SDE_STATE_ID). */
+function rowHashExpr(driver: 'sqlserver' | 'postgresql', cols: ColumnMeta[], prefix: string): string {
+  const parts = cols.map((c) => hashPartExpr(driver, c, prefix));
+  return driver === 'sqlserver'
+    ? `HASHBYTES('SHA2_256', CONCAT_WS('|', ${parts.join(', ')}))`
+    : `md5(CONCAT_WS('|', ${parts.join(', ')}))`;
+}
+
+/**
+ * THREE-WAY classification of a child version's own edits, for rebase.
+ *
+ * `selectChangedObjectIds` compares a child row against the parent's TIP only.
+ * That is wrong in two ways a rebase must not get wrong:
+ *   - False keep (defect D): a stale reconcile left the child holding the parent's
+ *     value from an EARLIER state (residue). The parent has since changed that row
+ *     again, so residue != parent tip and the residue gets replayed -- reverting
+ *     the parent's newer edit when the version is later posted.
+ *   - No conflict signal: a row the EDITOR changed and the PARENT also changed,
+ *     differently, is a genuine conflict a human must resolve. Tip-only comparison
+ *     silently replays the editor's value over the parent's.
+ *
+ * The correct question is the reconcile three-way: compare the child's value, the
+ * parent's tip value, and the value at the COMMON ANCESTOR (where the two
+ * diverged). For each OID the editor touched (has an A-row in `childStates`):
+ *   - child == ancestor            -> editor did not really change it; DROP.
+ *   - child != ancestor, parent == ancestor -> editor's change, parent untouched; REPLAY.
+ *   - child != ancestor, parent != ancestor, child == parent -> both made the same
+ *     change; the rebase already sits on the parent tip, so no replay needed; DROP.
+ *   - child != ancestor, parent != ancestor, child != parent -> CONFLICT.
+ *
+ * Values are compared by row hash so an arbitrary column set (including geometry)
+ * collapses to one comparison. "Absent" (no A-row and no base row) is a distinct
+ * value from any present row, so an editor INSERT (absent at ancestor) classifies
+ * as a change, and a row deleted on one side differs from a present row.
+ *
+ * NOTE: delete supersession is NOT modelled here -- an OID the editor added AND
+ * later deleted still resolves to its A-row in this function. Pure deletes travel
+ * the separate selectDeletedObjectIds path; this function only classifies A-rows,
+ * exactly the set selectChangedObjectIds used to return.
+ */
+export async function classifyChildChanges(
+  connection: IDatabaseConnection,
+  tableInfo: TableInfo,
+  childStates: number[],
+  parentStates: number[],
+  ancestorStates: number[],
+): Promise<{ changed: number[]; conflicts: number[] }> {
+  if (childStates.length === 0) return { changed: [], conflicts: [] };
+  const regId = requireRegistrationId(tableInfo);
+  const driver = connection.driver;
+  const qSchema = quoteId(driver, tableInfo.schema);
+  const aTable = `${qSchema}.${quoteId(driver, `a${regId}`)}`;
+  const baseTable = `${qSchema}.${quoteId(driver, tableInfo.name)}`;
+  const oidCol = quoteId(driver, 'OBJECTID');
+  const stateCol = quoteId(driver, 'SDE_STATE_ID');
+
+  const cols = payloadColumns(await getTableColumnsCached(connection, tableInfo.schema, `a${regId}`));
+  const aHash = rowHashExpr(driver, cols, '');
+  const baseHash = rowHashExpr(driver, cols, 'b.');
+
+  const listOrNull = (states: number[], label: string): string =>
+    states.length ? buildIntegerList(states, label) : 'NULL';
+  const childList = listOrNull(childStates, 'classify.child');
+  const parentList = listOrNull(parentStates, 'classify.parent');
+  const ancList = listOrNull(ancestorStates, 'classify.ancestor');
+
+  // Resolved value (present flag + row hash) for the cand OIDs at a state set:
+  // the A-row tip within the set if any, else the base row, else absent.
+  const resolved = (name: string, list: string): string => `
+    ${name} AS (
+      SELECT c.oid,
+        CASE WHEN at.oid IS NOT NULL OR b.${oidCol} IS NOT NULL THEN 1 ELSE 0 END AS present,
+        CASE WHEN at.oid IS NOT NULL THEN at.h
+             WHEN b.${oidCol} IS NOT NULL THEN ${baseHash}
+             ELSE NULL END AS h
+      FROM cand c
+      LEFT JOIN (
+        SELECT ${oidCol} AS oid, ${aHash} AS h,
+               ROW_NUMBER() OVER (PARTITION BY ${oidCol} ORDER BY ${stateCol} DESC) AS rn
+        FROM ${aTable} WHERE ${stateCol} IN (${list})
+      ) at ON at.oid = c.oid AND at.rn = 1
+      LEFT JOIN ${baseTable} b ON b.${oidCol} = c.oid
+    )`;
+
+  const sql = `
+    WITH cand AS (
+      SELECT DISTINCT ${oidCol} AS oid FROM ${aTable} WHERE ${stateCol} IN (${childList})
+    ),
+    ${resolved('child', childList)},
+    ${resolved('anc', ancList)},
+    ${resolved('par', parentList)}
+    SELECT c.oid AS OBJECTID,
+      CASE WHEN a.present = 1 AND ch.h = a.h THEN 1 ELSE 0 END AS childEqAnc,
+      CASE WHEN p.present = a.present AND (a.present = 0 OR p.h = a.h) THEN 1 ELSE 0 END AS parentEqAnc,
+      CASE WHEN p.present = 1 AND ch.h = p.h THEN 1 ELSE 0 END AS childEqParent
+    FROM cand c
+    JOIN child ch ON ch.oid = c.oid
+    JOIN anc a ON a.oid = c.oid
+    JOIN par p ON p.oid = c.oid`;
+
+  const rows = await connection.query<{
+    OBJECTID: number | string; childEqAnc: number; parentEqAnc: number; childEqParent: number;
+  }>(sql);
+
+  const changed: number[] = [];
+  const conflicts: number[] = [];
+  for (const r of rows) {
+    const oid = Number(r.OBJECTID);
+    if (Number(r.childEqAnc) === 1) continue; // editor did not change it
+    if (Number(r.parentEqAnc) === 1) { changed.push(oid); continue; } // editor-only change
+    if (Number(r.childEqParent) === 1) continue; // both made the same change
+    conflicts.push(oid); // both changed it, differently
+  }
+  return { changed, conflicts };
+}
+
+/**
  * Copy, in ONE statement, the tip row for each of `objectIds` from `fromStates`
  * into `toState`.
  *
