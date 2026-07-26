@@ -1382,25 +1382,14 @@ export class EnterpriseGeodatabase {
    * used data with no prior reconcile -- exactly where the remaining bugs live.
    * Treat a green training run here as weak evidence.
    *
-   * OPEN, each independently disqualifying:
+   * FIXED (2026-07-23, harness-pinned): A, B, C -- the closure is now seeded
+   * authoritatively from the parent's PARENT-WALK ancestry (base + ancestors +
+   * new state), idempotent and chunked, converging both SDE_state_new_edit
+   * branches. isReconciled passes (A), the graduable prefix is no longer emptied
+   * (B), and both branches produce identical closures (C).
    *
-   *  A. POST IS IMPOSSIBLE AFTER A REBASE. `isReconciled` (post.ts) is a pure
-   *     closure lookup for (child lineage_name, parent state). Seeding only
-   *     [newState] below leaves that row absent, so postVersion refuses with
-   *     "no longer reconciled" -- the version can only be cleared by the very
-   *     full reconcile this exists to avoid. The closure must be SEEDED with the
-   *     parent's ancestry under the new lineage (one set-based INSERT..SELECT,
-   *     which is what SDE_state_new_edit itself does when it allocates a
-   *     lineage), not truncated to one row.
-   *  B. COMPRESS GRADUATION STOPS DATABASE-WIDE. computeGraduablePrefix
-   *     intersects every version tip's closure; a one-row closure makes that
-   *     intersection empty, so compress graduates nothing for the whole
-   *     geodatabase while any rebased version exists -- and posted work reaches
-   *     the public layer via compress. Silent.
-   *  C. NON-DETERMINISTIC. If the parent tip already has a child,
-   *     SDE_state_new_edit allocates a fresh lineage and copies the parent's
-   *     closure into it, so the code takes a different branch and yields a
-   *     correct closure. Same input, two structurally different outcomes.
+   * STILL OPEN, each independently disqualifying:
+   *
    *  D. TIP-ONLY COMPARISON FALSE-KEEPS. Stale reconcile residue that the parent
    *     has since changed again differs from the parent's TIP, so it is replayed
    *     and supersedes DEFAULT's NEWER row -- reverting it on post. The test must
@@ -1554,36 +1543,69 @@ export class EnterpriseGeodatabase {
         [newState],
       );
 
-      // The new state MUST NOT share the parent's lineage. SDE_state_new_edit
-      // hands the child the parent's lineage_name when the parent's tip has no
-      // other children, and writing that state into the parent's closure makes a
-      // version's UNPOSTED edits visible to every closure-based reader -- Esri's
-      // *_evw and the publish ETL -- i.e. it publishes un-reviewed work. Observed
-      // live. Give the state its own lineage (SDE's convention: lineage_name =
-      // the state that starts the lineage) before touching any closure row.
+      // Closure normalisation -- fixes defect A (post refused) and defect C
+      // (branch-dependent divergence), which share a root cause: the new state's
+      // closure depends on which SDE_state_new_edit path ran.
+      //   - childless parent -> the proc REUSES the parent's lineage_name and
+      //     writes only (parentLineage, newState). Reassigning to a fresh lineage
+      //     then leaves that lineage EMPTY, so isReconciled -- a pure closure
+      //     lookup for the parent tip -- is false and post refuses (A).
+      //   - parent-with-children -> the proc allocates a fresh lineage and copies
+      //     the parent's (possibly-incomplete) CLOSURE into it -- correct only by
+      //     accident of shape (C).
+      // Converge both to one authoritative result: force the new state onto its
+      // OWN lineage (never the parent's -- that leaked unposted edits into
+      // DEFAULT's closure on live), delete whatever the proc wrote for it, and
+      // seed the closure from the parent's PARENT-WALK ancestry (not its closure,
+      // which may itself be divergent) plus base and the new state.
+      const driver = this.connection.driver;
       const parentLineage = await getLineageName(this.connection, parent.stateId);
-      let lineage = await getLineageName(this.connection, newState);
-      if (lineage === parentLineage) {
+      const procLineage = await getLineageName(this.connection, newState);
+      const lineage = newState; // SDE convention: a lineage is named by its root state.
+      if (procLineage !== lineage) {
         await this.connection.execute(
-          this.connection.driver === 'sqlserver'
+          driver === 'sqlserver'
             ? `UPDATE sde.SDE_states SET lineage_name = @p0 WHERE state_id = @p0`
             : `UPDATE sde.sde_states SET lineage_name = $1 WHERE state_id = $1`,
           [newState],
         );
-        lineage = newState;
       }
-      // SDE_state_new_edit maintains the closure ITSELF and inserts
-      // (parentLineage, newState) when it creates the state. Reassigning
-      // lineage_name above does not retract that row, so the version's unposted
-      // state would still sit in the parent's closure -- the exact leak that
-      // exposed un-reviewed edits to Esri *_evw and the publish ETL on live, and
-      // which a training run caught still happening. Retract it explicitly.
+      // Remove every closure row the proc wrote for the new state: the
+      // (parentLineage, newState) stray from the linear path, AND -- only when the
+      // proc allocated a distinct fresh lineage (branch path) -- that whole copy.
+      // Both key on ids unique to this brand-new state, so no other version's
+      // closure is touched. (Deleting `lineage_name = parentLineage` wholesale
+      // would destroy the parent's own closure -- hence the id-scoped conditions.)
       await this.connection.execute(
-        this.connection.driver === 'sqlserver'
-          ? `DELETE FROM sde.SDE_state_lineages WHERE lineage_name = @p0 AND lineage_id = @p1`
-          : `DELETE FROM sde.sde_state_lineages WHERE lineage_name = $1 AND lineage_id = $2`,
-        [parentLineage, newState],
+        driver === 'sqlserver'
+          ? `DELETE FROM sde.SDE_state_lineages
+             WHERE (lineage_name = @p0 AND lineage_id = @p1)
+                OR (@p2 <> @p0 AND lineage_name = @p2)`
+          : `DELETE FROM sde.sde_state_lineages
+             WHERE (lineage_name = $1 AND lineage_id = $2)
+                OR ($3 <> $1 AND lineage_name = $3)`,
+        [parentLineage, newState, procLineage],
       );
+      // Seed the new lineage's closure = base(0) + parent's ancestry + newState.
+      // parentStates (getStatesInRange from the parent tip) already includes the
+      // parent tip, so (lineage, parentTip) exists -> isReconciled passes -> the
+      // version posts. Idempotent (NOT EXISTS) so a re-run duplicates nothing, and
+      // chunked so the VALUES list stays within SQL Server's limits.
+      for (const part of chunkIds([0, ...parentStates, newState])) {
+        const values = part.map((s) => `(${s})`).join(',');
+        await this.connection.execute(
+          driver === 'sqlserver'
+            ? `INSERT INTO sde.SDE_state_lineages (lineage_name, lineage_id)
+               SELECT @p0, v.s FROM (VALUES ${values}) AS v(s)
+               WHERE NOT EXISTS (SELECT 1 FROM sde.SDE_state_lineages sl
+                                 WHERE sl.lineage_name = @p0 AND sl.lineage_id = v.s)`
+            : `INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id)
+               SELECT $1, v.s FROM (VALUES ${values}) AS v(s)
+               WHERE NOT EXISTS (SELECT 1 FROM sde.sde_state_lineages sl
+                                 WHERE sl.lineage_name = $1 AND sl.lineage_id = v.s)`,
+          [lineage],
+        );
+      }
 
       const replayed: Array<{ table: string; updates: number; deletes: number }> = [];
       for (const p of plan) {
@@ -1617,12 +1639,7 @@ export class EnterpriseGeodatabase {
         );
       }
 
-      // Record only the new state, under ITS OWN lineage. Writing the parent's
-      // whole chain here would be thousands of single-row INSERTs inside this
-      // transaction -- the very round-trip pathology this work removes -- and
-      // SDE's closure is sparsely populated by design anyway.
-      await addStatesToLineage(this.connection, lineage, [newState]);
-
+      // (Closure was seeded authoritatively above, before the replay.)
       await this.connection.commitTransaction();
       return {
         version: `${version.owner}.${version.name}`,

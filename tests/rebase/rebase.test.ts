@@ -148,10 +148,10 @@ d('rebaseVersion harness (DB-backed)', () => {
     expect(await visibleOf(conn, fx.parent)).toEqual(before);
   });
 
-  // DEFECT A (open): the rework seeds only [newState] into the closure, so
-  // isReconciled — a pure closure lookup for (child lineage, parent tip) — is
-  // false, and postVersion refuses. A rebased version must be postable.
-  it.fails('DEFECT A: a rebased version is reconciled with DEFAULT (postable)', async () => {
+  // DEFECT A/C (fixed): the closure is seeded from the parent walk, so a rebased
+  // version is reconciled with DEFAULT (postable) regardless of the
+  // SDE_state_new_edit branch taken.
+  it('a rebased version is reconciled with DEFAULT (postable) — defect A fixed', async () => {
     const fx = await loadOrphan();
     await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
     expect(await isReconciledInDb(conn, fx.version, fx.parent)).toBe(true);
