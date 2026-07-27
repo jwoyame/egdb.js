@@ -47,8 +47,6 @@ import {
   emitBaseShadowMarkers,
   updateVersionState,
   classifyChildChanges,
-  selectDeletedObjectIds,
-  selectObjectIdsWithARows,
   selectObjectIdsPresentInParent,
   insertSupersedeMarkers,
   copyTipRows,
@@ -1394,11 +1392,16 @@ export class EnterpriseGeodatabase {
    * dropped; an OID both sides changed differently is surfaced as a CONFLICT and
    * the rebase refuses (unless { acceptConflicts: true }, favour-edit).
    *
+   * FIXED (2026-07-26, harness-pinned): E (and vet #4) -- classifyChildChanges now
+   * resolves each leg (child/ancestor/parent) DELETE-AWARE, matching the reader:
+   * MAX add unless superseded by a later delete, else base unless DELETED_AT is in
+   * the set, else absent. A create-then-delete resolves absent both sides -> DROP
+   * (no resurrect); a delete-after-reconcile resolves child-absent, parent-present
+   * -> emit a delete marker (no vanish); a parent-deleted row the child edited ->
+   * present-vs-absent -> CONFLICT (no silent resurrect).
+   *
    * STILL OPEN, each independently disqualifying:
    *
-   *  E. CREATE-THEN-DELETE RESURRECTS; DELETE-AFTER-RECONCILE VANISHES. The
-   *     pureDeletes heuristic is a set difference; it needs a per-OID temporal
-   *     test (max D-state vs max A-state).
    *  F. PARENT IS NOT LOCKED. Only the child is locked; parentStates/parent tip
    *     are read before the transaction and never revalidated, so a concurrent
    *     post can strand rows dropped as "redundant" against a tip the new state
@@ -1439,9 +1442,9 @@ export class EnterpriseGeodatabase {
     if (!options?.dryRun && !options?.unsafeExperimental) {
       throw new Error(
         'rebaseVersion is NOT production ready: compress graduation can stall ' +
-        'database-wide, delete handling resurrects/loses features, and the parent ' +
-        'is not locked against a concurrent post. See the open-defect list on the ' +
-        'method. ' +
+        'database-wide (H), pure-delete markers are invisible to the egdb reader ' +
+        '(G), and the parent is not locked against a concurrent post (F). See the ' +
+        'open-defect list on the method. ' +
         'Pass { unsafeExperimental: true } to run it anyway, or { dryRun: true } to inspect the plan.',
       );
     }
@@ -1490,41 +1493,32 @@ export class EnterpriseGeodatabase {
     let droppedRedundant = 0;
     const allConflicts: Array<{ table: string; objectIds: number[] }> = [];
     for (const table of versionedTables) {
-      // Three-way against the common ancestor: keep the editor's genuine changes,
-      // drop stale reconcile residue, and surface rows BOTH sides changed as
-      // conflicts (defect D). Replaces the old tip-only selectChangedObjectIds.
-      const { changed, conflicts } = await classifyChildChanges(
+      // Delete-aware three-way against the common ancestor: keep the editor's
+      // genuine adds AND deletes, drop stale reconcile residue, surface rows both
+      // sides changed as conflicts (defects D + E, vet #4). The classifier resolves
+      // each leg to present-with-value or absent exactly as the reader does.
+      const cls = await classifyChildChanges(
         this.connection, table, childStates, parentStates, ancestorStates,
       );
-      if (conflicts.length) allConflicts.push({ table: table.name, objectIds: conflicts });
-      // favour-edit: when the caller opts into conflicts, the editor's value wins,
-      // so the conflicting OIDs are replayed alongside the clean changes. Without
-      // opt-in the run refuses below, so `replay` is only ever used post-refusal.
-      const replay = options?.acceptConflicts ? [...changed, ...conflicts] : changed;
-      const deleted = await selectDeletedObjectIds(this.connection, table, childStates);
-      // A PURE delete is a D-row with NO A-row anywhere in the version's states.
-      // Filtering only against `changed` is not enough: a reconcile writes a
-      // delete marker AND a copied A-row per parent change, and those A-rows are
-      // dropped as identical-to-parent, so their markers would otherwise survive
-      // as thousands of phantom "deletions" that never happened.
-      const withARows = new Set(await selectObjectIdsWithARows(this.connection, table, childStates));
-      const pureDeletes = deleted.filter((oid) => !withARows.has(oid));
-      // A replayed row that SUPERSEDES a row the parent has is an update, whose
-      // native representation is delete-marker + A-row at the same state (exactly
-      // what the editor's own edit state held). Without the marker the diff
-      // mislabels a retirement as a creation. A brand-new feature gets NO marker:
-      // one at the same state as its A-row hides it from Esri's *_evw readers.
-      const supersedes = await selectObjectIdsPresentInParent(this.connection, table, replay, parentStates);
-      const markers = [...new Set([...pureDeletes, ...supersedes])];
-      // How many of the version's own rows are being discarded as identical to
-      // the parent's. This is the number to sanity-check on a dry run: if it is
-      // non-zero for a version nobody reconciled, the comparison is dropping
-      // real edits and the rebase must not be run. Conflicts are not "redundant"
-      // -- they are held out unless favour-edit folds them into the replay set.
-      const redundant = Math.max(0, withARows.size - replay.length - (options?.acceptConflicts ? 0 : conflicts.length));
+      if (cls.conflicts.length) allConflicts.push({ table: table.name, objectIds: cls.conflicts });
+      // favour-edit: opting into conflicts replays the editor's resolution -- a
+      // present child value as an add, an absent one as a delete. Without opt-in
+      // the run refuses below, so these are only used post-refusal.
+      const accept = options?.acceptConflicts;
+      const replayAdds = accept ? [...cls.replayAdds, ...cls.conflictAdds] : cls.replayAdds;
+      const deletes = accept ? [...cls.deletes, ...cls.conflictDeletes] : cls.deletes;
+      // Every delete marker: the editor's deletes (all of which supersede a
+      // parent-present row, by construction) plus the updates -- a replayed add
+      // that also exists in the parent needs delete-marker + A-row, or the diff
+      // mislabels a retirement as a creation. A brand-new insert gets no marker.
+      const supersedes = await selectObjectIdsPresentInParent(this.connection, table, replayAdds, parentStates);
+      const markers = [...new Set([...deletes, ...supersedes])];
+      // Child-touched OIDs discarded as no-net-change. Sanity metric for a dry run:
+      // large for a heavily-reconciled version, ~0 for one nobody reconciled.
+      const redundant = cls.dropped;
       droppedRedundant += redundant;
-      if (replay.length || markers.length) {
-        plan.push({ table, changed: replay, pureDeletes: markers, redundant });
+      if (replayAdds.length || markers.length) {
+        plan.push({ table, changed: replayAdds, pureDeletes: markers, redundant });
       }
     }
 

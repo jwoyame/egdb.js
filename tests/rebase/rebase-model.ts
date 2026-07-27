@@ -93,6 +93,83 @@ export function buildResidueConflict(): RebaseFixture {
 }
 
 /**
+ * DEFECT E fixture (editor deletes). A compress-orphan whose editor both CREATED-
+ * THEN-DELETED a feature and DELETED a reconcile-copied one, mixed with a genuine
+ * insert. A correct rebase must neither resurrect nor lose either delete.
+ *
+ *   base (ancestor):     OID 1='base1'  OID 300='X'
+ *   DEFAULT (0<-10<-11): OID 1 -> 'default-new'; 300 untouched
+ *   Version V (0<-5<-6):
+ *     state 5: insert 100='alex', insert 200='new200', residue 300='X'
+ *     state 6: delete 200 (after its own add), delete 300 (after the reconcile copy)
+ *
+ * Correct rebase:
+ *   - OID 200: created then deleted -> absent both sides -> DROP (no resurrect).
+ *   - OID 300: child absent, parent present -> emit a DELETE marker (no vanish).
+ *   - OID 100: genuine insert -> REPLAY. OID 1: editor-untouched -> DEFAULT's tip.
+ */
+export function buildEditorDeletes(): RebaseFixture {
+  const f = new Fabric();
+  const t = f.table('parcels');
+  t.base.set(1, { VAL: 'base1' });
+  t.base.set(300, { VAL: 'X' });
+
+  // DEFAULT: 0 <- 10 <- 11
+  f.states.set(10, { stateId: 10, parentStateId: 0, lineageName: 10 });
+  f.states.set(11, { stateId: 11, parentStateId: 10, lineageName: 10 });
+  f.lineages.add('10:0'); f.lineages.add('10:10'); f.lineages.add('10:11');
+  f.versions.set('DEFAULT', 11);
+  t.adds.set('1:11', { oid: 1, state: 11, values: { VAL: 'default-new' } });
+
+  // Orphan V: 0 <- 5 <- 6
+  f.states.set(5, { stateId: 5, parentStateId: 0, lineageName: 5 });
+  f.states.set(6, { stateId: 6, parentStateId: 5, lineageName: 5 });
+  f.lineages.add('5:0'); f.lineages.add('5:5'); f.lineages.add('5:6');
+  f.versions.set('V', 6);
+  t.adds.set('100:5', { oid: 100, state: 5, values: { VAL: 'alex' } });
+  t.adds.set('200:5', { oid: 200, state: 5, values: { VAL: 'new200' } });
+  t.adds.set('300:5', { oid: 300, state: 5, values: { VAL: 'X' } }); // reconcile residue
+  // delete-after-add (SDE_STATE_ID 6 > add state 5, DELETED_AT 6 in the lineage):
+  t.dels.push({ oid: 200, state: 6, deletedAt: 6 });
+  t.dels.push({ oid: 300, state: 6, deletedAt: 6 });
+
+  return { f, version: 'test.V', parent: 'test.DEFAULT', editorOids: [100, 200, 300] };
+}
+
+/**
+ * DEFECT E / vet-#4 fixture (delete/update conflict). DEFAULT deleted a feature the
+ * editor edited -- neither side can silently win.
+ *
+ *   base (ancestor):     OID 400='Y'
+ *   DEFAULT (0<-10<-11): DELETE 400 (base row, DELETED_AT in a DEFAULT state)
+ *   Version V (0<-5):    edit 400 -> 'alex400'
+ *
+ * child present ('alex400'), ancestor present ('Y'), parent ABSENT (deleted) ->
+ * child != anc, parent != anc, child != parent -> CONFLICT. favour-edit replays
+ * the editor's value (resurrecting 400 in the version, its owner's choice).
+ */
+export function buildParentDeleteConflict(): RebaseFixture {
+  const f = new Fabric();
+  const t = f.table('parcels');
+  t.base.set(400, { VAL: 'Y' });
+
+  // DEFAULT: 0 <- 10 <- 11, deletes base OID 400 at state 11.
+  f.states.set(10, { stateId: 10, parentStateId: 0, lineageName: 10 });
+  f.states.set(11, { stateId: 11, parentStateId: 10, lineageName: 10 });
+  f.lineages.add('10:0'); f.lineages.add('10:10'); f.lineages.add('10:11');
+  f.versions.set('DEFAULT', 11);
+  t.dels.push({ oid: 400, state: 0, deletedAt: 11 }); // base delete: DELETED_AT in DEFAULT
+
+  // Orphan V: 0 <- 5, edits OID 400.
+  f.states.set(5, { stateId: 5, parentStateId: 0, lineageName: 5 });
+  f.lineages.add('5:0'); f.lineages.add('5:5');
+  f.versions.set('V', 5);
+  t.adds.set('400:5', { oid: 400, state: 5, values: { VAL: 'alex400' } });
+
+  return { f, version: 'test.V', parent: 'test.DEFAULT', editorOids: [400] };
+}
+
+/**
  * The version's expected visible set after a correct rebase: the parent tip's
  * visible set, with the editor's own OIDs overlaid from the pre-rebase version
  * view (present -> kept, absent -> deleted).

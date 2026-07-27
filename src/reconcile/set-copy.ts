@@ -216,37 +216,50 @@ function rowHashExpr(driver: 'sqlserver' | 'postgresql', cols: ColumnMeta[], pre
     : `md5(CONCAT_WS('|', ${parts.join(', ')}))`;
 }
 
+export interface ChildChangeClassification {
+  /** Editor's genuine adds/updates to REPLAY (copy the child tip A-row). */
+  replayAdds: number[];
+  /** Rows the editor DELETED that the parent still has -- emit a supersede marker. */
+  deletes: number[];
+  /** OIDs both sides changed differently (incl. delete/update). Rebase refuses. */
+  conflicts: number[];
+  /** Conflicts whose child value is PRESENT (favour-edit replays these as adds). */
+  conflictAdds: number[];
+  /** Conflicts whose child value is ABSENT (favour-edit replays these as deletes). */
+  conflictDeletes: number[];
+  /** Count of child-touched OIDs that resolved to no net change (dropped). */
+  dropped: number;
+}
+
 /**
- * THREE-WAY classification of a child version's own edits, for rebase.
+ * THREE-WAY, DELETE-AWARE classification of a child version's own edits, for rebase.
  *
- * `selectChangedObjectIds` compares a child row against the parent's TIP only.
- * That is wrong in two ways a rebase must not get wrong:
- *   - False keep (defect D): a stale reconcile left the child holding the parent's
- *     value from an EARLIER state (residue). The parent has since changed that row
- *     again, so residue != parent tip and the residue gets replayed -- reverting
- *     the parent's newer edit when the version is later posted.
- *   - No conflict signal: a row the EDITOR changed and the PARENT also changed,
- *     differently, is a genuine conflict a human must resolve. Tip-only comparison
- *     silently replays the editor's value over the parent's.
+ * `selectChangedObjectIds` compared a child row against the parent's TIP only.
+ * That was wrong in ways a rebase must not get wrong:
+ *   - False keep (defect D): stale reconcile residue the parent has since changed
+ *     again differs from the parent's tip and gets replayed -- reverting the
+ *     parent's newer edit on post.
+ *   - No conflict signal: a row BOTH sides changed differently is a genuine
+ *     conflict a human must resolve, not a silent overwrite.
+ *   - Delete blindness (defect E / vet #4): a create-then-delete resurrects; a
+ *     delete-after-reconcile vanishes; a row the PARENT deleted but the child
+ *     edited is silently resurrected.
  *
- * The correct question is the reconcile three-way: compare the child's value, the
- * parent's tip value, and the value at the COMMON ANCESTOR (where the two
- * diverged). For each OID the editor touched (has an A-row in `childStates`):
- *   - child == ancestor            -> editor did not really change it; DROP.
- *   - child != ancestor, parent == ancestor -> editor's change, parent untouched; REPLAY.
- *   - child != ancestor, parent != ancestor, child == parent -> both made the same
- *     change; the rebase already sits on the parent tip, so no replay needed; DROP.
- *   - child != ancestor, parent != ancestor, child != parent -> CONFLICT.
+ * The correct question is the reconcile three-way over the RESOLVED value (adds
+ * AND deletes) at three points: the child tip, the common ANCESTOR (where the two
+ * diverged), and the parent tip. Resolution matches the reader (dbVisible): the
+ * MAX-state add unless a later delete supersedes it, else the base row unless a
+ * delete marker's DELETED_AT falls in the state set, else ABSENT. Each leg is thus
+ * present-with-value or absent. For every OID the editor touched (add or delete):
+ *   - child == ancestor                     -> no net editor change; DROP.
+ *   - child != ancestor, parent == ancestor -> editor-only change:
+ *       child PRESENT -> REPLAY the add; child ABSENT -> emit a DELETE marker.
+ *   - child != ancestor, parent != ancestor, child == parent -> both same; DROP.
+ *   - child != ancestor, parent != ancestor, child != parent -> CONFLICT
+ *       (covers value/value, delete/update, and update/delete).
  *
- * Values are compared by row hash so an arbitrary column set (including geometry)
- * collapses to one comparison. "Absent" (no A-row and no base row) is a distinct
- * value from any present row, so an editor INSERT (absent at ancestor) classifies
- * as a change, and a row deleted on one side differs from a present row.
- *
- * NOTE: delete supersession is NOT modelled here -- an OID the editor added AND
- * later deleted still resolves to its A-row in this function. Pure deletes travel
- * the separate selectDeletedObjectIds path; this function only classifies A-rows,
- * exactly the set selectChangedObjectIds used to return.
+ * Values compare by row hash so an arbitrary column set (incl. geometry) collapses
+ * to one comparison; ABSENT is a distinct value from any present row.
  */
 export async function classifyChildChanges(
   connection: IDatabaseConnection,
@@ -254,15 +267,22 @@ export async function classifyChildChanges(
   childStates: number[],
   parentStates: number[],
   ancestorStates: number[],
-): Promise<{ changed: number[]; conflicts: number[] }> {
-  if (childStates.length === 0) return { changed: [], conflicts: [] };
+): Promise<ChildChangeClassification> {
+  const empty: ChildChangeClassification = {
+    replayAdds: [], deletes: [], conflicts: [], conflictAdds: [], conflictDeletes: [], dropped: 0,
+  };
+  if (childStates.length === 0) return empty;
   const regId = requireRegistrationId(tableInfo);
   const driver = connection.driver;
   const qSchema = quoteId(driver, tableInfo.schema);
   const aTable = `${qSchema}.${quoteId(driver, `a${regId}`)}`;
+  const dTable = `${qSchema}.${quoteId(driver, `D${regId}`)}`;
   const baseTable = `${qSchema}.${quoteId(driver, tableInfo.name)}`;
   const oidCol = quoteId(driver, 'OBJECTID');
   const stateCol = quoteId(driver, 'SDE_STATE_ID');
+  const dOid = driver === 'sqlserver' ? 'SDE_DELETES_ROW_ID' : 'sde_deletes_row_id';
+  const dState = driver === 'sqlserver' ? 'SDE_STATE_ID' : 'sde_state_id';
+  const dDelAt = driver === 'sqlserver' ? 'DELETED_AT' : 'deleted_at';
 
   // The A-table's payload columns also hash the BASE row (aliased b.). Standard
   // SDE registration makes the base table = business columns + no SDE_STATE_ID, so
@@ -279,54 +299,83 @@ export async function classifyChildChanges(
   const parentList = listOrNull(parentStates, 'classify.parent');
   const ancList = listOrNull(ancestorStates, 'classify.ancestor');
 
-  // Resolved value (present flag + row hash) for the cand OIDs at a state set:
-  // the A-row tip within the set if any, else the base row, else absent.
+  // Resolved value (present + row hash) for the cand OIDs at a state set, matching
+  // the reader's delete semantics:
+  //   surviving add = MAX-state add NOT superseded by a delete at a strictly later
+  //   state (SDE_STATE_ID > that add's state); else the base row UNLESS a marker's
+  //   DELETED_AT is in the set; else absent.
+  const addSuppressed = (list: string): string =>
+    `EXISTS (SELECT 1 FROM ${dTable} d WHERE d.${dOid} = c.oid
+             AND d.${dState} IN (${list}) AND d.${dState} > mx.am)`;
+  const baseDeleted = (list: string): string =>
+    `EXISTS (SELECT 1 FROM ${dTable} d WHERE d.${dOid} = c.oid AND d.${dDelAt} IN (${list}))`;
   const resolved = (name: string, list: string): string => `
     ${name} AS (
       SELECT c.oid,
-        CASE WHEN at.oid IS NOT NULL OR b.${oidCol} IS NOT NULL THEN 1 ELSE 0 END AS present,
-        CASE WHEN at.oid IS NOT NULL THEN at.h
-             WHEN b.${oidCol} IS NOT NULL THEN ${baseHash}
+        CASE WHEN mx.am IS NOT NULL AND NOT ${addSuppressed(list)} THEN 1
+             WHEN mx.am IS NOT NULL THEN 0
+             WHEN b.${oidCol} IS NOT NULL AND NOT ${baseDeleted(list)} THEN 1
+             ELSE 0 END AS present,
+        CASE WHEN mx.am IS NOT NULL AND NOT ${addSuppressed(list)} THEN at.h
+             WHEN mx.am IS NULL AND b.${oidCol} IS NOT NULL AND NOT ${baseDeleted(list)} THEN ${baseHash}
              ELSE NULL END AS h
       FROM cand c
       LEFT JOIN (
-        SELECT ${oidCol} AS oid, ${aHash} AS h,
-               ROW_NUMBER() OVER (PARTITION BY ${oidCol} ORDER BY ${stateCol} DESC) AS rn
+        SELECT ${oidCol} AS oid, MAX(${stateCol}) AS am
+        FROM ${aTable} WHERE ${stateCol} IN (${list}) GROUP BY ${oidCol}
+      ) mx ON mx.oid = c.oid
+      LEFT JOIN (
+        SELECT ${oidCol} AS oid, ${stateCol} AS st, ${aHash} AS h
         FROM ${aTable} WHERE ${stateCol} IN (${list})
-      ) at ON at.oid = c.oid AND at.rn = 1
+      ) at ON at.oid = c.oid AND at.st = mx.am
       LEFT JOIN ${baseTable} b ON b.${oidCol} = c.oid
     )`;
 
+  // cand = every OID the editor touched: an add OR a delete marker (by either
+  // column) in the child's own states. The delete-only OIDs catch pure base
+  // deletes that have no A-row at all.
   const sql = `
     WITH cand AS (
       SELECT DISTINCT ${oidCol} AS oid FROM ${aTable} WHERE ${stateCol} IN (${childList})
+      UNION
+      SELECT DISTINCT ${dOid} AS oid FROM ${dTable}
+        WHERE ${dState} IN (${childList}) OR ${dDelAt} IN (${childList})
     ),
     ${resolved('child', childList)},
     ${resolved('anc', ancList)},
     ${resolved('par', parentList)}
-    SELECT c.oid AS OBJECTID,
-      CASE WHEN a.present = 1 AND ch.h = a.h THEN 1 ELSE 0 END AS childEqAnc,
+    SELECT c.oid AS OBJECTID, ch.present AS childPresent,
+      CASE WHEN ch.present = a.present AND (ch.present = 0 OR ch.h = a.h) THEN 1 ELSE 0 END AS childEqAnc,
       CASE WHEN p.present = a.present AND (a.present = 0 OR p.h = a.h) THEN 1 ELSE 0 END AS parentEqAnc,
-      CASE WHEN p.present = 1 AND ch.h = p.h THEN 1 ELSE 0 END AS childEqParent
+      CASE WHEN ch.present = p.present AND (ch.present = 0 OR ch.h = p.h) THEN 1 ELSE 0 END AS childEqParent
     FROM cand c
     JOIN child ch ON ch.oid = c.oid
     JOIN anc a ON a.oid = c.oid
     JOIN par p ON p.oid = c.oid`;
 
   const rows = await connection.query<{
-    OBJECTID: number | string; childEqAnc: number; parentEqAnc: number; childEqParent: number;
+    OBJECTID: number | string; childPresent: number;
+    childEqAnc: number; parentEqAnc: number; childEqParent: number;
   }>(sql);
 
-  const changed: number[] = [];
-  const conflicts: number[] = [];
+  const out: ChildChangeClassification = {
+    replayAdds: [], deletes: [], conflicts: [], conflictAdds: [], conflictDeletes: [], dropped: 0,
+  };
   for (const r of rows) {
     const oid = Number(r.OBJECTID);
-    if (Number(r.childEqAnc) === 1) continue; // editor did not change it
-    if (Number(r.parentEqAnc) === 1) { changed.push(oid); continue; } // editor-only change
-    if (Number(r.childEqParent) === 1) continue; // both made the same change
-    conflicts.push(oid); // both changed it, differently
+    const present = Number(r.childPresent) === 1;
+    if (Number(r.childEqAnc) === 1) { out.dropped++; continue; } // no net editor change
+    if (Number(r.parentEqAnc) === 1) {                            // editor-only change
+      if (present) out.replayAdds.push(oid);
+      else out.deletes.push(oid);
+      continue;
+    }
+    if (Number(r.childEqParent) === 1) { out.dropped++; continue; } // both made the same change
+    out.conflicts.push(oid);                                      // both changed, differently
+    if (present) out.conflictAdds.push(oid);
+    else out.conflictDeletes.push(oid);
   }
-  return { changed, conflicts };
+  return out;
 }
 
 /**

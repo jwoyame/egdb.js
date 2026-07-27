@@ -20,7 +20,10 @@ import { installE2ESchema } from '../compress/db-e2e';
 import { materialize } from '../compress/fabric-builder';
 import { dbVisible, snapshotVisible } from '../compress/invariants';
 import { installRebaseProcs, seedIdPool } from './sde-procs';
-import { buildOrphan, buildResidueConflict, expectedAfterRebase, diffMaps } from './rebase-model';
+import {
+  buildOrphan, buildResidueConflict, buildEditorDeletes, buildParentDeleteConflict,
+  expectedAfterRebase, diffMaps,
+} from './rebase-model';
 import type { IDatabaseConnection } from '../../src/connections/connection';
 
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
@@ -198,5 +201,50 @@ d('rebaseVersion harness (DB-backed)', () => {
     expect(after.get(100)).toBe('alex');       // genuine insert kept
     expect(after.get(1)).toBe('default-new');  // editor-untouched -> DEFAULT's tip
     expect(await isReconciledInDb(conn, fx.version, fx.parent)).toBe(true);
+  });
+
+  // ---- Defect E: delete-aware resolution --------------------------------------
+
+  async function loadFixture(build: () => ReturnType<typeof buildEditorDeletes>) {
+    await resetFabric(conn);
+    const fx = build();
+    await materialize(conn, fx.f);
+    await conn.execute(`UPDATE sde.SDE_versions SET parent_name=@p0 WHERE owner='test' AND name='V';`, [fx.parent]);
+    await seedIdPool(conn);
+    return fx;
+  }
+
+  it('DEFECT E fixed: create-then-delete drops, delete-after-reconcile emits a delete', async () => {
+    const fx = await loadFixture(buildEditorDeletes);
+    const before = await visibleOf(conn, fx.version);
+    const parentVisible = await visibleOf(conn, fx.parent);
+    // Pre-rebase the version already resolves 200 and 300 as absent (editor deleted).
+    expect(before.has(200)).toBe(false);
+    expect(before.has(300)).toBe(false);
+
+    await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+
+    const after = await visibleOf(conn, fx.version);
+    const problems = diffMaps(expectedAfterRebase(before, parentVisible, fx.editorOids), after);
+    expect(problems, problems.join('; ')).toEqual([]);
+    expect(after.has(200)).toBe(false);        // NOT resurrected (create-then-delete)
+    expect(after.has(300)).toBe(false);        // editor's delete kept (no vanish)
+    expect(after.get(100)).toBe('alex');       // genuine insert survives
+    expect(after.get(1)).toBe('default-new');  // editor-untouched -> DEFAULT's tip
+    // DEFAULT still has 300 -- the delete is the version's, not posted.
+    expect((await visibleOf(conn, fx.parent)).get(300)).toBe('X');
+  });
+
+  it('DEFECT #4 fixed: parent-deleted row the child edited is a CONFLICT', async () => {
+    const fx = await loadFixture(buildParentDeleteConflict);
+    const plan = await gdb.rebaseVersion(fx.version, { dryRun: true });
+    expect(plan.conflicts.flatMap((c) => c.objectIds)).toEqual([400]);
+
+    await expect(gdb.rebaseVersion(fx.version, { unsafeExperimental: true }))
+      .rejects.toThrow(/conflict/i);
+
+    // favour-edit resurrects the editor's version of 400 (the owner's call).
+    await gdb.rebaseVersion(fx.version, { unsafeExperimental: true, acceptConflicts: true });
+    expect((await visibleOf(conn, fx.version)).get(400)).toBe('alex400');
   });
 });
