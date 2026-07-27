@@ -1687,9 +1687,12 @@ export class EnterpriseGeodatabase {
         for (const part of chunkIds(p.pureDeletes)) {
           // Native delete marker at newState: (SDE_STATE_ID, DELETED_AT) = (newState,
           // newState). newState > any parent add state, so the egdb reader suppresses
-          // it (G); newState is the version's own tip, never in the graduable prefix
-          // while unposted, so it can't graduate into DELETE FROM base (H). The Esri
-          // base-shadow markers are the post path's job (emitBaseShadowMarkers).
+          // it (G); newState is the version's own tip -- a DESCENDANT of the DEFAULT
+          // tip, which is always a version row that does not descend from newState --
+          // so newState is never an ancestor common to all tips, i.e. never in the
+          // graduable prefix while unposted, so it can't graduate into DELETE FROM
+          // base (H). The Esri base-shadow markers are the post path's job
+          // (emitBaseShadowMarkers).
           deletes += await insertDeleteMarkers(this.connection, p.table, part, newState);
         }
         replayed.push({ table: p.table.name, updates, deletes });

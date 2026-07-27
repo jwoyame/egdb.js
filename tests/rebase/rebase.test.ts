@@ -15,10 +15,12 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { EnterpriseGeodatabase } from '../../src/enterprise-geodatabase';
-import { connectScratch, resetFabric, HAVE_DB, REG_ID } from '../compress/db';
+import { connectScratch, resetFabric, HAVE_DB, REG_ID, e2eConfig } from '../compress/db';
 import { installE2ESchema } from '../compress/db-e2e';
 import { materialize } from '../compress/fabric-builder';
-import { dbVisible, snapshotVisible } from '../compress/invariants';
+import {
+  dbVisible, snapshotVisible, assertVisibleDataUnchanged, assertStructuralInvariants,
+} from '../compress/invariants';
 import { installRebaseProcs, seedIdPool } from './sde-procs';
 import {
   buildOrphan, buildResidueConflict, buildEditorDeletes, buildParentDeleteConflict,
@@ -83,8 +85,10 @@ d('rebaseVersion harness (DB-backed)', () => {
     await installE2ESchema(conn);
     await ensureVersionColumns(conn);
     await installRebaseProcs(conn);
+    // Full config (not just driver+logger) so compress()'s N9 exclusive-lock
+    // holder can open its own dedicated connection to the same scratch DB (A7).
     gdb = new (EnterpriseGeodatabase as unknown as new (c: unknown, conn: unknown) => EnterpriseGeodatabase)(
-      { driver: 'sqlserver', logger: silent }, conn);
+      { ...e2eConfig('egdb_rebase_test'), logger: silent }, conn);
   });
   afterAll(async () => { if (conn) await conn.close(); });
 
@@ -331,5 +335,46 @@ d('rebaseVersion harness (DB-backed)', () => {
     await conn.execute(`UPDATE sde.SDE_versions SET state_id=11 WHERE name='DEFAULT';`);
     await conn.execute(`DELETE FROM sde.SDE_states WHERE state_id=999;`);
     expect(await snapshotVisible(conn)).toEqual(before);
+  });
+
+  // ---- Capstone: does the rebased version still WORK? (A4 post, A7 compress) ---
+  // Rounds 1 and 2 shipped broken precisely because they never ran these.
+
+  it('A4: a rebased version POSTS with no prior reconcile, landing the editor work in DEFAULT', async () => {
+    const fx = await loadFixture(buildEditorDeletes);
+    await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+
+    // NO reconcileVersion() first -- the rebase already reconciled it (defect A).
+    // If post refused here, A would be broken. trimPost is the closure-correct
+    // path Esri readers/publish-ETL need.
+    const res = await gdb.postVersion(fx.version, { trimPost: true });
+    expect(res.changesPosted).toBeGreaterThan(0);
+
+    const def = await visibleOf(conn, fx.parent);
+    expect(def.get(100)).toBe('alex');       // editor insert landed in DEFAULT
+    expect(def.has(300)).toBe(false);        // editor delete landed in DEFAULT
+    expect(def.has(200)).toBe(false);        // create-then-delete never existed
+    expect(def.get(1)).toBe('default-new');  // DEFAULT's own edit intact
+  });
+
+  it('A7: a rebased (unposted) version survives a full compress, visible data unchanged', async () => {
+    const fx = await loadFixture(buildEditorDeletes);
+    await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+
+    const before = await snapshotVisible(conn);
+    const res = await gdb.compress({
+      acknowledgeExperimentalUnsafe: true,
+      phases: { prune: true, graduate: true, collapse: true },
+    });
+    expect(res).toBeDefined();
+
+    // Every version (DEFAULT + the rebased V) reads identically after compress,
+    // and no orphaned SDE_STATE_ID=0 marker was left (C0 guard).
+    assertVisibleDataUnchanged(before, await snapshotVisible(conn));
+    await assertStructuralInvariants(conn);
+    // The rebased version's own work is intact through the compress.
+    const v = await visibleOf(conn, fx.version);
+    expect(v.get(100)).toBe('alex');
+    expect(v.has(300)).toBe(false);
   });
 });
