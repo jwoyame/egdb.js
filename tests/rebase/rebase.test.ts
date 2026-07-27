@@ -377,4 +377,52 @@ d('rebaseVersion harness (DB-backed)', () => {
     expect(v.get(100)).toBe('alex');
     expect(v.has(300)).toBe(false);
   });
+
+  it('scale: rebases onto a DEFAULT with a 1500-state ancestry (no IN-list / VALUES overflow)', async () => {
+    await resetFabric(conn);
+    await conn.execute(`INSERT INTO dbo.base18 (OBJECTID, VAL) VALUES (1, 'base1');`);
+    // A 1500-deep DEFAULT chain (states 100..1599; 100's parent is base 0). The old
+    // code inlined every one of these as an IN-list and chunked them into a 2000-row
+    // VALUES constructor -- over SQL Server's 1000-row limit. The in-SQL walk + 1000
+    // chunk handle it.
+    await conn.execute(`
+      WITH n AS (SELECT 100 AS id UNION ALL SELECT id+1 FROM n WHERE id < 1599)
+      INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id)
+      SELECT id, 'sde', 200, CASE WHEN id=100 THEN 0 ELSE id-1 END FROM n OPTION (MAXRECURSION 0);`);
+    await conn.execute(`INSERT INTO sde.SDE_versions (name, owner, state_id, parent_name) VALUES ('DEFAULT','test',1599,NULL);`);
+    // Orphan V rooted at base with one editor insert.
+    await conn.execute(`INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id) VALUES (5,'sde',5,0);`);
+    await conn.execute(`INSERT INTO sde.SDE_versions (name, owner, state_id, parent_name) VALUES ('V','test',5,'test.DEFAULT');`);
+    await conn.execute(`INSERT INTO dbo.a18 (OBJECTID, SDE_STATE_ID, VAL) VALUES (100, 5, 'alex');`);
+    await seedIdPool(conn);
+
+    const res = await gdb.rebaseVersion('test.V', { unsafeExperimental: true });
+    expect((await visibleOf(conn, 'test.V')).get(100)).toBe('alex');
+    expect(await isReconciledInDb(conn, 'test.V', 'test.DEFAULT')).toBe(true);
+    // The closure was seeded from the whole 1500-state walk (> the old 1000 limit).
+    const clo = await conn.query<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM sde.SDE_state_lineages WHERE lineage_name=@p0;`, [res.toState]);
+    expect(Number(clo[0]!.n)).toBeGreaterThan(1000);
+  });
+
+  it('idempotent: rebasing an already-rebased version is a no-op (no parallel state)', async () => {
+    const fx = await loadOrphan();
+    const res1 = await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+    const n1 = await conn.query<{ n: number }>(`SELECT COUNT(*) AS n FROM sde.SDE_states;`);
+
+    const res2 = await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+    expect(res2.toState).toBe(res1.toState);   // same tip, not a fresh parallel state
+    expect(res2.replayed).toEqual([]);         // nothing re-replayed
+    const n2 = await conn.query<{ n: number }>(`SELECT COUNT(*) AS n FROM sde.SDE_states;`);
+    expect(Number(n2[0]!.n)).toBe(Number(n1[0]!.n)); // no new state created
+  });
+
+  it('refuses to rebase while an edit session is open on the version', async () => {
+    const fx = await loadOrphan(); // V tip = 5
+    // Simulate an open EditSession: a locked transient edit state off the tip.
+    await conn.execute(`INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id) VALUES (6,'sde',5,5);`);
+    await conn.execute(`INSERT INTO sde.SDE_state_locks (sde_id, state_id) VALUES (1, 6);`);
+    await expect(gdb.rebaseVersion(fx.version, { unsafeExperimental: true }))
+      .rejects.toThrow(/edit session is open/i);
+  });
 });

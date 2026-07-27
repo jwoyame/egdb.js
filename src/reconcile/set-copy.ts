@@ -265,8 +265,8 @@ export async function classifyChildChanges(
   connection: IDatabaseConnection,
   tableInfo: TableInfo,
   childStates: number[],
-  parentStates: number[],
-  ancestorStates: number[],
+  parentTip: number,
+  ancestorState: number,
 ): Promise<ChildChangeClassification> {
   const empty: ChildChangeClassification = {
     replayAdds: [], deletes: [], conflicts: [], conflictAdds: [], conflictDeletes: [], dropped: 0,
@@ -293,11 +293,31 @@ export async function classifyChildChanges(
   const aHash = rowHashExpr(driver, cols, '');
   const baseHash = rowHashExpr(driver, cols, 'b.');
 
-  const listOrNull = (states: number[], label: string): string =>
-    states.length ? buildIntegerList(states, label) : 'NULL';
-  const childList = listOrNull(childStates, 'classify.child');
-  const parentList = listOrNull(parentStates, 'classify.parent');
-  const ancList = listOrNull(ancestorStates, 'classify.ancestor');
+  const childList = buildIntegerList(childStates, 'classify.child');
+  // Parent and ancestor state sets are derived IN-SQL by walking parent_state_id
+  // from their tips, NOT inlined as thousands of ids: a pre-compress DEFAULT
+  // ancestry can be 10k+, which would blow the query text / expression limits.
+  // Base 0 is excluded (the base-row fallback covers it); an ancestorState of 0
+  // yields an EMPTY walk, so the ancestor value IS the base row -- exactly the
+  // compress-orphan case. `list` interpolates as a subquery, so every `IN (list)`
+  // below becomes `IN (SELECT s FROM ...)`.
+  const intId = (n: number, label: string): number => {
+    if (!Number.isInteger(n)) throw new Error(`classifyChildChanges: ${label} must be an integer (got ${n})`);
+    return n;
+  };
+  const statesTbl = driver === 'sqlserver' ? 'sde.SDE_states' : 'sde.sde_states';
+  const walkCte = (name: string, tip: number): string => `
+    ${name} AS (
+      SELECT state_id AS s, parent_state_id AS p FROM ${statesTbl}
+        WHERE state_id = ${intId(tip, name)} AND ${intId(tip, name)} <> 0
+      UNION ALL
+      SELECT st.state_id, st.parent_state_id FROM ${statesTbl} st
+        JOIN ${name} x ON st.state_id = x.p WHERE x.p <> 0
+    )`;
+  const parentList = 'SELECT s FROM pstates';
+  const ancList = 'SELECT s FROM astates';
+  const recursive = driver === 'sqlserver' ? '' : 'RECURSIVE ';
+  const maxrec = driver === 'sqlserver' ? '\n    OPTION (MAXRECURSION 0)' : '';
 
   // Resolved value (present + row hash) for the cand OIDs at a state set, matching
   // the reader's delete semantics:
@@ -335,7 +355,9 @@ export async function classifyChildChanges(
   // column) in the child's own states. The delete-only OIDs catch pure base
   // deletes that have no A-row at all.
   const sql = `
-    WITH cand AS (
+    WITH ${recursive}${walkCte('pstates', parentTip)},
+    ${walkCte('astates', ancestorState)},
+    cand AS (
       SELECT DISTINCT ${oidCol} AS oid FROM ${aTable} WHERE ${stateCol} IN (${childList})
       UNION
       SELECT DISTINCT ${dOid} AS oid FROM ${dTable}
@@ -351,7 +373,7 @@ export async function classifyChildChanges(
     FROM cand c
     JOIN child ch ON ch.oid = c.oid
     JOIN anc a ON a.oid = c.oid
-    JOIN par p ON p.oid = c.oid`;
+    JOIN par p ON p.oid = c.oid${maxrec}`;
 
   const rows = await connection.query<{
     OBJECTID: number | string; childPresent: number;

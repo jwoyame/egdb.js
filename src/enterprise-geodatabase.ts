@@ -1417,22 +1417,22 @@ export class EnterpriseGeodatabase {
    *
    * All originally-enumerated correctness defects (A-H) are now closed. STILL
    * gated because none of this has run against a REAL fabric or a live post/
-   * compress -- only the synthetic Docker harness -- and because of the lesser
-   * issues below.
+   * compress -- only the synthetic Docker harness.
    *
-   * Lesser (still open): markers/replay are not idempotent (a re-run duplicates
-   * them); parentStates is inlined as a huge IN-list (10k+ states pre-compress)
-   * where emitBaseShadowMarkers deliberately avoids that; CHUNK=2000 may exceed
-   * SQL Server's 1000-row table-value-constructor limit; begin/rollbackTransaction
-   * ignore the `wasInTx` pattern every other write path here uses; no
-   * open-EditSession/fork check (a save would silently undo the rebase); the
-   * dry-run reports updates under a `deletes` label.
+   * Lesser issues FIXED (2026-07-26, harness-pinned): re-run is now idempotent (an
+   * already-rebased/reconciled version short-circuits to a no-op instead of
+   * spawning a parallel state); the parent + ancestor state sets are walked IN-SQL
+   * from their tip ids (no 10k-id IN-list) and the closure is seeded the same way
+   * (no giant VALUES); CHUNK is 1000 (SQL Server's table-value-constructor limit);
+   * begin/commit/rollback honour the `wasInTx` pattern; an open EditSession on the
+   * version (locked edit state off its tip) is detected and refused; the dry-run
+   * labels are consistent (updates = A-rows replayed, deletes = delete markers).
    *
    * A rebased version has been shown end-to-end on the synthetic harness to POST
    * (with no prior reconcile -- proving A) and to survive a full COMPRESS with
    * every version's visible data unchanged (A4 + A7, the checks rounds 1 and 2
    * skipped). What remains before ungating is a REAL-fabric (training) run of the
-   * same chain and the lesser issues above.
+   * same chain.
    */
   async rebaseVersion(
     versionName: string,
@@ -1451,11 +1451,10 @@ export class EnterpriseGeodatabase {
     // by accident while the defects above stand.
     if (!options?.dryRun && !options?.unsafeExperimental) {
       throw new Error(
-        'rebaseVersion is NOT production ready: the correctness defects (A-H) are ' +
-        'fixed and harness-pinned, but it has only run against the synthetic ' +
-        'Docker harness -- never a real fabric or a live post/compress -- and ' +
-        'several lesser issues remain (non-idempotent replay, no open-EditSession ' +
-        'check, IN-list/CHUNK limits). See the defect list on the method. ' +
+        'rebaseVersion is NOT production ready: the correctness defects (A-H) and ' +
+        'the lesser issues are fixed and harness-pinned, but it has only run ' +
+        'against the synthetic Docker harness -- never a real fabric or a live ' +
+        'post/compress. See the defect list on the method. ' +
         'Pass { unsafeExperimental: true } to run it anyway, or { dryRun: true } to inspect the plan.',
       );
     }
@@ -1476,23 +1475,40 @@ export class EnterpriseGeodatabase {
     }
 
     const ancestor = await findCommonAncestor(this.connection, version.stateId, parent.stateId);
+    // The version's OWN edit states (above the common ancestor). Small even for a
+    // heavily-reconciled version -- it is the editor's handful of edit states, not
+    // DEFAULT's whole ancestry. The parent and ancestor state sets, which CAN be
+    // huge pre-compress, are walked IN-SQL by classifyChildChanges / the closure
+    // seed from their tip ids, never materialised or inlined here.
     const childStates = (await getStatesInRange(this.connection, version.stateId, 0))
       .filter((s) => s > ancestor);
-    const parentStates = await getStatesInRange(this.connection, parent.stateId, 0);
-    // States resolving the value AT the common ancestor: the ancestor and its own
-    // ancestry (base handled by fallback). Empty when the ancestor is base 0 (a
-    // compress-orphan), where the ancestor value IS the base row. This is the
-    // third leg of the three-way comparison that distinguishes an editor's real
-    // change from stale reconcile residue (defect D).
-    const ancestorStates = ancestor > 0
-      ? await getStatesInRange(this.connection, ancestor, 0)
-      : [];
+
+    // Idempotent no-op: if the version already descends DIRECTLY from the current
+    // parent tip AND its closure is intact, it is already rebased -- re-running
+    // would only spawn a pointless parallel state and orphan the current one. (A
+    // version that structurally descends but has a BROKEN closure is NOT skipped:
+    // seeding that closure is exactly the repair a rebase performs, so it falls
+    // through.)
+    if (ancestor === parent.stateId
+        && await isReconciled(this.connection, version.stateId, parent.stateId)) {
+      return {
+        version: `${version.owner}.${version.name}`,
+        fromState: version.stateId,
+        toState: version.stateId,
+        replayed: [],
+        droppedRedundant: 0,
+        conflicts: [],
+        dryRun: !!options?.dryRun,
+      };
+    }
 
     const versionedTables = (await this.listTables()).filter((t) => t.isVersioned);
 
-    // Keep IN-lists / VALUES constructors inside SQL Server's expression limits.
-    // One statement per chunk still collapses thousands of round-trips.
-    const CHUNK = 2000;
+    // Keep VALUES constructors inside SQL Server's 1000-row table-value-constructor
+    // limit (insertDeleteMarkers builds a VALUES list). IN-lists of OBJECTIDs are
+    // also chunked here to bound the query text. One statement per chunk still
+    // collapses thousands of round-trips.
+    const CHUNK = 1000;
     const chunkIds = (ids: number[]): number[][] => {
       const out: number[][] = [];
       for (let i = 0; i < ids.length; i += CHUNK) out.push(ids.slice(i, i + CHUNK));
@@ -1509,7 +1525,7 @@ export class EnterpriseGeodatabase {
       // sides changed as conflicts (defects D + E, vet #4). The classifier resolves
       // each leg to present-with-value or absent exactly as the reader does.
       const cls = await classifyChildChanges(
-        this.connection, table, childStates, parentStates, ancestorStates,
+        this.connection, table, childStates, parent.stateId, ancestor,
       );
       if (cls.conflicts.length) allConflicts.push({ table: table.name, objectIds: cls.conflicts });
       // favour-edit: opting into conflicts replays the editor's resolution -- a
@@ -1564,7 +1580,10 @@ export class EnterpriseGeodatabase {
       );
     }
 
-    await this.connection.beginTransaction();
+    // Match the wasInTx pattern every other write path here uses: only own the
+    // transaction if the caller has not already opened one.
+    const wasInTx = this.connection.inTransaction();
+    if (!wasInTx) await this.connection.beginTransaction();
     try {
       // N9: SHARED compress lock first -- a rebase mutates the state tree
       // (createChildState), so it must exclude a concurrent compress, exactly as
@@ -1598,6 +1617,30 @@ export class EnterpriseGeodatabase {
           `Version ${versionName} moved from state ${version.stateId} to ` +
           `${fresh?.stateId ?? 'missing'} while the rebase was being planned. ` +
           `Nothing was changed; re-run to pick up the new edits.`,
+        );
+      }
+
+      // Refuse if an EditSession is open on this version: it holds a locked,
+      // transient edit state branched off the version tip. A rebase moves the tip
+      // to newState, and that session's save (which repoints the version onto its
+      // own transient state) would then silently discard the rebase. The version
+      // app-lock above does not stop this -- the save's state predates the lock.
+      // The editor must save or close first.
+      const drv = this.connection.driver;
+      const openEdits = await this.connection.query<{ n: number }>(
+        drv === 'sqlserver'
+          ? `SELECT COUNT(*) AS n FROM sde.SDE_state_locks l
+               JOIN sde.SDE_states s ON s.state_id = l.state_id
+              WHERE s.parent_state_id = @p0`
+          : `SELECT COUNT(*) AS n FROM sde.sde_state_locks l
+               JOIN sde.sde_states s ON s.state_id = l.state_id
+              WHERE s.parent_state_id = $1`,
+        [version.stateId],
+      );
+      if (Number(openEdits[0]?.n ?? 0) > 0) {
+        throw new Error(
+          `rebaseVersion: an edit session is open on ${versionName} (a locked edit ` +
+          `state branches off its tip). Save or close it before rebasing.`,
         );
       }
 
@@ -1654,26 +1697,35 @@ export class EnterpriseGeodatabase {
                 OR ($3 <> $1 AND lineage_name = $3)`,
         [parentLineage, newState, procLineage],
       );
-      // Seed the new lineage's closure = base(0) + parent's ancestry + newState.
-      // parentStates (getStatesInRange from the parent tip) already includes the
-      // parent tip, so (lineage, parentTip) exists -> isReconciled passes -> the
-      // version posts. Idempotent (NOT EXISTS) so a re-run duplicates nothing, and
-      // chunked so the VALUES list stays within SQL Server's limits.
-      for (const part of chunkIds([0, ...parentStates, newState])) {
-        const values = part.map((s) => `(${s})`).join(',');
-        await this.connection.execute(
-          driver === 'sqlserver'
-            ? `INSERT INTO sde.SDE_state_lineages (lineage_name, lineage_id)
-               SELECT @p0, v.s FROM (VALUES ${values}) AS v(s)
-               WHERE NOT EXISTS (SELECT 1 FROM sde.SDE_state_lineages sl
-                                 WHERE sl.lineage_name = @p0 AND sl.lineage_id = v.s)`
-            : `INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id)
-               SELECT $1, v.s FROM (VALUES ${values}) AS v(s)
-               WHERE NOT EXISTS (SELECT 1 FROM sde.sde_state_lineages sl
-                                 WHERE sl.lineage_name = $1 AND sl.lineage_id = v.s)`,
-          [lineage],
-        );
-      }
+      // Seed the new lineage's closure = base(0) + parent's whole ancestry +
+      // newState. The parent ancestry is walked IN-SQL from the parent tip (a
+      // recursive parent_state_id walk) rather than materialised as a JS array and
+      // inlined -- a pre-compress DEFAULT ancestry can be 10k+ states. The walk
+      // includes the parent tip, so (lineage, parentTip) exists -> isReconciled
+      // passes -> the version posts. NOT EXISTS makes it idempotent.
+      await this.connection.execute(
+        driver === 'sqlserver'
+          ? `WITH anc AS (
+               SELECT state_id AS s, parent_state_id AS p FROM sde.SDE_states WHERE state_id = @p1
+               UNION ALL
+               SELECT st.state_id, st.parent_state_id FROM sde.SDE_states st
+                 JOIN anc x ON st.state_id = x.p WHERE x.p <> 0)
+             INSERT INTO sde.SDE_state_lineages (lineage_name, lineage_id)
+             SELECT @p0, src.s FROM (SELECT s FROM anc UNION SELECT 0 UNION SELECT @p2) src
+             WHERE NOT EXISTS (SELECT 1 FROM sde.SDE_state_lineages sl
+                               WHERE sl.lineage_name = @p0 AND sl.lineage_id = src.s)
+             OPTION (MAXRECURSION 0)`
+          : `WITH RECURSIVE anc AS (
+               SELECT state_id AS s, parent_state_id AS p FROM sde.sde_states WHERE state_id = $2
+               UNION ALL
+               SELECT st.state_id, st.parent_state_id FROM sde.sde_states st
+                 JOIN anc x ON st.state_id = x.p WHERE x.p <> 0)
+             INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id)
+             SELECT $1, src.s FROM (SELECT s FROM anc UNION SELECT 0 UNION SELECT $3) src
+             WHERE NOT EXISTS (SELECT 1 FROM sde.sde_state_lineages sl
+                               WHERE sl.lineage_name = $1 AND sl.lineage_id = src.s)`,
+        [lineage, parent.stateId, newState],
+      );
 
       const replayed: Array<{ table: string; updates: number; deletes: number }> = [];
       for (const p of plan) {
@@ -1714,7 +1766,7 @@ export class EnterpriseGeodatabase {
       }
 
       // (Closure was seeded authoritatively above, before the replay.)
-      await this.connection.commitTransaction();
+      if (!wasInTx) await this.connection.commitTransaction();
       return {
         version: `${version.owner}.${version.name}`,
         fromState: version.stateId,
@@ -1725,7 +1777,7 @@ export class EnterpriseGeodatabase {
         dryRun: false,
       };
     } catch (error) {
-      await this.connection.rollbackTransaction();
+      if (!wasInTx) await this.connection.rollbackTransaction();
       throw error;
     }
   }
