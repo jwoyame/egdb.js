@@ -56,9 +56,17 @@ rounds 1 and 2 skipped, and the reason they shipped broken. A4 lands the editor'
 inserts AND deletes in DEFAULT; A7 runs prune+graduate+collapse and asserts the
 snapshot + structural (C0) invariants.
 
+The lesser issues are now fixed and pinned too: re-run is idempotent (an
+already-rebased version no-ops instead of spawning a parallel state); the parent
+and ancestor state sets are walked IN-SQL from their tip ids and the closure is
+seeded the same way (no 10k-id IN-list, no giant VALUES — pinned by a 1500-state
+scale test); CHUNK is 1000 (SQL Server's TVC limit); begin/commit/rollback honour
+`wasInTx`; an open EditSession on the version is detected and refused.
+
 Remaining before ungating: a **real-fabric (training-clone) run** of the whole
-chain (rebase → post → compress) and the lesser issues (non-idempotent replay, no
-open-EditSession check, IN-list/CHUNK limits).
+chain (rebase → post → compress). This needs the parcel-DB port-forward up AND
+confirmation that the training→PROD write-leak (SDE 3-part baked refs; see the
+project memory) is closed, since a rebase writes to the fabric.
 
 ## Part 0 — the oracle (the thing rev 1 got wrong)
 
