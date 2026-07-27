@@ -170,6 +170,44 @@ export function buildParentDeleteConflict(): RebaseFixture {
 }
 
 /**
+ * DEFECT G/H fixture (delete of an A-row-backed feature). A NON-orphan version
+ * (its common ancestor with DEFAULT already includes DEFAULT's edit) deletes a
+ * feature whose current value is a DEFAULT A-ROW, not a base row -- the case the
+ * old superseded-state marker got wrong.
+ *
+ *   base:                 OID 1='base1', OID 1000='Z0'
+ *   DEFAULT (0<-10<-11):  edits 1000 -> 'Zdef' (A-row at state 11)
+ *   Version V (11<-20):   deletes 1000 (branched off DEFAULT tip 11)
+ *
+ * The delete supersedes DEFAULT's A-row at state 11. The OLD marker (SDE_STATE_ID
+ * = 11) is NOT > 11, so the egdb reader never honors it (G) -- and 11 is a
+ * DEFAULT-ancestor state that lands in the graduable prefix, so the unposted
+ * delete could graduate into DELETE FROM base (H). The native marker at newState
+ * (> 11, not graduable) fixes both.
+ */
+export function buildParentARowDelete(): RebaseFixture {
+  const f = new Fabric();
+  const t = f.table('parcels');
+  t.base.set(1, { VAL: 'base1' });
+  t.base.set(1000, { VAL: 'Z0' });
+
+  // DEFAULT: 0 <- 10 <- 11, edits 1000 to 'Zdef' at state 11.
+  f.states.set(10, { stateId: 10, parentStateId: 0, lineageName: 10 });
+  f.states.set(11, { stateId: 11, parentStateId: 10, lineageName: 10 });
+  f.lineages.add('10:0'); f.lineages.add('10:10'); f.lineages.add('10:11');
+  f.versions.set('DEFAULT', 11);
+  t.adds.set('1000:11', { oid: 1000, state: 11, values: { VAL: 'Zdef' } });
+
+  // Version V branches off DEFAULT tip 11 and deletes 1000 at its own state 20.
+  f.states.set(20, { stateId: 20, parentStateId: 11, lineageName: 20 });
+  f.lineages.add('20:0'); f.lineages.add('20:10'); f.lineages.add('20:11'); f.lineages.add('20:20');
+  f.versions.set('V', 20);
+  t.dels.push({ oid: 1000, state: 20, deletedAt: 20 }); // native delete of the DEFAULT A-row value
+
+  return { f, version: 'test.V', parent: 'test.DEFAULT', editorOids: [1000] };
+}
+
+/**
  * The version's expected visible set after a correct rebase: the parent tip's
  * visible set, with the editor's own OIDs overlaid from the pre-rebase version
  * view (present -> kept, absent -> deleted).

@@ -47,8 +47,6 @@ import {
   emitBaseShadowMarkers,
   updateVersionState,
   classifyChildChanges,
-  selectObjectIdsPresentInParent,
-  insertSupersedeMarkers,
   copyTipRows,
   insertDeleteMarkers,
   getVersionStats,
@@ -1407,25 +1405,29 @@ export class EnterpriseGeodatabase {
    * lock, and aborts if its tip advanced since the plan was computed. A concurrent
    * post can no longer strand the new state off a stale parent tip.
    *
-   * STILL OPEN, each independently disqualifying:
+   * FIXED (2026-07-26, harness-pinned): G + H (and S19) -- editor deletes are now
+   * written NATIVELY at newState (insertDeleteMarkers), never at the superseded
+   * row's state. newState > any parent add state, so the egdb reader honors the
+   * delete (G); and newState is the version's own tip, never in the graduable
+   * prefix while unposted, so an unposted delete can never graduate into
+   * `DELETE FROM <base>` (H/S19). An UPDATE gets no marker at all -- its A-row at
+   * newState is already the newest add, so the reader picks it over the parent's
+   * older row. Esri base-shadow markers remain the post path's job
+   * (emitBaseShadowMarkers), exactly as for a native egdb edit.
    *
-   *  G. PURE-DELETE MARKERS ARE INVISIBLE TO EGDB'S OWN READER. The adds-half
-   *     predicate needs D.SDE_STATE_ID > A.SDE_STATE_ID; a marker at the
-   *     superseded state can never satisfy it. The previous form broke Esri
-   *     instead. Both markers are needed, not one or the other.
-   *  H. LATENT BASE-TABLE DELETION. Markers carry a DEFAULT-lineage state, and
-   *     graduateTable treats SDE_STATE_ID in the graduable prefix as graduable --
-   *     so once (A) is fixed, an UNPOSTED version's delete can graduate into
-   *     `DELETE FROM <base>`. Today only the broken closure masks it. This is the
-   *     most dangerous interaction in the change; fix (A) and (H) together.
+   * All originally-enumerated correctness defects (A-H) are now closed. STILL
+   * gated because none of this has run against a REAL fabric or a live post/
+   * compress -- only the synthetic Docker harness -- and because of the lesser
+   * issues below.
    *
-   * Lesser: markers are not idempotent (a re-run duplicates them); parentStates
-   * is inlined as a huge IN-list (10k+ states pre-compress) where
-   * emitBaseShadowMarkers deliberately avoids that; CHUNK=2000 may exceed SQL
-   * Server's 1000-row table-value-constructor limit; begin/rollbackTransaction
+   * Lesser (still open): markers/replay are not idempotent (a re-run duplicates
+   * them); parentStates is inlined as a huge IN-list (10k+ states pre-compress)
+   * where emitBaseShadowMarkers deliberately avoids that; CHUNK=2000 may exceed
+   * SQL Server's 1000-row table-value-constructor limit; begin/rollbackTransaction
    * ignore the `wasInTx` pattern every other write path here uses; no
    * open-EditSession/fork check (a save would silently undo the rebase); the
-   * dry-run reports updates under a `deletes` label.
+   * dry-run reports updates under a `deletes` label; A4 (post SUCCEEDS after a
+   * rebase) and A7 (end-to-end compress-safety) are not yet wired in the harness.
    */
   async rebaseVersion(
     versionName: string,
@@ -1444,9 +1446,11 @@ export class EnterpriseGeodatabase {
     // by accident while the defects above stand.
     if (!options?.dryRun && !options?.unsafeExperimental) {
       throw new Error(
-        'rebaseVersion is NOT production ready: compress graduation can stall ' +
-        'database-wide (H) and pure-delete markers are invisible to the egdb ' +
-        'reader (G). See the open-defect list on the method. ' +
+        'rebaseVersion is NOT production ready: the correctness defects (A-H) are ' +
+        'fixed and harness-pinned, but it has only run against the synthetic ' +
+        'Docker harness -- never a real fabric or a live post/compress -- and ' +
+        'several lesser issues remain (non-idempotent replay, no open-EditSession ' +
+        'check, IN-list/CHUNK limits). See the defect list on the method. ' +
         'Pass { unsafeExperimental: true } to run it anyway, or { dryRun: true } to inspect the plan.',
       );
     }
@@ -1509,18 +1513,19 @@ export class EnterpriseGeodatabase {
       const accept = options?.acceptConflicts;
       const replayAdds = accept ? [...cls.replayAdds, ...cls.conflictAdds] : cls.replayAdds;
       const deletes = accept ? [...cls.deletes, ...cls.conflictDeletes] : cls.deletes;
-      // Every delete marker: the editor's deletes (all of which supersede a
-      // parent-present row, by construction) plus the updates -- a replayed add
-      // that also exists in the parent needs delete-marker + A-row, or the diff
-      // mislabels a retirement as a creation. A brand-new insert gets no marker.
-      const supersedes = await selectObjectIdsPresentInParent(this.connection, table, replayAdds, parentStates);
-      const markers = [...new Set([...deletes, ...supersedes])];
+      // Delete markers are the editor's deletes ONLY -- written natively at
+      // newState (defects G + H). An UPDATE needs no marker: its replayed A-row
+      // sits at newState, which is the newest add in the version's lineage, so the
+      // reader already picks it over the parent's older row. Writing a marker at
+      // the superseded row's state instead (as insertSupersedeMarkers did) is
+      // invisible to the egdb reader for an A-row-backed row (G) and, being a
+      // DEFAULT-ancestor state, can graduate into DELETE FROM base (H).
       // Child-touched OIDs discarded as no-net-change. Sanity metric for a dry run:
       // large for a heavily-reconciled version, ~0 for one nobody reconciled.
       const redundant = cls.dropped;
       droppedRedundant += redundant;
-      if (replayAdds.length || markers.length) {
-        plan.push({ table, changed: replayAdds, pureDeletes: markers, redundant });
+      if (replayAdds.length || deletes.length) {
+        plan.push({ table, changed: replayAdds, pureDeletes: deletes, redundant });
       }
     }
 
@@ -1680,9 +1685,12 @@ export class EnterpriseGeodatabase {
         }
         let deletes = 0;
         for (const part of chunkIds(p.pureDeletes)) {
-          // Markers carry the SUPERSEDED row's state (0 = base), not newState --
-          // a marker at the A-row's own state hides the feature from Esri readers.
-          deletes += await insertSupersedeMarkers(this.connection, p.table, part, parentStates, newState);
+          // Native delete marker at newState: (SDE_STATE_ID, DELETED_AT) = (newState,
+          // newState). newState > any parent add state, so the egdb reader suppresses
+          // it (G); newState is the version's own tip, never in the graduable prefix
+          // while unposted, so it can't graduate into DELETE FROM base (H). The Esri
+          // base-shadow markers are the post path's job (emitBaseShadowMarkers).
+          deletes += await insertDeleteMarkers(this.connection, p.table, part, newState);
         }
         replayed.push({ table: p.table.name, updates, deletes });
       }

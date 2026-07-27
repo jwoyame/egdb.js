@@ -22,8 +22,10 @@ import { dbVisible, snapshotVisible } from '../compress/invariants';
 import { installRebaseProcs, seedIdPool } from './sde-procs';
 import {
   buildOrphan, buildResidueConflict, buildEditorDeletes, buildParentDeleteConflict,
-  expectedAfterRebase, diffMaps,
+  buildParentARowDelete, expectedAfterRebase, diffMaps,
 } from './rebase-model';
+import { computeGraduablePrefix, graduateTable } from '../../src/reconcile/compress-impl';
+import { PARCELS } from '../compress/db';
 import type { IDatabaseConnection } from '../../src/connections/connection';
 
 const silent = { debug() {}, info() {}, warn() {}, error() {} };
@@ -246,6 +248,52 @@ d('rebaseVersion harness (DB-backed)', () => {
     // favour-edit resurrects the editor's version of 400 (the owner's call).
     await gdb.rebaseVersion(fx.version, { unsafeExperimental: true, acceptConflicts: true });
     expect((await visibleOf(conn, fx.version)).get(400)).toBe('alex400');
+  });
+
+  // ---- Defects G + H: delete markers honored by egdb + not graduable ----------
+
+  async function dMarkerState(oid: number): Promise<number | null> {
+    const r = await conn.query<{ s: number | bigint }>(
+      `SELECT SDE_STATE_ID AS s FROM dbo.D18 WHERE SDE_DELETES_ROW_ID=@p0 ORDER BY SDE_STATE_ID DESC;`, [oid]);
+    return r.length ? Number(r[0]!.s) : null;
+  }
+
+  it('DEFECT G fixed: a delete of an A-row-backed feature is honored by the egdb reader', async () => {
+    const fx = await loadFixture(buildParentARowDelete);
+    // Before rebase DEFAULT shows 1000='Zdef' (an A-row, not a base row).
+    expect((await visibleOf(conn, fx.parent)).get(1000)).toBe('Zdef');
+
+    const res = await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+
+    // egdb reader honors the delete: 1000 is gone from the version. The old
+    // superseded-state marker (SDE_STATE_ID=11, not > 11) left it visible.
+    expect((await visibleOf(conn, fx.version)).has(1000)).toBe(false);
+    // Marker sits on the version's own new state, above DEFAULT tip 11.
+    expect(await dMarkerState(1000)).toBe(res.toState);
+    expect(res.toState!).toBeGreaterThan(11);
+    // DEFAULT still has it (the delete is the version's, unposted).
+    expect((await visibleOf(conn, fx.parent)).get(1000)).toBe('Zdef');
+  });
+
+  it('DEFECT H fixed: an unposted delete cannot graduate into DELETE FROM base', async () => {
+    const fx = await loadFixture(buildParentARowDelete);
+    const res = await gdb.rebaseVersion(fx.version, { unsafeExperimental: true });
+
+    // The delete marker's state is NOT in the graduable prefix (H-safety): the
+    // prefix is the ancestors common to ALL tips; the version's own new state is
+    // not one, so its delete can never be swept into a base delete while unposted.
+    const prefix = await computeGraduablePrefix(conn);
+    expect(prefix.has(res.toState!)).toBe(false);
+    expect(prefix.has(11)).toBe(true); // DEFAULT's own edit IS graduable
+
+    // Run a real graduation over that prefix. DEFAULT's edit to 1000 graduates
+    // into base ('Zdef'); the version's unposted delete must NOT delete it.
+    await graduateTable(conn, PARCELS, prefix);
+    const base = await conn.query<{ v: string }>(`SELECT VAL AS v FROM dbo.base18 WHERE OBJECTID=1000;`);
+    expect(base.length, '1000 was deleted from base by an unposted version').toBe(1);
+    expect(base[0]!.v).toBe('Zdef');
+    // The version still resolves 1000 as deleted after graduation.
+    expect((await visibleOf(conn, fx.version)).has(1000)).toBe(false);
   });
 
   // ---- Defect F: parent lock + tip revalidation -------------------------------

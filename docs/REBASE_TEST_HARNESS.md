@@ -39,14 +39,20 @@ one at a time, each pinned red-then-green; the method stays gated behind
 | E — create-then-delete resurrect / delete-after-reconcile vanish | **fixed** (harness) | editor-deletes test |
 | vet #4 — parent-deleted row child edited resurrected | **fixed** (with E) | parent-delete-conflict test |
 | F — parent not locked / tip not revalidated | **fixed** (harness) | parent-moved abort test |
-| G — pure-delete markers invisible to egdb reader | **open** | — |
-| H — latent base-table deletion via graduation | **open** | — |
-| I — parent-deleted resurrected | open | — |
-| S19 — unposted delete graduates into `DELETE FROM base` | open (relates to H) | — |
+| G — pure-delete markers invisible to egdb reader | **fixed** (harness) | A-row-backed-delete test |
+| H — latent base-table deletion via graduation | **fixed** (harness) | graduation-safety test |
+| I — parent-deleted resurrected | **fixed** (with E/vet#4) | parent-delete-conflict test |
+| S19 — unposted delete graduates into `DELETE FROM base` | **fixed** (with H) | graduation-safety test |
+
+All originally-enumerated correctness defects (A–H, plus vet #4 and S19) are now
+fixed and pinned. The method stays gated: it has only run against the synthetic
+Docker harness, and lesser issues remain (non-idempotent replay, no
+open-EditSession check, IN-list/CHUNK limits).
 
 Two assertions still to wire in: **A4** (post SUCCEEDS after a rebase) and **A7**
-(compress-safety) — both need `postVersion`/`compress` run against the rebased
-version, the check rounds 1 and 2 skipped.
+(end-to-end compress-safety) — both need `postVersion`/`compress` run against the
+rebased version, the check rounds 1 and 2 skipped. These are the next step before
+any real-fabric (training) validation.
 
 ## Part 0 — the oracle (the thing rev 1 got wrong)
 
