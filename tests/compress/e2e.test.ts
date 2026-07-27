@@ -64,7 +64,7 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
     const before18 = await snapshotVisible(conn, 18);
     const before19 = await snapshotVisible(conn, 19);
 
-    const res = await egdb.compress({ acknowledgeExperimentalUnsafe: true, phases: { prune: true, graduate: true, collapse: true } });
+    const res = await egdb.compress({ acknowledgeExperimentalUnsafe: true, bypassClosureGateUnsafe: true, phases: { prune: true, graduate: true, collapse: true } });
     expect(res).toBeDefined();
 
     assertVisibleDataUnchanged(before18, await snapshotVisible(conn, 18));
@@ -86,7 +86,7 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
 
     // Explicit collapse-only: no graduation, but collapses may occur.
     await resetFabric(conn); await materialize(conn, generate(72, 18).fabric);
-    const r2 = await egdb.compress({ acknowledgeExperimentalUnsafe: true, phases: { collapse: true } });
+    const r2 = await egdb.compress({ acknowledgeExperimentalUnsafe: true, bypassClosureGateUnsafe: true, phases: { collapse: true } });
     expect(r2.graduatedUpserts, 'collapse-only must not graduate').toBe(0);
     expect(r2.statesRemoved, 'collapse-only must not prune').toBe(0);
 
@@ -98,7 +98,7 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
   it('verify: self-check passes on a clean full compress (egdb-visible data unchanged)', async () => {
     await materialize(conn, generate(72, 18).fabric);
     await copy18to19(conn);
-    const res = await egdb.compress({ acknowledgeExperimentalUnsafe: true, verify: true, phases: { prune: true, graduate: true, collapse: true } });
+    const res = await egdb.compress({ acknowledgeExperimentalUnsafe: true, bypassClosureGateUnsafe: true, verify: true, phases: { prune: true, graduate: true, collapse: true } });
     expect(res.selfCheck, 'selfCheck present when verify:true').toBeDefined();
     expect(res.selfCheck!.diffs, 'egdb-visible data unchanged by compress').toEqual([]);
     expect(res.selfCheck!.passed).toBe(true);
@@ -124,7 +124,7 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
 
     // Graduate base18 only; prune & collapse must still run over base19 (N2) so it
     // is never left with delta rows tagged to a pruned/collapsed-away state.
-    await egdb.compress({ acknowledgeExperimentalUnsafe: true, tables: ['base18'], phases: { prune: true, graduate: true, collapse: true } });
+    await egdb.compress({ acknowledgeExperimentalUnsafe: true, bypassClosureGateUnsafe: true, tables: ['base18'], phases: { prune: true, graduate: true, collapse: true } });
 
     assertVisibleDataUnchanged(before18, await snapshotVisible(conn, 18));
     assertVisibleDataUnchanged(before19, await snapshotVisible(conn, 19));

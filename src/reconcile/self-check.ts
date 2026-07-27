@@ -31,7 +31,7 @@ function qid(driver: Driver, name: string): string {
   // double the closing delimiter so a catalog name containing ] or " can't break out
   return driver === 'sqlserver' ? `[${name.replace(/]/g, ']]')}]` : `"${name.replace(/"/g, '""')}"`;
 }
-function sys(driver: Driver, n: 'SDE_states' | 'SDE_versions'): string {
+function sys(driver: Driver, n: 'SDE_states' | 'SDE_versions' | 'SDE_state_lineages'): string {
   return driver === 'sqlserver' ? `sde.${n}` : `sde.${n.toLowerCase()}`;
 }
 
@@ -60,12 +60,19 @@ async function hashColumns(conn: IDatabaseConnection, driver: Driver, table: Tab
   return cols;
 }
 
-async function versionTips(conn: IDatabaseConnection, driver: Driver): Promise<Array<{ key: string; tip: number }>> {
+async function versionTips(conn: IDatabaseConnection, driver: Driver): Promise<Array<{ key: string; tip: number; lineageName: number }>> {
   const v = sys(driver, 'SDE_versions');
-  const rows = await conn.query<{ owner: string; name: string; state_id: number | bigint }>(
-    `SELECT owner, name, state_id FROM ${v} WHERE state_id IS NOT NULL`);
-  return rows.map(r => ({ key: `${r.owner}.${r.name}`, tip: Number(r.state_id) }));
+  const s = sys(driver, 'SDE_states');
+  const rows = await conn.query<{ owner: string; name: string; state_id: number | bigint; ln: number | bigint }>(
+    `SELECT v.owner, v.name, v.state_id, st.lineage_name AS ln
+       FROM ${v} v JOIN ${s} st ON st.state_id = v.state_id WHERE v.state_id IS NOT NULL`);
+  return rows.map(r => ({ key: `${r.owner}.${r.name}`, tip: Number(r.state_id), lineageName: Number(r.ln) }));
 }
+
+/** Which ancestry a snapshot resolves through: 'walk' = egdb's authoritative
+ * parent_state_id climb; 'closure' = the Esri SDE_state_lineages read (`_evw` /
+ * publish-ETL). Comparing the two AFTER compress is the Step D closure telemetry. */
+export type ReadMode = 'walk' | 'closure';
 
 // Fixed-name REAL staging table (a #temp does not survive across this pool's
 // requests). It is safe only because it is written on ONE connection within a single
@@ -74,24 +81,28 @@ async function versionTips(conn: IDatabaseConnection, driver: Driver): Promise<A
 // captureVisibleSnapshot outside that exclusion against the same database concurrently.
 const MEM = { sqlserver: 'dbo.egdb_selfcheck_mem', postgresql: 'egdb_selfcheck_mem' } as const;
 
-/** Materialise the ancestor state-id set of `tip` (parent_state_id walk) into an
- * indexed staging table ONCE per version, so the per-table signature queries
- * semi-join it instead of re-running an ~n-deep recursive CTE per big-table scan
- * (which times out on a real fabric). Real table (a #temp does not survive across
- * this pool's requests). */
-async function materializeMem(conn: IDatabaseConnection, driver: Driver, tip: number): Promise<string> {
+/** Materialise a version's ancestor state-id set into an indexed staging table
+ * ONCE per version, so the per-table signature queries semi-join it instead of
+ * re-running an ~n-deep recursive CTE per big-table scan (which times out on a
+ * real fabric). Real table (a #temp does not survive across this pool's requests).
+ * `mode='walk'` climbs parent_state_id (egdb's read); `mode='closure'` reads the
+ * SDE_state_lineages bag for the tip's lineage_name (the Esri `_evw` read). */
+async function materializeMem(conn: IDatabaseConnection, driver: Driver, tip: number, lineageName: number, mode: ReadMode): Promise<string> {
   const ref = MEM[driver]; const st = sys(driver, 'SDE_states');
   const rec = driver === 'sqlserver' ? '' : 'RECURSIVE ';
   const maxrec = driver === 'sqlserver' ? ' OPTION (MAXRECURSION 0)' : '';
-  const walk = `WITH ${rec}mem AS (
-      SELECT state_id AS s, parent_state_id AS p FROM ${st} WHERE state_id = ${tip}
-      UNION ALL SELECT c.state_id, c.parent_state_id FROM ${st} c JOIN mem ON c.state_id = mem.p WHERE mem.p <> 0)`;
+  const src = mode === 'walk'
+    ? `WITH ${rec}mem AS (
+        SELECT state_id AS s, parent_state_id AS p FROM ${st} WHERE state_id = ${tip}
+        UNION ALL SELECT c.state_id, c.parent_state_id FROM ${st} c JOIN mem ON c.state_id = mem.p WHERE mem.p <> 0)`
+    : `WITH mem AS (
+        SELECT lineage_id AS s FROM ${sys(driver, 'SDE_state_lineages')} WHERE lineage_name = ${lineageName} AND lineage_id <= ${tip})`;
   if (driver === 'sqlserver') {
     await conn.execute(`IF OBJECT_ID('${ref}') IS NOT NULL DROP TABLE ${ref};`);
-    await conn.execute(`${walk} SELECT s INTO ${ref} FROM mem${maxrec}; CREATE UNIQUE CLUSTERED INDEX ix_scmem ON ${ref}(s);`);
+    await conn.execute(`${src} SELECT s INTO ${ref} FROM mem${maxrec}; CREATE UNIQUE CLUSTERED INDEX ix_scmem ON ${ref}(s);`);
   } else {
     await conn.execute(`DROP TABLE IF EXISTS ${ref};`);
-    await conn.execute(`CREATE TABLE ${ref} (s BIGINT PRIMARY KEY); ${walk} INSERT INTO ${ref} SELECT s FROM mem;`);
+    await conn.execute(`CREATE TABLE ${ref} (s BIGINT PRIMARY KEY); ${src} INSERT INTO ${ref} SELECT s FROM mem;`);
   }
   return ref;
 }
@@ -102,7 +113,7 @@ async function dropMem(conn: IDatabaseConnection, driver: Driver): Promise<void>
 
 /** count + CHECKSUM_AGG over the rows visible to a version, using the pre-materialised
  * ancestor-state staging table `mem(s)`. */
-async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableInfo, cols: string[], memRef: string): Promise<TableSig> {
+async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableInfo, cols: string[], memRef: string, mode: ReadMode): Promise<TableSig> {
   const reg = table.registrationId!;
   const qSchema = qid(driver, table.schema);
   const base = `${qSchema}.${qid(driver, table.name)}`;
@@ -112,6 +123,12 @@ async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableI
   const sidc = driver === 'sqlserver' ? 'SDE_STATE_ID' : 'sde_state_id';
   const drow = driver === 'sqlserver' ? 'SDE_DELETES_ROW_ID' : 'sde_deletes_row_id';
   const delAt = driver === 'sqlserver' ? 'DELETED_AT' : 'deleted_at';
+  // Base-hide fidelity: the Esri `_evw` / publish-ETL reader hides a base row ONLY
+  // via a base-shadow marker (SDE_STATE_ID = 0) whose DELETED_AT is an ancestor —
+  // a non-zero-state D-row supersedes an ADD, not the base. So in 'closure' mode
+  // restrict the base-hide to SDE_STATE_ID = 0 to be a faithful public-read oracle.
+  // 'walk' mode keeps egdb's own resolution (mirrors enterprise-table.ts).
+  const baseHideState = mode === 'closure' ? ` AND dz.${sidc} = 0` : '';
   const colList = cols.map(c => qid(driver, c)).join(', ');
   const chk = driver === 'sqlserver'
     ? `CHECKSUM_AGG(BINARY_CHECKSUM(${colList}))`
@@ -119,7 +136,7 @@ async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableI
   const sql = `WITH mem AS (SELECT s FROM ${memRef})
     , vis AS (
       SELECT ${cols.map(c => `b.${qid(driver, c)}`).join(', ')} FROM ${base} b
-      WHERE NOT EXISTS (SELECT 1 FROM ${dd} dz JOIN mem ON mem.s = dz.${delAt} WHERE dz.${drow} = b.${oid})
+      WHERE NOT EXISTS (SELECT 1 FROM ${dd} dz JOIN mem ON mem.s = dz.${delAt} WHERE dz.${drow} = b.${oid}${baseHideState})
         AND NOT EXISTS (SELECT 1 FROM ${a} az JOIN mem ON mem.s = az.${sidc} WHERE az.${oid} = b.${oid})
       UNION ALL
       SELECT ${cols.map(c => `x.${qid(driver, c)}`).join(', ')} FROM ${a} x
@@ -137,19 +154,21 @@ async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableI
   return { count: Number(rows[0]?.cnt ?? 0), hash: h == null ? '0' : String(h) };
 }
 
-/** Capture the per-version visible-data signature via egdb's parent-walk read. */
-export async function captureVisibleSnapshot(conn: IDatabaseConnection, versionedTables: TableInfo[]): Promise<CompressSnapshot> {
+/** Capture the per-version visible-data signature. `mode='walk'` (default) uses
+ * egdb's authoritative parent_state_id read; `mode='closure'` uses the Esri
+ * SDE_state_lineages read (`_evw` / publish-ETL) — Step D closure telemetry. */
+export async function captureVisibleSnapshot(conn: IDatabaseConnection, versionedTables: TableInfo[], mode: ReadMode = 'walk'): Promise<CompressSnapshot> {
   const driver = conn.driver;
   const cache = new Map<string, string[]>();
   const tables = versionedTables.filter(t => t.isVersioned && t.registrationId);
   const out: CompressSnapshot = {};
   try {
     for (const v of await versionTips(conn, driver)) {
-      const memRef = await materializeMem(conn, driver, v.tip); // ancestor states, once per version
+      const memRef = await materializeMem(conn, driver, v.tip, v.lineageName, mode); // ancestors, once per version
       const perTable: Record<number, TableSig> = {};
       for (const t of tables) {
         const cols = await hashColumns(conn, driver, t, cache);
-        perTable[t.registrationId!] = await tableSig(conn, driver, t, cols, memRef);
+        perTable[t.registrationId!] = await tableSig(conn, driver, t, cols, memRef, mode);
       }
       out[v.key] = perTable;
     }
@@ -157,6 +176,11 @@ export async function captureVisibleSnapshot(conn: IDatabaseConnection, versione
     await dropMem(conn, driver).catch(() => { /* best-effort cleanup */ });
   }
   return out;
+}
+
+/** Step D telemetry: the same signature resolved through the Esri closure read. */
+export function captureClosureSnapshot(conn: IDatabaseConnection, versionedTables: TableInfo[]): Promise<CompressSnapshot> {
+  return captureVisibleSnapshot(conn, versionedTables, 'closure');
 }
 
 export function compareSnapshots(before: CompressSnapshot, after: CompressSnapshot): SelfCheckResult {

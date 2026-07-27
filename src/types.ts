@@ -505,6 +505,17 @@ export interface CompressOptions {
    * unattended nightly runs.
    */
   verify?: boolean;
+  /**
+   * Bypass the Step D closure-safety gate (closure-gate.ts) that normally refuses
+   * graduate/collapse when the SDE_state_lineages closure diverges from the
+   * parent-walk. DANGEROUS — graduation is irreversible and a divergent closure is
+   * exactly where it can flip a version invisible to the public map. This exists
+   * ONLY for tests that exercise phase MECHANICS on deliberately-divergent synthetic
+   * fabrics (the op-model generates them on purpose) and assert the walk-visible
+   * result; the gate's own behaviour is covered by closure-gate.test.ts. NEVER set
+   * this on a real/nightly run.
+   */
+  bypassClosureGateUnsafe?: boolean;
 }
 
 /** Compression result */
@@ -555,6 +566,15 @@ export interface CompressResult {
    * check lands with Step D closure repair.)
    */
   selfCheck?: { passed: boolean; diffs: string[] };
+  /**
+   * Result of the Step D closure-safety gate (only present when graduate or collapse
+   * was requested). `safe` is false iff the SDE_state_lineages closure diverges from
+   * the parent-walk in a way an irreversible graduate/collapse could weaponise
+   * (divergent shared lineage_name, or a stored OVER state) — see closure-gate.ts.
+   * When unsafe, graduate/collapse were REFUSED: the run downgraded to prune-only if
+   * prune was requested, else it threw ClosureUnsafeError. `reasons` names offenders.
+   */
+  closureGate?: { safe: boolean; reasons: string[] };
 }
 
 /**

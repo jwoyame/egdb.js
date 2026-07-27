@@ -62,8 +62,10 @@ import {
   EDITOR_SHARED_LOCK_TIMEOUT_MS,
   captureVisibleSnapshot,
   compareSnapshots,
+  assessClosureSafety,
+  ClosureUnsafeError,
 } from './reconcile';
-import type { SelfCheckResult } from './reconcile';
+import type { SelfCheckResult, ClosureSafety } from './reconcile';
 import type { GraduateTableResult } from './reconcile';
 import type { StaleLockCleanupResult } from './reconcile';
 
@@ -1826,8 +1828,8 @@ export class EnterpriseGeodatabase {
     // defaults to PRUNE-ONLY (the safe default — see CompressOptions.phases).
     const phases = options?.phases ?? { prune: true };
     const runPrune = !!phases.prune;
-    const runGraduate = !!phases.graduate;
-    const runCollapse = !!phases.collapse;
+    let runGraduate = !!phases.graduate;
+    let runCollapse = !!phases.collapse;
     // Refuse an all-false selection rather than return a green "did nothing"
     // result — for an unattended, config-driven caller a typo'd phase key
     // (`{ prun: true }`) would otherwise silently no-op and report success.
@@ -1876,6 +1878,31 @@ export class EnterpriseGeodatabase {
 
     const allTables = await this.listTables();
     const allVersioned = allTables.filter(t => t.isVersioned);
+
+    // Step D closure-safety gate (NIGHTLY_COMPRESS_ROADMAP.md §Step D). Graduate
+    // and collapse are irreversible and feed the Esri closure reader; refuse them
+    // when the closure diverges from the parent-walk (divergent shared lineage_name,
+    // or a stored OVER state) — that is the config where an irreversible base/parent
+    // write can flip a version invisible to the public map (closure-gate.ts). Prune
+    // is closure-safe, so if it was also requested we downgrade to prune-only rather
+    // than abort the whole run; a graduate/collapse-only request throws instead.
+    let closureGate: ClosureSafety | undefined;
+    if ((runGraduate || runCollapse) && options?.bypassClosureGateUnsafe) {
+      this._logger.warn?.('compress: bypassClosureGateUnsafe set — SKIPPING the Step D closure-safety gate before an irreversible graduate/collapse. This must never be set on a real/nightly run.');
+    }
+    if ((runGraduate || runCollapse) && !options?.bypassClosureGateUnsafe) {
+      closureGate = await assessClosureSafety(this.connection);
+      if (!closureGate.safe) {
+        this._logger.error?.(`compress: CLOSURE UNSAFE for graduate/collapse — ${closureGate.reasons.join('; ')}`);
+        if (runPrune) {
+          this._logger.warn?.('compress: downgrading to PRUNE-ONLY (graduate/collapse refused by the closure gate).');
+          runGraduate = false;
+          runCollapse = false;
+        } else {
+          throw new ClosureUnsafeError(closureGate.reasons);
+        }
+      }
+    }
 
     // Step C self-check: snapshot every version's visible data (both read paths)
     // BEFORE the phases run, so we can prove afterward that nothing changed.
@@ -1977,6 +2004,7 @@ export class EnterpriseGeodatabase {
       statesSkippedByPrune: pruneResult.statesSkipped,
       allTablesSkippedDueToConcurrentVersionChange: allTablesSkipped || undefined,
       selfCheck,
+      closureGate,
     };
     } finally {
       await holder.release();
