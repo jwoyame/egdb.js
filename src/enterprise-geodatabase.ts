@@ -1402,10 +1402,13 @@ export class EnterpriseGeodatabase {
    *
    * STILL OPEN, each independently disqualifying:
    *
-   *  F. PARENT IS NOT LOCKED. Only the child is locked; parentStates/parent tip
-   *     are read before the transaction and never revalidated, so a concurrent
-   *     post can strand rows dropped as "redundant" against a tip the new state
-   *     does not descend from. postVersion locks the parent; this must too.
+   * FIXED (2026-07-26): F -- the transaction now takes the SHARED compress lock
+   * and locks the PARENT (before the child, a fixed order), re-reads it under the
+   * lock, and aborts if its tip advanced since the plan was computed. A concurrent
+   * post can no longer strand the new state off a stale parent tip.
+   *
+   * STILL OPEN, each independently disqualifying:
+   *
    *  G. PURE-DELETE MARKERS ARE INVISIBLE TO EGDB'S OWN READER. The adds-half
    *     predicate needs D.SDE_STATE_ID > A.SDE_STATE_ID; a marker at the
    *     superseded state can never satisfy it. The previous form broke Esri
@@ -1442,9 +1445,8 @@ export class EnterpriseGeodatabase {
     if (!options?.dryRun && !options?.unsafeExperimental) {
       throw new Error(
         'rebaseVersion is NOT production ready: compress graduation can stall ' +
-        'database-wide (H), pure-delete markers are invisible to the egdb reader ' +
-        '(G), and the parent is not locked against a concurrent post (F). See the ' +
-        'open-defect list on the method. ' +
+        'database-wide (H) and pure-delete markers are invisible to the egdb ' +
+        'reader (G). See the open-defect list on the method. ' +
         'Pass { unsafeExperimental: true } to run it anyway, or { dryRun: true } to inspect the plan.',
       );
     }
@@ -1554,9 +1556,31 @@ export class EnterpriseGeodatabase {
 
     await this.connection.beginTransaction();
     try {
-      // Serialise against concurrent edits, then re-read the version INSIDE the
-      // lock: the plan above was computed from a state read before the lock, and
-      // a save landing in between would otherwise be silently orphaned.
+      // N9: SHARED compress lock first -- a rebase mutates the state tree
+      // (createChildState), so it must exclude a concurrent compress, exactly as
+      // postVersion does. Bounces if a compress is running.
+      await acquireCompressLock(this.connection, 'Shared', EDITOR_SHARED_LOCK_TIMEOUT_MS);
+
+      // Lock the PARENT and re-read it under the lock (defect F). The whole plan --
+      // parentStates, the common ancestor, and every classify decision -- was
+      // computed against the parent tip read before the lock. If a concurrent post
+      // advanced the parent, the new state would branch off a tip the plan does not
+      // match, stranding rows dropped as redundant against a state the version no
+      // longer descends from cleanly. Abort and let the caller re-plan. Lock the
+      // parent BEFORE the child, a fixed order, so two rebases can't deadlock.
+      await this.lockVersion(parentFullName);
+      const freshParent = await this.getVersion(parentFullName);
+      if (!freshParent || freshParent.stateId !== parent.stateId) {
+        throw new Error(
+          `Parent ${parentFullName} moved from state ${parent.stateId} to ` +
+          `${freshParent?.stateId ?? 'missing'} while the rebase was being planned. ` +
+          `Nothing was changed; re-run to rebase onto the new parent tip.`,
+        );
+      }
+
+      // Serialise against concurrent edits to the version, then re-read it INSIDE
+      // the lock: the plan was computed from a state read before the lock, and a
+      // save landing in between would otherwise be silently orphaned.
       await this.lockVersion(versionName);
       const fresh = await this.getVersion(versionName);
       if (!fresh || fresh.stateId !== version.stateId) {

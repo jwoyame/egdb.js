@@ -247,4 +247,41 @@ d('rebaseVersion harness (DB-backed)', () => {
     await gdb.rebaseVersion(fx.version, { unsafeExperimental: true, acceptConflicts: true });
     expect((await visibleOf(conn, fx.version)).get(400)).toBe('alex400');
   });
+
+  // ---- Defect F: parent lock + tip revalidation -------------------------------
+
+  it('DEFECT F fixed: aborts (writing nothing) if the parent tip advances mid-plan', async () => {
+    const fx = await loadOrphan();
+    const before = await snapshotVisible(conn);
+
+    // Simulate a concurrent post landing on DEFAULT between the plan (which reads
+    // the parent tip) and the locked re-read: advance DEFAULT to a fresh state on
+    // the FIRST getVersion(DEFAULT) call, which is the plan's read.
+    const real = gdb.getVersion.bind(gdb);
+    let bumped = false;
+    (gdb as unknown as { getVersion: typeof real }).getVersion = async (name: string) => {
+      const v = await real(name);
+      if (!bumped && name.toUpperCase().includes('DEFAULT')) {
+        bumped = true;
+        await conn.execute(
+          `INSERT INTO sde.SDE_states (state_id, owner, lineage_name, parent_state_id)
+             VALUES (999, 'sde', 10, 11);`);
+        await conn.execute(`UPDATE sde.SDE_versions SET state_id=999 WHERE name='DEFAULT';`);
+      }
+      return v;
+    };
+    try {
+      await expect(gdb.rebaseVersion(fx.version, { unsafeExperimental: true }))
+        .rejects.toThrow(/parent .* moved/i);
+    } finally {
+      (gdb as unknown as { getVersion: typeof real }).getVersion = real;
+    }
+
+    // The version is untouched (still on its orphan state) and nothing else moved.
+    expect((await lineageNameOf(conn, fx.version)).tip).toBe(5);
+    // Restore DEFAULT and confirm no rows were written by the aborted rebase.
+    await conn.execute(`UPDATE sde.SDE_versions SET state_id=11 WHERE name='DEFAULT';`);
+    await conn.execute(`DELETE FROM sde.SDE_states WHERE state_id=999;`);
+    expect(await snapshotVisible(conn)).toEqual(before);
+  });
 });
