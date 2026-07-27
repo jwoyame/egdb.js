@@ -77,6 +77,7 @@ export {
   InsufficientPrivilegeError,
   assessClosureSafety,
   ClosureUnsafeError,
+  updateVersionState,
 } from './reconcile';
 export type {
   StaleLockCleanupResult,
