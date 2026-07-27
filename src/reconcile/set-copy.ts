@@ -306,11 +306,17 @@ export async function classifyChildChanges(
     return n;
   };
   const statesTbl = driver === 'sqlserver' ? 'sde.SDE_states' : 'sde.sde_states';
+  // UNION (not UNION ALL) on Postgres so a corrupt parent_state_id CYCLE
+  // terminates -- PG has no MAXRECURSION, so a duplicate row is the only stop
+  // signal (matches getStatesInRange). SQL Server bounds recursion via
+  // OPTION(MAXRECURSION 0) + request timeout and requires UNION ALL. On valid
+  // acyclic chains the two are identical.
+  const setOp = driver === 'sqlserver' ? 'UNION ALL' : 'UNION';
   const walkCte = (name: string, tip: number): string => `
     ${name} AS (
       SELECT state_id AS s, parent_state_id AS p FROM ${statesTbl}
         WHERE state_id = ${intId(tip, name)} AND ${intId(tip, name)} <> 0
-      UNION ALL
+      ${setOp}
       SELECT st.state_id, st.parent_state_id FROM ${statesTbl} st
         JOIN ${name} x ON st.state_id = x.p WHERE x.p <> 0
     )`;

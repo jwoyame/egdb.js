@@ -1717,7 +1717,7 @@ export class EnterpriseGeodatabase {
              OPTION (MAXRECURSION 0)`
           : `WITH RECURSIVE anc AS (
                SELECT state_id AS s, parent_state_id AS p FROM sde.sde_states WHERE state_id = $2
-               UNION ALL
+               UNION
                SELECT st.state_id, st.parent_state_id FROM sde.sde_states st
                  JOIN anc x ON st.state_id = x.p WHERE x.p <> 0)
              INSERT INTO sde.sde_state_lineages (lineage_name, lineage_id)
