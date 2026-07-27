@@ -75,12 +75,15 @@ export {
   getVersionStats,
   cleanupStaleLocks,
   InsufficientPrivilegeError,
+  assessClosureSafety,
+  ClosureUnsafeError,
 } from './reconcile';
 export type {
   StaleLockCleanupResult,
   ChangedFeatureRecord,
   ChangedFeaturesResult,
   FeatureReader,
+  ClosureSafety,
 } from './reconcile';
 
 // Unified geodatabase access (works with both gdb.js and egdb.js)
