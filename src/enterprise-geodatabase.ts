@@ -1426,8 +1426,13 @@ export class EnterpriseGeodatabase {
    * SQL Server's 1000-row table-value-constructor limit; begin/rollbackTransaction
    * ignore the `wasInTx` pattern every other write path here uses; no
    * open-EditSession/fork check (a save would silently undo the rebase); the
-   * dry-run reports updates under a `deletes` label; A4 (post SUCCEEDS after a
-   * rebase) and A7 (end-to-end compress-safety) are not yet wired in the harness.
+   * dry-run reports updates under a `deletes` label.
+   *
+   * A rebased version has been shown end-to-end on the synthetic harness to POST
+   * (with no prior reconcile -- proving A) and to survive a full COMPRESS with
+   * every version's visible data unchanged (A4 + A7, the checks rounds 1 and 2
+   * skipped). What remains before ungating is a REAL-fabric (training) run of the
+   * same chain and the lesser issues above.
    */
   async rebaseVersion(
     versionName: string,

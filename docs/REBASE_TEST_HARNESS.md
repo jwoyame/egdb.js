@@ -49,10 +49,16 @@ fixed and pinned. The method stays gated: it has only run against the synthetic
 Docker harness, and lesser issues remain (non-idempotent replay, no
 open-EditSession check, IN-list/CHUNK limits).
 
-Two assertions still to wire in: **A4** (post SUCCEEDS after a rebase) and **A7**
-(end-to-end compress-safety) — both need `postVersion`/`compress` run against the
-rebased version, the check rounds 1 and 2 skipped. These are the next step before
-any real-fabric (training) validation.
+**A4** (post SUCCEEDS after a rebase, with NO prior reconcile) and **A7**
+(a rebased version survives a full compress with every version's visible data
+unchanged) are now wired and green on the synthetic harness — the exact checks
+rounds 1 and 2 skipped, and the reason they shipped broken. A4 lands the editor's
+inserts AND deletes in DEFAULT; A7 runs prune+graduate+collapse and asserts the
+snapshot + structural (C0) invariants.
+
+Remaining before ungating: a **real-fabric (training-clone) run** of the whole
+chain (rebase → post → compress) and the lesser issues (non-idempotent replay, no
+open-EditSession check, IN-list/CHUNK limits).
 
 ## Part 0 — the oracle (the thing rev 1 got wrong)
 
