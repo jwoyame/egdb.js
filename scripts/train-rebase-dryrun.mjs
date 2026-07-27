@@ -17,6 +17,15 @@ const cfg = {
   database: process.env.TRAIN_DB || 'parcel_fabric_test',
   user: process.env.TRAIN_USER || process.env.U,
   password: process.env.TRAIN_PASS || process.env.P,
+  // Over a fetch tunnel, TLS negotiation per query is slow; default encrypt off
+  // (set TRAIN_ENCRYPT=1 to force on). Longer requestTimeout for the 14-table
+  // classifier sweep on a real fabric.
+  options: {
+    encrypt: process.env.TRAIN_ENCRYPT === '1',
+    trustServerCertificate: true,
+    connectionTimeout: 20000,
+    requestTimeout: 90000,
+  },
 };
 if (!cfg.user || !cfg.password) {
   console.error('Missing TRAIN_USER/TRAIN_PASS (or U/P) in env. Nothing run.');
