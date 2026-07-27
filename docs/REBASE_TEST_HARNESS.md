@@ -23,6 +23,31 @@ fix would violate. This revision replaces it with an **absolute oracle**.
 The harness's job is to **falsify** `rebaseVersion`. A scenario that cannot fail
 does not earn its place.
 
+## Implementation status (2026-07-26)
+
+The harness is built on the committed compress infrastructure (reference model,
+synthetic schema, snapshot invariants) — see `tests/rebase/`. Defects are fixed
+one at a time, each pinned red-then-green; the method stays gated behind
+`{ unsafeExperimental: true }` until all are closed.
+
+| Defect | Status | Where pinned |
+|--------|--------|--------------|
+| A — post refused (truncated closure) | **fixed** (harness) | `rebase.test.ts` reconciled/postable |
+| B — graduable prefix emptied | **fixed** (with A) | closure seeded from parent walk |
+| C — SDE_state_new_edit branch divergence | **fixed** (with A) | own-lineage normalisation |
+| D — tip-only false-keep + no conflict signal | **fixed** (harness) | residue-conflict test |
+| E — create-then-delete resurrect / delete-after-reconcile vanish | **fixed** (harness) | editor-deletes test |
+| vet #4 — parent-deleted row child edited resurrected | **fixed** (with E) | parent-delete-conflict test |
+| F — parent not locked / tip not revalidated | **fixed** (harness) | parent-moved abort test |
+| G — pure-delete markers invisible to egdb reader | **open** | — |
+| H — latent base-table deletion via graduation | **open** | — |
+| I — parent-deleted resurrected | open | — |
+| S19 — unposted delete graduates into `DELETE FROM base` | open (relates to H) | — |
+
+Two assertions still to wire in: **A4** (post SUCCEEDS after a rebase) and **A7**
+(compress-safety) — both need `postVersion`/`compress` run against the rebased
+version, the check rounds 1 and 2 skipped.
+
 ## Part 0 — the oracle (the thing rev 1 got wrong)
 
 ### Fixture ledger — captured, not declared
