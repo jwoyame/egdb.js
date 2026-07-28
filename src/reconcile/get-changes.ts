@@ -74,12 +74,16 @@ export async function getTableChanges(
   const addedIds = new Map<number, number>(); // objectId -> stateId
   const deletedIds = new Map<number, number>(); // objectId -> stateId
 
+  // Coerce to Number: SQL Server returns the bigint SDE_STATE_ID as a STRING, and
+  // FeatureChange.stateId flows into copyTipRows -> buildIntegerList, which rejects
+  // a non-number ("Invalid integer ... copyTipRows.from"). state_ids are far below
+  // 2^53 so no precision loss. (Same bigint fix the post path already carries.)
   for (const row of addsRows) {
-    addedIds.set(row.OBJECTID, row.SDE_STATE_ID);
+    addedIds.set(Number(row.OBJECTID), Number(row.SDE_STATE_ID));
   }
 
   for (const row of deletesRows) {
-    deletedIds.set(row.OBJECTID, row.SDE_STATE_ID);
+    deletedIds.set(Number(row.OBJECTID), Number(row.SDE_STATE_ID));
   }
 
   const changes: VersionChanges = { inserts: [], updates: [], deletes: [] };
