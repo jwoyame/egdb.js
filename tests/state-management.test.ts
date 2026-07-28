@@ -29,8 +29,8 @@ interface MockCall {
 interface MockOptions {
   driver?: 'sqlserver' | 'postgresql';
   inTransaction?: boolean;
-  /** Map of (substring of sql) -> rows to return for query() */
-  queryResponses?: Array<{ match: RegExp; rows: Record<string, unknown>[] }>;
+  /** Map of (substring of sql) -> rows to return for query() (or throw) */
+  queryResponses?: Array<{ match: RegExp; rows?: Record<string, unknown>[]; throws?: Error }>;
 }
 
 function makeMock(opts: MockOptions = {}): {
@@ -51,6 +51,7 @@ function makeMock(opts: MockOptions = {}): {
       // Grant the N9 shared applock by default (createChildState acquires it first).
       if (/sp_getapplock|pg_advisory/.test(sql)) return [{ code: 0 }] as T[];
       const match = (opts.queryResponses ?? []).find((r) => r.match.test(sql));
+      if (match?.throws) throw match.throws;
       return (match?.rows ?? []) as T[];
     },
     async *stream() {
@@ -369,5 +370,38 @@ describe('cleanupStaleLocks', () => {
     await cleanupStaleLocks(connection);
     expect(calls.find((c) => /pg_stat_activity/.test(c.sql))).toBeDefined();
     expect(calls.find((c) => /dm_exec_sessions/.test(c.sql))).toBeUndefined();
+  });
+
+  it('strict path ALSO spares a live Esri session via SDE_process_information', async () => {
+    // 5555 is not a SQL session_id (Esri direct-connect uses SDE session ids), so
+    // signal (1) alone would wrongly reap it; the registry protects it.
+    const { connection, calls } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        sqlServerPermOk,
+        cutoffOk,
+        { match: /DISTINCT sde_id/, rows: [{ sde_id: 5555 }, { sde_id: 52 }] },
+        { match: /dm_exec_sessions/, rows: [{ sde_id: 51 }] },
+        { match: /SDE_process_information/, rows: [{ sde_id: 5555 }] },
+      ],
+    });
+    const result = await cleanupStaleLocks(connection);
+    expect([...result.staleSdeIds]).toEqual([52]); // only 52 (in neither signal) is stale
+    expect(calls.find((c) => /SDE_process_information/.test(c.sql))).toBeDefined();
+  });
+
+  it('tolerates a missing SDE_process_information on the strict path (registry is a bonus)', async () => {
+    const { connection } = makeMock({
+      driver: 'sqlserver',
+      queryResponses: [
+        sqlServerPermOk,
+        cutoffOk,
+        { match: /DISTINCT sde_id/, rows: [{ sde_id: 51 }, { sde_id: 52 }] },
+        { match: /dm_exec_sessions/, rows: [{ sde_id: 51 }] },
+        { match: /SDE_process_information/, throws: new Error('Invalid object name') },
+      ],
+    });
+    const result = await cleanupStaleLocks(connection); // registry error swallowed; SQL-session signal stands
+    expect([...result.staleSdeIds]).toEqual([52]);
   });
 });

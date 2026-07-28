@@ -1865,6 +1865,11 @@ export class EnterpriseGeodatabase {
     // missing VIEW SERVER STATE), fall through to the conservative COUNT (defer on
     // ANY lock — fail-safe) and warn so an operator can reap manually.
     try {
+      // Strict path: requires VIEW SERVER STATE so every live session is visible.
+      // We do NOT reap on a login lacking it — a persistent EditSession holds a
+      // lock row for minutes with no applock held and no stable connection behind
+      // its @@SPID, so it is indistinguishable from a leaked lock without full
+      // session visibility. Without the grant this throws and we defer (fail-safe).
       await cleanupStaleLocks(this.connection);
     } catch (e) {
       this._logger.warn?.(`compress: stale-lock reaper could not run (${e instanceof Error ? e.message : String(e)}); deferring on any lock present.`);

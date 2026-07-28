@@ -262,6 +262,7 @@ export interface StaleLockCleanupResult {
   removedLocks: number;
 }
 
+
 export class InsufficientPrivilegeError extends Error {
   constructor(message: string) {
     super(message);
@@ -317,18 +318,27 @@ async function assertCanSeeAllSessions(connection: IDatabaseConnection): Promise
  * SDE_state_locks rows leak when a process holding a lock dies before
  * EditSession.close() runs (e.g. crash, OOM, kill -9). The orphaned row
  * keeps compress away from a state that nothing else references, so
- * the state and its A/D entries linger forever. ArcGIS itself addresses
- * this with SDE_process_information heartbeats; we cross-check the
- * live session list instead, which works for the typical egdb.js
- * deployment shape (one Node process per connection).
+ * the state and its A/D entries linger forever.
  *
- * Liveness is judged against:
- *   SQL Server — sys.dm_exec_sessions.session_id (requires VIEW SERVER STATE)
- *   PostgreSQL — pg_stat_activity.pid       (requires pg_read_all_stats /
- *                                            pg_monitor / superuser)
+ * Liveness is the UNION of two signals, because two kinds of editor lock this
+ * fabric with disjoint id spaces:
+ *   (1) visible SQL sessions — sys.dm_exec_sessions.session_id / pg_stat_activity.pid.
+ *       egdb.js locks under its raw SQL @@SPID, so this protects a live egdb
+ *       editor. Seeing OTHER sessions needs VIEW SERVER STATE (SQL Server) /
+ *       pg_read_all_stats|pg_monitor|superuser (PostgreSQL).
+ *   (2) the ArcSDE session registry — SDE_process_information. Esri/ArcGIS-Pro
+ *       direct-connect editors lock under an SDE session id (a counter, never a
+ *       @@SPID), so signal (1) can never protect them; this registry does while
+ *       their session is open, and drops the row when it closes (the leaked lock
+ *       this reaps).
  *
- * Without those grants this throws InsufficientPrivilegeError rather than
- * doing damage — see assertCanSeeAllSessions for why.
+ * Default (strict) path requires the grant for signal (1) — throwing
+ * InsufficientPrivilegeError rather than reaping live sessions (see
+ * assertCanSeeAllSessions) — and adds (2) as a bonus. The exclusive path
+ * ({assumeExclusiveAccess}) leans on (2): the caller's compress applock already
+ * excludes live egdb editors, so the grant is NOT required — this is how
+ * compress reaps leaked Esri direct-connect locks on a login lacking VIEW
+ * SERVER STATE.
  *
  * Race protection: a database SPID/pid can be recycled to a brand-new
  * connection between when we read the lock list and when we run the DELETE.
@@ -353,6 +363,12 @@ export async function cleanupStaleLocks(
 ): Promise<StaleLockCleanupResult> {
   const driver = connection.driver;
 
+  // Require VIEW SERVER STATE (SQL Server) / stats visibility (PostgreSQL) so
+  // EVERY live session is visible. This is NOT optional: a persistent egdb.js
+  // EditSession holds an SDE_state_locks row for the session's lifetime with no
+  // applock held and no stable connection behind its @@SPID, so without full
+  // session visibility a LIVE editor's lock is indistinguishable from a leaked
+  // one. Rather than risk reaping a live lock, throw and let the caller defer.
   await assertCanSeeAllSessions(connection);
 
   // Capture a cutoff timestamp BEFORE reading locks. Any lock inserted
@@ -380,12 +396,37 @@ export async function cleanupStaleLocks(
     return { staleSdeIds: [], removedLocks: 0 };
   }
 
+  // Liveness signal 1 — visible SQL sessions. With VIEW SERVER STATE this is
+  // every session (protects egdb, whose lock sde_id IS the SQL @@SPID); without
+  // it, only the caller's own session (still enough on the exclusive path).
   const liveRows = await connection.query<{ sde_id: number }>(
     driver === 'sqlserver'
       ? `SELECT session_id AS sde_id FROM sys.dm_exec_sessions`
       : `SELECT pid AS sde_id FROM pg_stat_activity WHERE pid IS NOT NULL`
   );
   const liveSet = new Set(liveRows.map((r) => r.sde_id));
+
+  // Liveness signal 2 — the ArcSDE session registry. Esri/ArcGIS-Pro
+  // direct-connect editors lock under an SDE session id (a monotonic counter,
+  // NOT a SQL @@SPID), so sys.dm_exec_sessions never protects them — a live
+  // Esri editor's lock would be misclassified stale by signal 1 alone. Their
+  // sde_id IS a row here while their session is open, and the row disappears
+  // when it closes (leaving the leaked lock this reaps). Best-effort: tolerate
+  // the table's absence on a pure-egdb / non-Esri deployment, EXCEPT on the
+  // exclusive path where it is the load-bearing signal.
+  try {
+    const sdeSessions = await connection.query<{ sde_id: number }>(
+      driver === 'sqlserver'
+        ? `SELECT sde_id FROM sde.SDE_process_information`
+        : `SELECT sde_id FROM sde.process_information`
+    );
+    for (const r of sdeSessions) liveSet.add(r.sde_id);
+  } catch {
+    // The registry is a BONUS signal (it protects live Esri direct-connect
+    // editors, whose SDE session id is never a @@SPID). We already have full
+    // SQL-session visibility from the required grant, so tolerate its absence
+    // on a pure-egdb / non-ArcSDE-registered deployment.
+  }
 
   const staleSdeIds = lockSdeRows
     .map((r) => r.sde_id)
