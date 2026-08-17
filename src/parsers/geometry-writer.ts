@@ -8,18 +8,44 @@ import type { Geometry, GeometryType, CoordinateGeometry, GeometryCollectionType
  * Convert a GeoJSON-style geometry to WKT (Well-Known Text)
  * WKT is easier to work with than WKB and SQL Server/PostgreSQL can parse it natively
  */
+// WKT type keyword per geometry type, used to write empty geometries as
+// "<TYPE> EMPTY".
+const WKT_TYPE_NAME: Record<string, string> = {
+  Point: 'POINT',
+  MultiPoint: 'MULTIPOINT',
+  LineString: 'LINESTRING',
+  MultiLineString: 'MULTILINESTRING',
+  Polygon: 'POLYGON',
+  MultiPolygon: 'MULTIPOLYGON',
+};
+
 export function geometryToWkt(geometry: Geometry): string {
   const type = geometry.type;
 
   // Handle GeometryCollection separately
   if (type === 'GeometryCollection') {
     const geomCollection = geometry as GeometryCollectionType;
+    // An empty collection must be written with the EMPTY keyword. The
+    // "GEOMETRYCOLLECTION ()" form is not valid WKT: SQL Server rejects it with
+    // error 24114 ("the label ) in the input well-known text (WKT) is not
+    // valid") and aborts the whole write (e.g. a parcel merge that touches an
+    // empty-Shape line).
+    if (geomCollection.geometries.length === 0) return 'GEOMETRYCOLLECTION EMPTY';
     const wktParts = geomCollection.geometries.map(g => geometryToWkt(g));
     return `GEOMETRYCOLLECTION (${wktParts.join(', ')})`;
   }
 
   // For coordinate-based geometries
   const coords = (geometry as CoordinateGeometry).coordinates;
+
+  // A geometry with no coordinates must also use EMPTY, not "()". Legacy fabric
+  // lines and parcels can carry an empty Shape; writing one back as
+  // "LINESTRING ()" / "POLYGON ()" is invalid WKT and SQL Server rejects it the
+  // same way. Only shortcut known types so an unknown type still hits the
+  // explicit error in the switch below.
+  if (!(coords as ArrayLike<unknown> | undefined)?.length && WKT_TYPE_NAME[type]) {
+    return `${WKT_TYPE_NAME[type]} EMPTY`;
+  }
 
   switch (type) {
     case 'Point':

@@ -256,6 +256,29 @@ describe('Geometry Writer', () => {
       };
       expect(geometryToWkt(geom)).toBe('MULTIPOLYGON (((0 0, 1 0, 1 1, 0 1, 0 0)), ((2 2, 3 2, 3 3, 2 3, 2 2)))');
     });
+
+    // Empty geometries must use the WKT "EMPTY" keyword. The "(...)"-with-nothing
+    // form (e.g. "GEOMETRYCOLLECTION ()") is invalid WKT and SQL Server rejects it
+    // with error 24114, which aborts writes such as a parcel merge that touches a
+    // legacy empty-Shape line.
+    it('should write an empty GeometryCollection as EMPTY, not "()"', () => {
+      expect(geometryToWkt({ type: 'GeometryCollection', geometries: [] } as unknown as Geometry))
+        .toBe('GEOMETRYCOLLECTION EMPTY');
+    });
+
+    it('should write empty coordinate geometries with the EMPTY keyword', () => {
+      expect(geometryToWkt({ type: 'LineString', coordinates: [] } as unknown as Geometry)).toBe('LINESTRING EMPTY');
+      expect(geometryToWkt({ type: 'Polygon', coordinates: [] } as unknown as Geometry)).toBe('POLYGON EMPTY');
+      expect(geometryToWkt({ type: 'MultiPolygon', coordinates: [] } as unknown as Geometry)).toBe('MULTIPOLYGON EMPTY');
+      expect(geometryToWkt({ type: 'Point', coordinates: [] } as unknown as Geometry)).toBe('POINT EMPTY');
+    });
+
+    it('should write a nested empty member with the EMPTY keyword', () => {
+      expect(geometryToWkt({
+        type: 'GeometryCollection',
+        geometries: [{ type: 'LineString', coordinates: [] }],
+      } as unknown as Geometry)).toBe('GEOMETRYCOLLECTION (LINESTRING EMPTY)');
+    });
   });
 
   describe('geometryToSqlExpression', () => {
