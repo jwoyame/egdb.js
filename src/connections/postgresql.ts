@@ -49,7 +49,10 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     this._isConnected = true;
   }
 
-  async query<T>(sqlQuery: string, params?: unknown[]): Promise<T[]> {
+  // opts is accepted for interface parity with the SQL Server driver (its
+  // mutating opt-out gates connection-blip retry). This driver does not auto-retry,
+  // so opts has no effect here.
+  async query<T>(sqlQuery: string, params?: unknown[], _opts?: { mutating?: boolean }): Promise<T[]> {
     if (!this.pool) throw new Error('Not connected');
 
     // Convert @p0, @p1 parameter syntax to $1, $2 for PostgreSQL

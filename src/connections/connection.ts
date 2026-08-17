@@ -15,10 +15,17 @@ export interface IDatabaseConnection {
   /** Connect to the database */
   connect(): Promise<void>;
 
-  /** Execute a query and return results */
+  /**
+   * Execute a query and return results.
+   * @param opts.mutating set true when the SQL mutates (e.g. an SDE stored proc
+   *   like create_version routed through query()); it then does NOT auto-retry a
+   *   connection blip, since re-running a non-idempotent statement could
+   *   double-apply. Plain reads (the default) may retry.
+   */
   query<T = Record<string, unknown>>(
     sql: string,
-    params?: unknown[]
+    params?: unknown[],
+    opts?: { mutating?: boolean }
   ): Promise<T[]>;
 
   /** Stream query results */

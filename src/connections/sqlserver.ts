@@ -6,6 +6,42 @@ import type { IDatabaseConnection, ExecuteResult } from './connection';
 import type { SqlServerConfig } from '../types';
 import { RwLock } from '../utils/rw-lock';
 
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Classify a driver error so we can retry transient connection blips (a brief
+ * RDS/network hiccup). Note there is NO driver signal that proves a statement
+ * never reached the server -- a socket reset can arrive after a commit -- so we
+ * never rely on this to make a WRITE retry-safe. It gates only idempotent reads
+ * and BEGIN TRAN (which the server auto-rolls-back if the connection drops):
+ *
+ *  - 'connection'      -- a connection-level failure (mssql ConnectionError,
+ *                         socket errors, or a bare timeout with no server
+ *                         context). Retried only for reads and begin.
+ *  - 'request-timeout' -- a RequestError timeout: the statement reached the
+ *                         server and may have committed. Retried only for an
+ *                         idempotent read, never for a write or begin.
+ *  - 'other'           -- a real SQL/logic error; never retry.
+ */
+export function classifyConnError(err: unknown): 'connection' | 'request-timeout' | 'other' {
+  const e = err as { code?: unknown; name?: unknown; message?: unknown } | null | undefined;
+  const code = typeof e?.code === 'string' ? e.code : '';
+  const name = typeof e?.name === 'string' ? e.name : '';
+  const msg = typeof e?.message === 'string' ? e.message : '';
+
+  if (name === 'ConnectionError') return 'connection';
+  if (['ESOCKET', 'ECONNCLOSED', 'ECONNRESET', 'EPIPE', 'ENOTOPEN', 'ENOCONN'].includes(code)) return 'connection';
+  if (/failed to connect|connection is closed|connection not yet open|connection lost|socket hang up|connection to .* failed|not connected/i.test(msg)) {
+    return 'connection';
+  }
+  // A request that reached the server then timed out: same ETIMEOUT code, but a
+  // RequestError. Retry only reads.
+  if (name === 'RequestError' && (code === 'ETIMEOUT' || code === 'ETIMEDOUT')) return 'request-timeout';
+  // A bare timeout with no RequestError name is a connect/acquire timeout.
+  if (code === 'ETIMEOUT' || code === 'ETIMEDOUT') return 'connection';
+  return 'other';
+}
+
 export class SqlServerConnection implements IDatabaseConnection {
   private pool: sql.ConnectionPool | null = null;
   private config: sql.config;
@@ -64,7 +100,48 @@ export class SqlServerConnection implements IDatabaseConnection {
       : await sql.connect(this.config);
   }
 
-  async query<T>(sqlQuery: string, params?: unknown[]): Promise<T[]> {
+  // Re-establish the pool if it has dropped. For a shared (non-dedicated)
+  // connection this calls sql.connect, which rebuilds mssql's global pool if it
+  // closed but returns the existing one if it's healthy -- so we never yank the
+  // pool out from under other connections. Best-effort: on failure we leave the
+  // pool as-is and let the retried op surface a fresh error.
+  private async reestablishIfDown(): Promise<void> {
+    if (this.pool?.connected) return;
+    if (this.dedicatedPool) {
+      // Close the dead PRIVATE pool before replacing it so its sockets don't leak.
+      try { await this.pool?.close(); } catch { /* already down */ }
+      try { this.pool = await new sql.ConnectionPool(this.config).connect(); }
+      catch { /* leave as-is; the caller's retry will report if still down */ }
+    } else {
+      // Shared pool: sql.connect rebuilds mssql's global pool if it closed but
+      // returns the existing one if healthy, so we never close it out from under
+      // other connections.
+      try { this.pool = await sql.connect(this.config); }
+      catch { /* leave as-is */ }
+    }
+  }
+
+  // Run an idempotent READ op, retrying ONCE through a transient connection blip.
+  // Only reads use this -- writes never auto-retry (a commit's ack can be lost,
+  // making a retry a double-apply). `retryRequestTimeout` is true for reads so a
+  // slow-then-timed-out read also retries. Never retries while a transaction is
+  // open: a lost connection there dooms the whole transaction and the caller must
+  // roll back and re-run it.
+  private async withConnRetry<T>(op: () => Promise<T>, retryRequestTimeout: boolean): Promise<T> {
+    try {
+      return await op();
+    } catch (err) {
+      if (this.transaction) throw err;
+      const kind = classifyConnError(err);
+      const retriable = kind === 'connection' || (retryRequestTimeout && kind === 'request-timeout');
+      if (!retriable) throw err;
+      await this.reestablishIfDown();
+      await delay(300);
+      return op();
+    }
+  }
+
+  async query<T>(sqlQuery: string, params?: unknown[], opts?: { mutating?: boolean }): Promise<T[]> {
     if (!this.pool) throw new Error('Not connected');
 
     // Inside our own transaction: run on it directly (we hold the write lock).
@@ -74,13 +151,18 @@ export class SqlServerConnection implements IDatabaseConnection {
       const result = await request.query(sqlQuery);
       return result.recordset as T[];
     }
-    // Otherwise take the shared lock so we can't run while a transaction is open.
-    return this.lock.read(async () => {
+    const op = async (): Promise<T[]> => {
       const request = this.pool!.request();
       if (params) params.forEach((p, i) => request.input(`p${i}`, p));
       const result = await request.query(sqlQuery);
       return result.recordset as T[];
-    });
+    };
+    // A mutating call routed through query() -- an SDE stored proc like
+    // create_version/delete_version/edit_version -- is not idempotent, so it must
+    // NOT auto-retry (same reasoning as execute()). Callers pass mutating:true.
+    // A plain read has no side effect and is safe to retry through a blip.
+    if (opts?.mutating) return this.lock.read(op);
+    return this.lock.read(() => this.withConnRetry(op, true));
   }
 
   async *stream(
@@ -209,6 +291,11 @@ export class SqlServerConnection implements IDatabaseConnection {
     };
 
     if (this.transaction) return run(this.transaction.request());
+    // No auto-retry for a write. An autocommit INSERT/UPDATE/DELETE can commit on
+    // the server and then have its ack lost (a socket reset arrives after the
+    // commit), which is indistinguishable from "never ran" at the driver level -
+    // so retrying could double-apply. The caller must decide whether re-running
+    // is safe.
     return this.lock.read(() => run(this.pool!.request()));
   }
 
@@ -233,6 +320,7 @@ export class SqlServerConnection implements IDatabaseConnection {
     };
 
     if (this.transaction) return run(this.transaction.request());
+    // No auto-retry for a write (see execute()).
     return this.lock.read(() => run(this.pool!.request()));
   }
 
@@ -250,20 +338,38 @@ export class SqlServerConnection implements IDatabaseConnection {
     // lock before assigning `this.transaction` so no reader observes it mid-open.
     await this.lock.acquireWrite();
     try {
-      const tx = new sql.Transaction(this.pool);
       const isoLevel = options?.isolation === 'serializable'
         ? sql.ISOLATION_LEVEL.SERIALIZABLE
         : undefined;
-      if (isoLevel !== undefined) {
-        await tx.begin(isoLevel);
-      } else {
-        await tx.begin();
-      }
-      this.transaction = tx;
+      this.transaction = await this.beginWithRetry(isoLevel);
     } catch (err) {
       // begin() failed — release the lock so the connection isn't stranded.
       this.lock.releaseWrite();
       throw err;
+    }
+  }
+
+  // Open a transaction, retrying ONCE only when the failure dropped the
+  // connection. On a dropped connection SQL Server auto-rolls-back any BEGIN it
+  // had started, so nothing is left applied and re-beginning on a fresh
+  // connection is safe. A request-timeout is deliberately NOT retried: the
+  // connection may survive with BEGIN TRAN already open, and starting a second
+  // transaction would leave the first connection poisoned (an inherited open
+  // transaction holding locks) back in the pool.
+  private async beginWithRetry(isoLevel: number | undefined): Promise<sql.Transaction> {
+    const start = async (): Promise<sql.Transaction> => {
+      const tx = new sql.Transaction(this.pool!);
+      if (isoLevel !== undefined) await tx.begin(isoLevel);
+      else await tx.begin();
+      return tx;
+    };
+    try {
+      return await start();
+    } catch (err) {
+      if (classifyConnError(err) !== 'connection') throw err;
+      await this.reestablishIfDown();
+      await delay(300);
+      return start();
     }
   }
 

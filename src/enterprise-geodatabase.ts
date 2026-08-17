@@ -692,7 +692,7 @@ export class EnterpriseGeodatabase {
       ? `EXEC sde.set_current_version @p0`
       : `SELECT sde.set_current_version($1)`;
 
-    await this.connection.query(sql, [fullName]);
+    await this.connection.query(sql, [fullName], { mutating: true });
   }
 
   /**
@@ -814,13 +814,15 @@ export class EnterpriseGeodatabase {
       // The procedure may modify the name if nameRule is UNIQUE
       await this.connection.query(
         `EXEC sde.create_version @p0, @p1, @p2, @p3, @p4`,
-        [parent, name, nameRule, access, description]
+        [parent, name, nameRule, access, description],
+        { mutating: true }
       );
     } else {
       // PostgreSQL
       await this.connection.query(
         `SELECT sde.create_version($1, $2, $3, $4, $5)`,
-        [parent, name, nameRule, access, description]
+        [parent, name, nameRule, access, description],
+        { mutating: true }
       );
     }
 
@@ -853,9 +855,9 @@ export class EnterpriseGeodatabase {
     }
 
     if (this.config.driver === 'sqlserver') {
-      await this.connection.query(`EXEC sde.delete_version @p0`, [fullName]);
+      await this.connection.query(`EXEC sde.delete_version @p0`, [fullName], { mutating: true });
     } else {
-      await this.connection.query(`SELECT sde.delete_version($1)`, [fullName]);
+      await this.connection.query(`SELECT sde.delete_version($1)`, [fullName], { mutating: true });
     }
   }
 
@@ -875,9 +877,9 @@ export class EnterpriseGeodatabase {
 
     if (this.config.driver === 'sqlserver') {
       // edit_action: 1 = start editing
-      await this.connection.query(`EXEC sde.edit_version @p0, 1`, [fullName]);
+      await this.connection.query(`EXEC sde.edit_version @p0, 1`, [fullName], { mutating: true });
     } else {
-      await this.connection.query(`SELECT sde.edit_version($1, 1)`, [fullName]);
+      await this.connection.query(`SELECT sde.edit_version($1, 1)`, [fullName], { mutating: true });
     }
   }
 
@@ -898,9 +900,9 @@ export class EnterpriseGeodatabase {
 
     if (this.config.driver === 'sqlserver') {
       // edit_action: 1 = start editing, 2 = end editing
-      await this.connection.query(`EXEC sde.edit_version @p0, @p1`, [fullName, 2]);
+      await this.connection.query(`EXEC sde.edit_version @p0, @p1`, [fullName, 2], { mutating: true });
     } else {
-      await this.connection.query(`SELECT sde.edit_version($1, 2)`, [fullName]);
+      await this.connection.query(`SELECT sde.edit_version($1, 2)`, [fullName], { mutating: true });
     }
   }
 
