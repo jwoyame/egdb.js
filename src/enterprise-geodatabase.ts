@@ -2146,6 +2146,21 @@ export class EnterpriseGeodatabase {
    * });
    * ```
    */
+  /**
+   * Run `fn` with a per-statement timeout on the underlying edit connection, so a
+   * fast operation (e.g. a merge, normally sub-second) fails quickly on a
+   * transient DB stall instead of waiting the full pool requestTimeout. Wrap the
+   * WHOLE operation (reads + editTransaction) so a stall during either fails fast.
+   * SQL Server only; a no-op passthrough on other drivers. Does not cover the
+   * COMMIT statement (see SqlServerConnection.withStatementTimeout).
+   */
+  async withEditStatementTimeout<T>(ms: number, fn: () => Promise<T>): Promise<T> {
+    if (this.connection instanceof SqlServerConnection) {
+      return this.connection.withStatementTimeout(ms, fn);
+    }
+    return fn();
+  }
+
   async editTransaction<T>(
     versionName: string,
     fn: (session: EditSession) => Promise<T>
@@ -2176,8 +2191,19 @@ export class EnterpriseGeodatabase {
 
       return result;
     } catch (error) {
-      if (!alreadyInTransaction) {
-        await this.connection.rollbackTransaction();
+      // Roll back only if a transaction is still open. A request-timeout on the
+      // COMMIT statement leaves commitTransaction having already cleared its
+      // transaction slot, so a blind rollbackTransaction() would throw "No
+      // transaction in progress" and MASK the original timeout error (which the
+      // caller needs to classify as a connection blip). Guarding on
+      // inTransaction() lets the real error propagate; a failed rollback is
+      // likewise swallowed so it can't mask the original error either.
+      if (!alreadyInTransaction && this.connection.inTransaction()) {
+        try {
+          await this.connection.rollbackTransaction();
+        } catch {
+          // ignore - propagate the original error below
+        }
       }
       throw error;
     }

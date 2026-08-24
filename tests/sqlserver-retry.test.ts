@@ -134,3 +134,53 @@ describe('SqlServerConnection retry routing', () => {
     expect(calls).toBe(1);
   });
 });
+
+describe('withStatementTimeout (edit fast-fail)', () => {
+  // The timeout only applies to IN-TRANSACTION statements (exclusively the
+  // lock-holding operation's own), so tests inject a transaction whose request()
+  // returns the controllable request -- matching how a merge runs its writes.
+  function injectTx(conn: SqlServerConnection, req: unknown) {
+    (conn as unknown as { pool: unknown }).pool = { connected: true, request: () => req, close: async () => {} };
+    (conn as unknown as { transaction: unknown }).transaction = { request: () => req };
+  }
+
+  it('cancels a slow in-transaction statement and rejects ~timeout with ETIMEOUT', async () => {
+    const conn = makeConn();
+    let canceled = false;
+    const hangingReq = { input() { return this; }, query: () => new Promise(() => {}), cancel: () => { canceled = true; } };
+    injectTx(conn, hangingReq);
+    const t = Date.now();
+    const err = await conn.withStatementTimeout(150, () => conn.execute('UPDATE x SET y=1')).catch((e) => e);
+    const elapsed = Date.now() - t;
+    expect(canceled).toBe(true);
+    expect((err as { code?: string }).code).toBe('ETIMEOUT');
+    expect(elapsed).toBeGreaterThanOrEqual(140);
+    expect(elapsed).toBeLessThan(1000);
+  });
+
+  it('does NOT time out a fast statement, and clears the override after', async () => {
+    const conn = makeConn();
+    const fastReq = { input() { return this; }, query: async () => ({ rowsAffected: [1] }), cancel: () => {} };
+    injectTx(conn, fastReq);
+    const r = await conn.withStatementTimeout(150, () => conn.execute('UPDATE x SET y=1'));
+    expect(r.rowsAffected).toBe(1);
+    // Override cleared: a later slow op is not canceled.
+    let canceled = false;
+    const laterReq = { input() { return this; }, query: async () => ({ rowsAffected: [0] }), cancel: () => { canceled = true; } };
+    injectTx(conn, laterReq);
+    await conn.execute('UPDATE x SET y=2');
+    expect(canceled).toBe(false);
+  });
+
+  it('does NOT cancel a POOLED (concurrent) statement even while a timeout is set', async () => {
+    // A pooled read during another op's timeout window must not be canceled.
+    const conn = makeConn();
+    let canceled = false;
+    const pooledReq = { input() { return this; }, query: async () => ({ recordset: [{ n: 1 }] }), cancel: () => { canceled = true; } };
+    (conn as unknown as { pool: unknown }).pool = { connected: true, request: () => pooledReq, close: async () => {} };
+    // transaction is NULL -> pooled path; even with a short timeout set, no cancel.
+    const rows = await conn.withStatementTimeout(10, () => conn.query('SELECT 1'));
+    expect(rows).toEqual([{ n: 1 }]);
+    expect(canceled).toBe(false);
+  });
+});

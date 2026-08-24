@@ -59,7 +59,68 @@ export class SqlServerConnection implements IDatabaseConnection {
   // pooled request and don't touch the lock. See utils/rw-lock.ts.
   private lock = new RwLock();
 
+  // Optional per-statement timeout (ms) applied to execute/executeInsert/query
+  // requests when set (enforced by cancelling the request, since mssql has no
+  // per-request timeout). Lets an edit operation fail fast on a transient DB
+  // stall (e.g. a merge, which is normally sub-second) instead of waiting the
+  // full pool requestTimeout. Note: it does NOT cover streaming reads or the
+  // COMMIT statement (mssql builds its own request for tx.commit()), so a stall
+  // there still rides the pool default. Set via withStatementTimeout().
+  private statementTimeoutMs: number | null = null;
+
   readonly driver = 'sqlserver' as const;
+
+  /**
+   * Run `fn` with a per-statement timeout applied to this connection's
+   * IN-TRANSACTION execute/executeInsert/query requests (see runWithTimeout).
+   * Restores the previous value after.
+   *
+   * The timeout field is shared on the connection and this save/restore is NOT
+   * safe across concurrent callers that use DIFFERENT timeout values -- it
+   * assumes a single caller (today: the merge, always 12s). Because the timeout
+   * only arms for in-transaction statements and those run under the exclusive
+   * write lock, wrap ONLY the transaction (not preceding reads) so the armed
+   * window is exactly when this op owns the write path.
+   */
+  async withStatementTimeout<T>(ms: number, fn: () => Promise<T>): Promise<T> {
+    const prev = this.statementTimeoutMs;
+    this.statementTimeoutMs = ms;
+    try {
+      return await fn();
+    } finally {
+      this.statementTimeoutMs = prev;
+    }
+  }
+
+  // Run a request with the active per-statement timeout, if one is set. mssql has
+  // no per-request timeout, so we enforce it by cancelling the request (an
+  // attention token) when the timer fires; that rejects `exec()` with a
+  // cancellation error, which classifyConnError treats as a request-timeout.
+  private async runWithTimeout<T>(request: sql.Request, exec: () => Promise<T>): Promise<T> {
+    const ms = this.statementTimeoutMs;
+    // Only enforce the timeout on statements running INSIDE our own transaction.
+    // The connection is shared per-connection-id across concurrent requests, and
+    // statementTimeoutMs is a shared field; if we also applied it to pooled
+    // statements, a merge's fast-fail timer could cancel an unrelated concurrent
+    // read. In-transaction statements run only while this operation holds the
+    // exclusive write lock, so they are exclusively ours -- safe to cancel.
+    if (ms == null || this.transaction == null) return exec();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try { request.cancel(); } catch { /* already done */ }
+        const err = new Error(`Statement canceled after ${ms}ms (edit fast-fail timeout)`) as Error & { code: string; name: string };
+        err.code = 'ETIMEOUT';
+        err.name = 'RequestError';
+        reject(err);
+      }, ms);
+    });
+    try {
+      return await Promise.race([exec(), timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
 
   constructor(config: SqlServerConfig) {
     this.config = {
@@ -148,13 +209,13 @@ export class SqlServerConnection implements IDatabaseConnection {
     if (this.transaction) {
       const request = this.transaction.request();
       if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await request.query(sqlQuery);
+      const result = await this.runWithTimeout(request, () => request.query(sqlQuery));
       return result.recordset as T[];
     }
     const op = async (): Promise<T[]> => {
       const request = this.pool!.request();
       if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await request.query(sqlQuery);
+      const result = await this.runWithTimeout(request, () => request.query(sqlQuery));
       return result.recordset as T[];
     };
     // A mutating call routed through query() -- an SDE stored proc like
@@ -286,7 +347,7 @@ export class SqlServerConnection implements IDatabaseConnection {
 
     const run = async (request: sql.Request): Promise<ExecuteResult> => {
       if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await request.query(sqlStatement);
+      const result = await this.runWithTimeout(request, () => request.query(sqlStatement));
       return { rowsAffected: result.rowsAffected.reduce((sum, n) => sum + n, 0) };
     };
 
@@ -308,7 +369,7 @@ export class SqlServerConnection implements IDatabaseConnection {
 
     const run = async (request: sql.Request): Promise<number[]> => {
       if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await request.query(sqlStatement);
+      const result = await this.runWithTimeout(request, () => request.query(sqlStatement));
       // Extract OBJECTID from recordset (OUTPUT INSERTED.OBJECTID)
       if (result.recordset && result.recordset.length > 0) {
         return result.recordset.map((row: Record<string, unknown>) => {
