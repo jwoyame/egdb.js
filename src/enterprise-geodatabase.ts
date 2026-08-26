@@ -1275,8 +1275,23 @@ export class EnterpriseGeodatabase {
         // Count what we actually applied. Asserting each individual copy is not
         // enough: when `changes` comes back EMPTY the loop body never runs, so
         // nothing throws, and the pointer below still advances to a fresh empty
-        // state -- a post that reports success and publishes nothing. That is
-        // the failure mode that already lost a real editor's merge once.
+        // state -- a post that reports success and publishes nothing.
+        //
+        // History worth knowing before touching this. A guard with this NAME was
+        // added in openparcels (bbf9266) and then deliberately REMOVED (9f7d516)
+        // because it false-fired on real posts: it failed when `changesPosted`
+        // was 0, and that count was unreliable at the time (it came from
+        // getChildUniqueStates, which returns empty for some reconciled
+        // versions). This guard is on a different axis -- it requires
+        // changesPosted to be POSITIVE and fires only when NOTHING was copied --
+        // and changesPosted is now derived from the findCommonAncestor ->
+        // getStatesInRange range, which is the reliable one.
+        //
+        // Residual risk, stated plainly: changesPosted and getAllChanges are
+        // computed by different functions over the same states. A total
+        // divergence between them would refuse a post that should have
+        // succeeded. That is the failure that got the earlier guard reverted, so
+        // if this starts false-firing, suspect that divergence first.
         let applied = 0;
         for (const c of [...changes.inserts, ...changes.updates, ...changes.deletes]) {
           const t = versionedTables.find(vt => vt.name === c.table);
