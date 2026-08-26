@@ -124,6 +124,12 @@ export function parseWkb(wkb: Buffer, srid?: number): InternalGeometry | null {
       );
     case 7: // GeometryCollection
       return parseGeometryCollection(wkb, offset, isLittleEndian, parsedSrid);
+    case 8: // CircularString
+      return parseCircularStringWithOffset(wkb, offset, isLittleEndian, coordDims, parsedSrid).geometry;
+    case 9: // CompoundCurve
+      return parseCompoundCurveWithOffset(wkb, offset, isLittleEndian, parsedSrid).geometry;
+    case 10: // CurvePolygon
+      return parseCurvePolygonWithOffset(wkb, offset, isLittleEndian, parsedSrid).geometry;
     default:
       parserLogger.warn(`Unsupported geometry type: ${baseType}`);
       return null;
@@ -358,6 +364,73 @@ function parseMultiPolygon(
  * Parse a geometry and return both the geometry and the new offset.
  * Used for parsing GeometryCollection members.
  */
+// ---------------------------------------------------------------------------
+// Curve WKB (ISO types 8, 9, 10).
+//
+// SQL Server's STAsBinary() returns these natively -- a CurvePolygon comes back
+// as `010A000000...`, NOT as a linearised type 3. Before this existed parseWkb
+// hit its `default:` and returned null, so a stored curve read back as no
+// geometry at all, and any later attribute-only update then wrote that null
+// back over the real shape.
+//
+// The nesting matters: a CompoundCurve's segments and a CurvePolygon's rings
+// are COMPLETE sub-geometries, each with its own byte-order byte and type
+// header -- not the bare `numPoints + points` payload a Polygon ring uses. They
+// are read with parseGeometryAtOffset for exactly that reason.
+// ---------------------------------------------------------------------------
+
+function parseCircularStringWithOffset(
+  wkb: Buffer,
+  offset: number,
+  littleEndian: boolean,
+  coordDims: number,
+  srid?: number,
+): { geometry: InternalGeometry; newOffset: number } {
+  const numPoints = readUInt32(wkb, offset, littleEndian);
+  let currentOffset = offset + 4;
+  const coordinates: number[][] = [];
+  for (let i = 0; i < numPoints; i++) {
+    const { coord, newOffset } = readCoordinate(wkb, currentOffset, littleEndian, coordDims);
+    coordinates.push(coord.length === 2 ? coord : coord.slice(0, 2));
+    currentOffset = newOffset;
+  }
+  return { geometry: { type: "CircularString", coordinates, srid } as InternalGeometry, newOffset: currentOffset };
+}
+
+function parseCompoundCurveWithOffset(
+  wkb: Buffer,
+  offset: number,
+  littleEndian: boolean,
+  srid?: number,
+): { geometry: InternalGeometry; newOffset: number } {
+  const numSegments = readUInt32(wkb, offset, littleEndian);
+  let currentOffset = offset + 4;
+  const segments: InternalGeometry[] = [];
+  for (let i = 0; i < numSegments; i++) {
+    const result = parseGeometryAtOffset(wkb, currentOffset, srid);
+    if (result.geometry) segments.push(result.geometry);
+    currentOffset = result.newOffset;
+  }
+  return { geometry: { type: "CompoundCurve", segments, srid } as unknown as InternalGeometry, newOffset: currentOffset };
+}
+
+function parseCurvePolygonWithOffset(
+  wkb: Buffer,
+  offset: number,
+  littleEndian: boolean,
+  srid?: number,
+): { geometry: InternalGeometry; newOffset: number } {
+  const numRings = readUInt32(wkb, offset, littleEndian);
+  let currentOffset = offset + 4;
+  const rings: InternalGeometry[] = [];
+  for (let i = 0; i < numRings; i++) {
+    const result = parseGeometryAtOffset(wkb, currentOffset, srid);
+    if (result.geometry) rings.push(result.geometry);
+    currentOffset = result.newOffset;
+  }
+  return { geometry: { type: "CurvePolygon", rings, srid } as unknown as InternalGeometry, newOffset: currentOffset };
+}
+
 function parseGeometryAtOffset(
   wkb: Buffer,
   offset: number,
@@ -465,6 +538,18 @@ function parseGeometryAtOffset(
         parsedSrid,
       );
       return result;
+    }
+    case 8: {
+      // CircularString
+      return parseCircularStringWithOffset(wkb, offset, isLittleEndian, coordDims, parsedSrid);
+    }
+    case 9: {
+      // CompoundCurve
+      return parseCompoundCurveWithOffset(wkb, offset, isLittleEndian, parsedSrid);
+    }
+    case 10: {
+      // CurvePolygon
+      return parseCurvePolygonWithOffset(wkb, offset, isLittleEndian, parsedSrid);
     }
     case 7: {
       // Nested GeometryCollection
