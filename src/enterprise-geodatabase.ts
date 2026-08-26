@@ -81,6 +81,21 @@ export class LockTimeoutError extends Error {
   }
 }
 
+/**
+ * A post moved DEFAULT's pointer but published no rows.
+ *
+ * Distinct from a generic failure because the caller must treat it as a
+ * data-integrity stop: the version is intact and must NOT be deleted, and the
+ * operator needs to know the edit is still unpublished rather than seeing a
+ * green result.
+ */
+export class PostLandedNothingError extends Error {
+  constructor(message: string, public readonly changesExpected: number) {
+    super(message);
+    this.name = 'PostLandedNothingError';
+  }
+}
+
 export class EnterpriseGeodatabase {
   /** Version-lock acquisition timeout (milliseconds) */
   private static readonly LOCK_TIMEOUT_MS = 30000;
@@ -1257,6 +1272,12 @@ export class EnterpriseGeodatabase {
             );
           }
         };
+        // Count what we actually applied. Asserting each individual copy is not
+        // enough: when `changes` comes back EMPTY the loop body never runs, so
+        // nothing throws, and the pointer below still advances to a fresh empty
+        // state -- a post that reports success and publishes nothing. That is
+        // the failure mode that already lost a real editor's merge once.
+        let applied = 0;
         for (const c of [...changes.inserts, ...changes.updates, ...changes.deletes]) {
           const t = versionedTables.find(vt => vt.name === c.table);
           if (!t) continue;
@@ -1276,7 +1297,21 @@ export class EnterpriseGeodatabase {
             // state-0 marker Esri readers need.
             await insertDeleteMarker(this.connection, t, c.objectId, newTip);
           }
+          applied++;
         }
+
+        // The version had changes to publish and we published none of them.
+        // Throwing rolls the transaction back, which also stops the caller from
+        // deleting the version on the strength of a phantom success.
+        if (changesPosted > 0 && applied === 0) {
+          throw new PostLandedNothingError(
+            `Post landed nothing for ${versionName}: ${changesPosted} change(s) were expected ` +
+            `across states [${childStates.join(', ')}] but no row was copied to the new tip. ` +
+            'The edit was NOT published and the version has been left intact.',
+            changesPosted,
+          );
+        }
+
         const advanced = await updateVersionState(
           this.connection, parent.owner, parent.name, newTip
         );

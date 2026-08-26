@@ -5,7 +5,7 @@
  */
 
 // Main classes
-export { EnterpriseGeodatabase, LockTimeoutError } from './enterprise-geodatabase';
+export { EnterpriseGeodatabase, LockTimeoutError, PostLandedNothingError } from './enterprise-geodatabase';
 export { EnterpriseTable } from './enterprise-table';
 export { EditSession } from './edit-session';
 export type { VersionedInsertOptions, VersionedUpdateOptions } from './edit-session';
