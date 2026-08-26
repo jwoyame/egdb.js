@@ -203,7 +203,13 @@ export class EditSession {
    * Quote identifier based on database driver
    */
   private quoteId(name: string): string {
-    return this.connection.driver === 'sqlserver' ? `[${name}]` : `"${name}"`;
+    // Escape the closing delimiter. Identifiers reaching here can come from a
+    // caller-supplied attribute bag, and an unescaped `]` closes the bracket
+    // early -- `execute` runs a batch, so that is statement injection, not
+    // just a malformed name.
+    return this.connection.driver === 'sqlserver'
+      ? `[${name.replace(/]/g, ']]')}]`
+      : `"${name.replace(/"/g, '""')}"`;
   }
 
   /**
