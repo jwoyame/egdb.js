@@ -10,7 +10,7 @@
 import type { IDatabaseConnection } from './connections/connection';
 import type { EnterpriseGeodatabase } from './enterprise-geodatabase';
 import { EnterpriseTable } from './enterprise-table';
-import { geometryToWkt, isValidGeometry } from './parsers/geometry-writer';
+import { geometryToWkt, isValidGeometry, isWritableGeometry } from './parsers/geometry-writer';
 import { FieldType } from './types';
 import type { Feature, Geometry, VersionInfo, TableInfo } from './types';
 import { validatePositiveInteger } from './utils/sql-helpers';
@@ -379,7 +379,7 @@ export class EditSession {
     }
 
     // Handle geometry
-    if (shapeField && feature.geometry && isValidGeometry(feature.geometry)) {
+    if (shapeField && feature.geometry && isWritableGeometry(feature.geometry, 'EditSession.insert')) {
       const srid = options?.srid ?? feature.geometry.srid ?? 0;
       const wkt = geometryToWkt(feature.geometry);
 
@@ -487,7 +487,7 @@ export class EditSession {
     const shapeAttrValue = shapeField ? findAttrCaseInsensitive(attributes, shapeField) : undefined;
     if (shapeField && shapeAttrValue) {
       const geometry = shapeAttrValue as Geometry;
-      if (isValidGeometry(geometry)) {
+      if (isWritableGeometry(geometry, 'EditSession.update (row already in adds)')) {
         const srid = options?.srid ?? geometry.srid ?? 0;
         const wkt = geometryToWkt(geometry);
 
@@ -648,7 +648,7 @@ export class EditSession {
       ? (findAttrCaseInsensitive(attributes, shapeField) as Geometry | undefined)
       : undefined;
     const geometry = shapeOverride ?? current.geometry;
-    if (shapeField && geometry && isValidGeometry(geometry)) {
+    if (shapeField && geometry && isWritableGeometry(geometry, 'EditSession.insertNewStateRow')) {
       const srid = options?.srid ?? geometry.srid ?? 0;
       const wkt = geometryToWkt(geometry);
 
@@ -1189,7 +1189,7 @@ export class EditSession {
     }
 
     // Handle geometry
-    if (shapeField && geometry && isValidGeometry(geometry)) {
+    if (shapeField && geometry && isWritableGeometry(geometry, 'EditSession.applyChange (update)')) {
       const geomSrid = srid ?? geometry.srid ?? 0;
       const wkt = geometryToWkt(geometry);
 
@@ -1259,7 +1259,7 @@ export class EditSession {
     }
 
     // Handle geometry
-    if (shapeField && geometry && isValidGeometry(geometry)) {
+    if (shapeField && geometry && isWritableGeometry(geometry, 'EditSession.applyChange (insert)')) {
       const geomSrid = srid ?? geometry.srid ?? 0;
       const wkt = geometryToWkt(geometry);
 

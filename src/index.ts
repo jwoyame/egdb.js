@@ -51,7 +51,7 @@ export { FieldType } from './types';
 export { parseWkb, geometryToGeoJSON, setParserLogger } from './parsers/geometry-parser';
 export { parseGdbItems, parseDefinitionXml, ITEM_TYPE_UUIDS } from './parsers/gdb-items-parser';
 export type { GdbItemRow } from './parsers/gdb-items-parser';
-export { geometryToWkt, geometryToSqlExpression, isValidGeometry } from './parsers/geometry-writer';
+export { geometryToWkt, geometryToSqlExpression, isValidGeometry, isWritableGeometry, setWriterLogger } from './parsers/geometry-writer';
 
 // Connection interface (for custom implementations)
 export type { IDatabaseConnection } from './connections/connection';

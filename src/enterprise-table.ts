@@ -5,7 +5,7 @@
 import type { IDatabaseConnection } from './connections/connection';
 import { parseDefinitionXml } from './parsers/gdb-items-parser';
 import { parseWkb } from './parsers/geometry-parser';
-import { geometryToWkt, isValidGeometry } from './parsers/geometry-writer';
+import { geometryToWkt, isValidGeometry, isWritableGeometry } from './parsers/geometry-writer';
 import type {
   TableInfo,
   TableMetadata,
@@ -1019,7 +1019,7 @@ export class EnterpriseTable {
     }
 
     // Handle geometry
-    if (shapeField && feature.geometry && isValidGeometry(feature.geometry)) {
+    if (shapeField && feature.geometry && isWritableGeometry(feature.geometry, 'EnterpriseTable.insert')) {
       const srid = options?.srid ?? feature.geometry.srid ?? 0;
       const wkt = geometryToWkt(feature.geometry);
 
@@ -1108,7 +1108,7 @@ export class EnterpriseTable {
     // Handle geometry update if present
     if (shapeField && attributes[shapeField]) {
       const geometry = attributes[shapeField] as Geometry;
-      if (isValidGeometry(geometry)) {
+      if (isWritableGeometry(geometry, 'EnterpriseTable.update')) {
         const srid = options?.srid ?? geometry.srid ?? 0;
         const wkt = geometryToWkt(geometry);
 

@@ -40,7 +40,12 @@ export type GeometryType =
   | 'MultiLineString'
   | 'Polygon'
   | 'MultiPolygon'
-  | 'GeometryCollection';
+  | 'GeometryCollection'
+  // Curve types. SQL Server stores and returns these natively (STAsBinary
+  // yields ISO WKB 8/9/10), and a parcel fabric uses them for true arcs.
+  | 'CircularString'
+  | 'CompoundCurve'
+  | 'CurvePolygon';
 
 /** Connection configuration */
 export interface ConnectionConfig {
@@ -174,8 +179,16 @@ export interface TableMetadata {
   spatialReference?: SpatialReference;
 }
 
-/** Coordinate-based geometry types */
-export type CoordinateGeometryType = Exclude<GeometryType, 'GeometryCollection'>;
+/** Coordinate-based geometry types.
+ *
+ * CompoundCurve and CurvePolygon are excluded: they carry `segments` / `rings`
+ * of nested geometries rather than a flat `coordinates` array, so they are
+ * separate members of the `Geometry` union below. CircularString DOES have
+ * `coordinates` (an odd-length run of at least 3 positions) and stays here. */
+export type CoordinateGeometryType = Exclude<
+  GeometryType,
+  'GeometryCollection' | 'CompoundCurve' | 'CurvePolygon'
+>;
 
 /** Coordinate-based geometry object */
 export interface CoordinateGeometry {
@@ -193,8 +206,33 @@ export interface GeometryCollectionType {
   srid?: number;
 }
 
-/** Geometry object (union of coordinate-based and collection types) */
-export type Geometry = CoordinateGeometry | GeometryCollectionType;
+/** One run of a CompoundCurve: an arc, or a straight run of positions. */
+export type CurveSegment =
+  | { type: 'CircularString'; coordinates: [number, number][] }
+  | { type: 'LineString'; coordinates: [number, number][] };
+
+/** A curve made of arcs and straight runs joined end to start. */
+export interface CompoundCurveType {
+  type: 'CompoundCurve';
+  segments: CurveSegment[];
+  bbox?: [number, number, number, number];
+  srid?: number;
+}
+
+/** A polygon whose rings may contain arcs. Ring 0 is the exterior. */
+export interface CurvePolygonType {
+  type: 'CurvePolygon';
+  rings: Array<CompoundCurveType | CurveSegment>;
+  bbox?: [number, number, number, number];
+  srid?: number;
+}
+
+/** Geometry object (union of coordinate-based, curve and collection types) */
+export type Geometry =
+  | CoordinateGeometry
+  | GeometryCollectionType
+  | CompoundCurveType
+  | CurvePolygonType;
 
 /** Feature record */
 export interface Feature {
