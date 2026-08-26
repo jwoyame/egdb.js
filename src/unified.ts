@@ -143,12 +143,51 @@ class EnterpriseTableAdapter implements ITable {
  * }
  * ```
  */
+/** The slice of gdb.js's Geodatabase this shim actually uses. Declared here so
+ *  the optional peer dependency does not have to resolve at compile time, while
+ *  the shape we depend on stays explicit and checked. */
+interface GdbJsTable {
+  fields: Array<{
+    name: string;
+    type: number;
+    typeName?: string;
+    alias?: string;
+    nullable: boolean;
+    length?: number;
+    precision?: { precision?: number; scale?: number };
+    defaultValue?: unknown;
+  }>;
+  recordCount: number;
+  geometryMetadata?: { type?: string; fieldName?: string };
+  stream(): AsyncIterable<Feature>;
+  getFeature(id: number): Promise<Feature | null>;
+  close(): Promise<void>;
+  [key: string]: unknown;
+}
+
+interface GdbJsHandle {
+  listTables(): Promise<Array<{ name: string; tableNumber?: number; isFeatureClass: boolean }>>;
+  openTable(name: string): Promise<GdbJsTable>;
+  close(): Promise<void>;
+  [key: string]: unknown;
+}
+
 export async function openGeodatabase(config: UnifiedGeodatabaseConfig): Promise<IGeodatabase> {
   if (config.type === 'file') {
     // Dynamic import to avoid requiring gdb.js as a dependency
     try {
-      // @ts-expect-error - gdb.js is an optional peer dependency
-      const gdbjs = await import('@etchgis/gdb.js');
+      // gdb.js is an OPTIONAL peer dependency -- it may not be installed at all,
+      // so this module cannot depend on its types resolving. It is typed loosely
+      // on purpose; the shape actually relied on is pinned by the explicit
+      // annotations on the mapping callbacks below, which is where a real
+      // mismatch would show up.
+      //
+      // (This previously carried a @ts-expect-error. That silently stopped
+      // being true once gdb.js shipped a built dist, and the directive then
+      // masked a genuine mismatch here.)
+      const gdbjs = (await import('@etchgis/gdb.js')) as unknown as {
+        Geodatabase: { open(path: string): Promise<GdbJsHandle> };
+      };
       const gdb = await gdbjs.Geodatabase.open(config.path);
 
       // Wrap gdb.js Geodatabase to match IGeodatabase interface
@@ -159,7 +198,7 @@ export async function openGeodatabase(config: UnifiedGeodatabaseConfig): Promise
         async listTables() {
           const tables = await gdb.listTables();
           // Map gdb.js TableInfo to our TableInfo format
-          return tables.map((t: { name: string; tableNumber: number; isFeatureClass: boolean }) => ({
+          return tables.map((t) => ({
             name: t.name,
             physicalName: t.name,
             schema: '',
