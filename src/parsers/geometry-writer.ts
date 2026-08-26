@@ -30,6 +30,16 @@ export function setWriterLogger(logger: Logger): void {
  */
 export function isWritableGeometry(geometry: Geometry, context: string): boolean {
   if (isValidGeometry(geometry)) return true;
+
+  // A geometry with an empty coordinate list is dropped, but it is NOT a
+  // surprise: roughly 9% of Putnam's legacy ArcMap lines store no Shape at all,
+  // and every copy-forward through a post or reconcile passes them here. Warning
+  // on those would emit hundreds of identical benign lines during the single
+  // highest-stakes operation in the system, which trains people to ignore the
+  // warning that matters. Drop it quietly; it is expected.
+  const coords = (geometry as { coordinates?: unknown } | null | undefined)?.coordinates;
+  if (Array.isArray(coords) && coords.length === 0) return false;
+
   const type = (geometry as { type?: string } | null | undefined)?.type ?? 'unknown';
   writerLogger.warn(
     `[egdb] ${context}: geometry of type "${type}" is not writable; ` +
@@ -205,9 +215,19 @@ export function geometryToWkt(geometry: Geometry): string {
   }
 
   // Curve geometries carry `segments` / `rings`, not `coordinates`, so they are
-  // handled before the coordinate-based path below.
-  if (type === 'CompoundCurve') return compoundCurveToWkt(geometry as CompoundCurveType);
-  if (type === 'CurvePolygon') return curvePolygonToWkt(geometry as CurvePolygonType);
+  // handled before the coordinate-based path below. An empty one still has to
+  // use the EMPTY keyword -- "COMPOUNDCURVE ()" is rejected by SQL Server the
+  // same way "POLYGON ()" is.
+  if (type === 'CompoundCurve') {
+    const segs = (geometry as CompoundCurveType).segments;
+    if (!segs?.length) return 'COMPOUNDCURVE EMPTY';
+    return compoundCurveToWkt(geometry as CompoundCurveType);
+  }
+  if (type === 'CurvePolygon') {
+    const rings = (geometry as CurvePolygonType).rings;
+    if (!rings?.length) return 'CURVEPOLYGON EMPTY';
+    return curvePolygonToWkt(geometry as CurvePolygonType);
+  }
 
   // For coordinate-based geometries
   const coords = (geometry as CoordinateGeometry).coordinates;

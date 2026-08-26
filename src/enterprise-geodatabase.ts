@@ -11,6 +11,7 @@ import { EnterpriseTable } from './enterprise-table';
 import { EditSession } from './edit-session';
 import { type Logger, consoleLogger } from './logger';
 import { setParserLogger } from './parsers/geometry-parser';
+import { setWriterLogger } from './parsers/geometry-writer';
 import { parseGdbItems } from './parsers/gdb-items-parser';
 import type { GdbItemRow } from './parsers/gdb-items-parser';
 import type {
@@ -131,6 +132,7 @@ export class EnterpriseGeodatabase {
     // Route the parser's "unsupported geometry" warnings through the same
     // logger. Process-wide; see setParserLogger doc.
     setParserLogger(this._logger);
+    setWriterLogger(this._logger);
   }
 
   /**

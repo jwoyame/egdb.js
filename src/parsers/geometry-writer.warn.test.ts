@@ -26,7 +26,7 @@ describe('isWritableGeometry', () => {
     const cases: Array<[string, unknown]> = [
       ['CurvePolygon', { type: 'CurvePolygon', rings: [] }],
       ['CircularString', { type: 'CircularString', coordinates: [[0, 0], [5, 5]] }],
-      ['Polygon', { type: 'Polygon', coordinates: [] }],
+      ['Polygon', { type: 'Polygon', coordinates: [[[0, 0], [1, 1], [0, 0]]] }],
       ['LineString', { type: 'LineString', coordinates: [[0, 0]] }],
     ];
     for (const [type, g] of cases) {
@@ -38,5 +38,17 @@ describe('isWritableGeometry', () => {
       expect(msg).toContain('EditSession.insert');
       expect(msg).toMatch(/no geometry|SHAPE column will be omitted/);
     }
+  });
+});
+
+describe('the known legacy empty-Shape case stays quiet', () => {
+  // ~9% of Putnam's legacy ArcMap lines carry no Shape. They pass through here
+  // on every copy-forward during a post or reconcile. Warning on each would bury
+  // the warnings that actually mean something.
+  it('drops an empty-coordinates geometry without warning', () => {
+    const warn = capture();
+    expect(isWritableGeometry({ type: 'LineString', coordinates: [] } as never, 'post')).toBe(false);
+    expect(isWritableGeometry({ type: 'Polygon', coordinates: [] } as never, 'post')).toBe(false);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

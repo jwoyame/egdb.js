@@ -11,8 +11,10 @@
  *
  * `./x.js` is the correct specifier -- NodeNext maps it to `./x.d.ts`.
  */
-import { readdir, readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readdir, readFile, writeFile, access } from 'node:fs/promises';
+import { join, dirname, resolve } from 'node:path';
+
+const exists = async (p) => { try { await access(p); return true; } catch { return false; } };
 
 const DIST = new URL('../dist/', import.meta.url).pathname;
 
@@ -30,15 +32,42 @@ async function walk(dir) {
 // like 'mssql', and never one that already has an extension.
 const SPEC = /(\bfrom\s*|\bimport\s*\(\s*)(['"])(\.\.?\/[^'"]*?)\2/g;
 
-let changed = 0, touched = 0;
+// A specifier can point at a FILE (./types -> types.d.ts) or at a DIRECTORY
+// (./reconcile -> reconcile/index.d.ts). Appending ".js" blindly turns the
+// second kind into "./reconcile.js", which does not exist -- so those imports
+// stay unresolvable and every type behind them silently stays `any`. That is
+// the exact failure this script exists to prevent, so it has to distinguish
+// the two.
+async function resolveSpecifier(fromFile, spec) {
+  const base = resolve(dirname(fromFile), spec);
+  if (await exists(`${base}.d.ts`)) return `${spec}.js`;
+  if (await exists(join(base, 'index.d.ts'))) return `${spec}/index.js`;
+  return null;
+}
+
+let changed = 0, touched = 0, unresolved = [];
 for (const file of await walk(DIST)) {
   const src = await readFile(file, 'utf8');
+  const specs = [...src.matchAll(SPEC)];
+  const rewrites = new Map();
+  for (const [, , , spec] of specs) {
+    if (/\.(js|cjs|mjs|json)$/.test(spec) || rewrites.has(spec)) continue;
+    const target = await resolveSpecifier(file, spec);
+    if (target) rewrites.set(spec, target);
+    else unresolved.push(`${file}: ${spec}`);
+  }
   let n = 0;
   const out = src.replace(SPEC, (m, lead, q, spec) => {
-    if (/\.(js|cjs|mjs|json)$/.test(spec)) return m;
+    const target = rewrites.get(spec);
+    if (!target) return m;
     n++;
-    return `${lead}${q}${spec}.js${q}`;
+    return `${lead}${q}${target}${q}`;
   });
   if (n) { await writeFile(file, out); changed += n; touched++; }
+}
+
+if (unresolved.length) {
+  console.error('fix-dts-extensions: could not resolve:\n  ' + unresolved.join('\n  '));
+  process.exit(1);
 }
 console.log(`fix-dts-extensions: rewrote ${changed} specifier(s) across ${touched} file(s)`);
