@@ -36,7 +36,8 @@
     "test:integration": "EGDB_TEST=1 vitest run",
     "typecheck": "tsc --noEmit",
     "prepare": "rollup -c && node scripts/fix-dts-extensions.mjs && node scripts/check-dist-fresh.mjs --write",
-    "check:dist": "node scripts/check-dist-fresh.mjs"
+    "check:dist": "node scripts/check-dist-fresh.mjs",
+    "prepack": "node scripts/check-dist-fresh.mjs"
   },
   "dependencies": {
     "mssql": "^12.2.0",

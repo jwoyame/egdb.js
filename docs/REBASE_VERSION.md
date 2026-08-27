@@ -80,7 +80,7 @@ rebased version passes the compress closure-safety gate.
 Scripts (training only): `scripts/train-rebase-dryrun.mjs`, `train-write-test.mjs`,
 `train-undo-post.mjs`, `train-a7-compress.mjs`. Connect with `encrypt:false` over
 the fetch tunnel. Password lives in `openparcels/RDS_ACCESS.local.md` (the
-`Sketchy1` in CLAUDE.md is stale).
+the password recorded in CLAUDE.md is stale).
 
 ---
 

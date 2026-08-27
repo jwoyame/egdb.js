@@ -37,8 +37,17 @@ async function hashSources() {
     }
   }
   await walk(join(ROOT, 'src'));
+  // Build inputs count too. Hashing only src/ meant a change to the rollup
+  // config, the tsconfig, or the .d.ts fixer left a genuinely stale dist
+  // reported as fresh -- the same false-green this script exists to prevent.
+  for (const extra of ['rollup.config.js', 'tsconfig.json', 'scripts/fix-dts-extensions.mjs']) {
+    files.push(join(ROOT, extra));
+  }
   const h = createHash('sha256');
-  for (const f of files) { h.update(f.slice(ROOT.length)); h.update(await readFile(f)); }
+  for (const f of files) {
+    h.update(f.slice(ROOT.length));
+    try { h.update(await readFile(f)); } catch { h.update('<missing>'); }
+  }
   return h.digest('hex');
 }
 
