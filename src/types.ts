@@ -535,6 +535,14 @@ export interface CompressOptions {
    */
   phases?: { prune?: boolean; graduate?: boolean; collapse?: boolean };
   /**
+   * Scope the verify self-check to these versions (by `owner.name`). The full
+   * self-check over every version x geometry x both read paths is very heavy on a
+   * real fabric; a caller that only needs to prove specific versions survive (e.g.
+   * a rebased version + DEFAULT) can scope it. Omitted = all versions (the default,
+   * correct for an unattended nightly).
+   */
+  verifyVersions?: string[];
+  /**
    * Run the post-run SELF-CHECK (NIGHTLY_COMPRESS_ROADMAP.md Step C): snapshot
    * every version's visible data (both the egdb parent-walk read AND the Esri
    * closure read) before and after, and compare. Populates `CompressResult.selfCheck`

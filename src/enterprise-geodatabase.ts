@@ -1969,8 +1969,8 @@ export class EnterpriseGeodatabase {
     // BEFORE the phases run. The parent-walk read (egdb) must be byte-identical
     // after; the closure read (Esri _evw / publish-ETL) may legitimately change but
     // must not LOSE any row (a loss = a parcel vanished from the public FeatureServer).
-    const beforeSnapshot = options?.verify ? await captureVisibleSnapshot(this.connection, allVersioned) : null;
-    const beforeClosure = options?.verify ? await captureClosureSnapshot(this.connection, allVersioned) : null;
+    const beforeSnapshot = options?.verify ? await captureVisibleSnapshot(this.connection, allVersioned, 'walk', options.verifyVersions) : null;
+    const beforeClosure = options?.verify ? await captureClosureSnapshot(this.connection, allVersioned, options.verifyVersions) : null;
     // N2 (COMPRESS_HARDENING_PLAN.md): `options.tables` may ONLY scope graduation.
     // Prune and collapse delete/re-point STATES, so they must always operate on
     // EVERY versioned table — otherwise an excluded table keeps A/D rows tagged
@@ -2052,14 +2052,14 @@ export class EnterpriseGeodatabase {
     let selfCheck: SelfCheckResult | undefined;
     let closureCheck: SelfCheckResult | undefined;
     if (beforeSnapshot) {
-      const after = await captureVisibleSnapshot(this.connection, allVersioned);
+      const after = await captureVisibleSnapshot(this.connection, allVersioned, 'walk', options?.verifyVersions);
       selfCheck = compareSnapshots(beforeSnapshot, after);
       if (!selfCheck.passed) {
         this._logger.error?.(`compress SELF-CHECK FAILED — a version's visible data changed (egdb read):\n  ${selfCheck.diffs.slice(0, 20).join('\n  ')}`);
       }
     }
     if (beforeClosure) {
-      const afterClosure = await captureClosureSnapshot(this.connection, allVersioned);
+      const afterClosure = await captureClosureSnapshot(this.connection, allVersioned, options?.verifyVersions);
       closureCheck = compareClosureNoLoss(beforeClosure, afterClosure);
       if (!closureCheck.passed) {
         this._logger.error?.(`compress CLOSURE SELF-CHECK FAILED — rows vanished from the public (Esri) read:\n  ${closureCheck.diffs.slice(0, 20).join('\n  ')}`);

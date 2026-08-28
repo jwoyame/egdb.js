@@ -201,13 +201,19 @@ async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableI
 /** Capture the per-version visible-data signature. `mode='walk'` (default) uses
  * egdb's authoritative parent_state_id read; `mode='closure'` uses the Esri
  * SDE_state_lineages read (`_evw` / publish-ETL) — Step D closure telemetry. */
-export async function captureVisibleSnapshot(conn: IDatabaseConnection, versionedTables: TableInfo[], mode: ReadMode = 'walk'): Promise<CompressSnapshot> {
+export async function captureVisibleSnapshot(conn: IDatabaseConnection, versionedTables: TableInfo[], mode: ReadMode = 'walk', onlyVersions?: string[]): Promise<CompressSnapshot> {
   const driver = conn.driver;
   const cache = new Map<string, string[]>();
   const tables = versionedTables.filter(t => t.isVersioned && t.registrationId);
+  // Optional scoping: verify only these versions (by `owner.name`, case-insensitive).
+  // The self-check over EVERY version x geometry x both read paths is very heavy on a
+  // real fabric; a caller that only needs to prove specific versions survive (e.g. a
+  // rebased version + DEFAULT) can scope it. Default (undefined) = all versions.
+  const only = onlyVersions ? new Set(onlyVersions.map(s => s.toLowerCase())) : null;
   const out: CompressSnapshot = {};
   try {
     for (const v of await versionTips(conn, driver)) {
+      if (only && !only.has(v.key.toLowerCase())) continue;
       const memRef = await materializeMem(conn, driver, v.tip, v.lineageName, mode); // ancestors, once per version
       const perTable: Record<number, TableSig> = {};
       for (const t of tables) {
@@ -224,8 +230,8 @@ export async function captureVisibleSnapshot(conn: IDatabaseConnection, versione
 }
 
 /** Step D telemetry: the same signature resolved through the Esri closure read. */
-export function captureClosureSnapshot(conn: IDatabaseConnection, versionedTables: TableInfo[]): Promise<CompressSnapshot> {
-  return captureVisibleSnapshot(conn, versionedTables, 'closure');
+export function captureClosureSnapshot(conn: IDatabaseConnection, versionedTables: TableInfo[], onlyVersions?: string[]): Promise<CompressSnapshot> {
+  return captureVisibleSnapshot(conn, versionedTables, 'closure', onlyVersions);
 }
 
 export function compareSnapshots(before: CompressSnapshot, after: CompressSnapshot): SelfCheckResult {
