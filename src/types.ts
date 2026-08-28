@@ -605,6 +605,13 @@ export interface CompressResult {
    */
   selfCheck?: { passed: boolean; diffs: string[] };
   /**
+   * Result of the CLOSURE (Esri public read) self-check: false iff a row visible to
+   * the public FeatureServer before compress vanished after (a data-loss / C0
+   * vector). Only present when verify is set. Closure GAINS are allowed; only
+   * losses fail.
+   */
+  closureCheck?: { passed: boolean; diffs: string[] };
+  /**
    * Result of the Step D closure-safety gate (only present when graduate or collapse
    * was requested). `safe` is false iff the SDE_state_lineages closure diverges from
    * the parent-walk in a way an irreversible graduate/collapse could weaponise

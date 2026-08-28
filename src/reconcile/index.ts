@@ -93,7 +93,7 @@ export {
   COMPRESS_LOCK_RESOURCE,
   EDITOR_SHARED_LOCK_TIMEOUT_MS,
 } from './applock';
-export { captureVisibleSnapshot, captureClosureSnapshot, compareSnapshots } from './self-check';
+export { captureVisibleSnapshot, captureClosureSnapshot, compareSnapshots, compareClosureNoLoss } from './self-check';
 export type { CompressSnapshot, SelfCheckResult, ReadMode } from './self-check';
 export { assessClosureSafety, ClosureUnsafeError } from './closure-gate';
 export type { ClosureSafety } from './closure-gate';

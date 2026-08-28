@@ -62,7 +62,9 @@ import {
   acquireCompressLock,
   EDITOR_SHARED_LOCK_TIMEOUT_MS,
   captureVisibleSnapshot,
+  captureClosureSnapshot,
   compareSnapshots,
+  compareClosureNoLoss,
   assessClosureSafety,
   ClosureUnsafeError,
 } from './reconcile';
@@ -1963,9 +1965,12 @@ export class EnterpriseGeodatabase {
       }
     }
 
-    // Step C self-check: snapshot every version's visible data (both read paths)
-    // BEFORE the phases run, so we can prove afterward that nothing changed.
+    // Step C self-check: snapshot every version's visible data on BOTH read paths
+    // BEFORE the phases run. The parent-walk read (egdb) must be byte-identical
+    // after; the closure read (Esri _evw / publish-ETL) may legitimately change but
+    // must not LOSE any row (a loss = a parcel vanished from the public FeatureServer).
     const beforeSnapshot = options?.verify ? await captureVisibleSnapshot(this.connection, allVersioned) : null;
+    const beforeClosure = options?.verify ? await captureClosureSnapshot(this.connection, allVersioned) : null;
     // N2 (COMPRESS_HARDENING_PLAN.md): `options.tables` may ONLY scope graduation.
     // Prune and collapse delete/re-point STATES, so they must always operate on
     // EVERY versioned table — otherwise an excluded table keeps A/D rows tagged
@@ -2040,14 +2045,24 @@ export class EnterpriseGeodatabase {
       );
     }
 
-    // Step C self-check: re-snapshot and compare. A parent-walk diff means real
-    // corruption (compress must only reclaim storage) — log at error level.
+    // Step C self-check: re-snapshot and compare on both read paths.
+    //  - parent-walk (egdb): must be byte-identical; any diff = real corruption.
+    //  - closure (Esri public read): must not LOSE a row (a parcel vanishing from
+    //    the public FeatureServer is the C0 data-loss vector). Both logged at error.
     let selfCheck: SelfCheckResult | undefined;
+    let closureCheck: SelfCheckResult | undefined;
     if (beforeSnapshot) {
       const after = await captureVisibleSnapshot(this.connection, allVersioned);
       selfCheck = compareSnapshots(beforeSnapshot, after);
       if (!selfCheck.passed) {
         this._logger.error?.(`compress SELF-CHECK FAILED — a version's visible data changed (egdb read):\n  ${selfCheck.diffs.slice(0, 20).join('\n  ')}`);
+      }
+    }
+    if (beforeClosure) {
+      const afterClosure = await captureClosureSnapshot(this.connection, allVersioned);
+      closureCheck = compareClosureNoLoss(beforeClosure, afterClosure);
+      if (!closureCheck.passed) {
+        this._logger.error?.(`compress CLOSURE SELF-CHECK FAILED — rows vanished from the public (Esri) read:\n  ${closureCheck.diffs.slice(0, 20).join('\n  ')}`);
       }
     }
 
@@ -2063,6 +2078,7 @@ export class EnterpriseGeodatabase {
       statesSkippedByPrune: pruneResult.statesSkipped,
       allTablesSkippedDueToConcurrentVersionChange: allTablesSkipped || undefined,
       selfCheck,
+      closureCheck,
       closureGate,
     };
     } finally {

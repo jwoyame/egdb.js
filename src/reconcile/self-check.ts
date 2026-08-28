@@ -60,6 +60,43 @@ async function hashColumns(conn: IDatabaseConnection, driver: Driver, table: Tab
   return cols;
 }
 
+/** Geometry-typed columns of a table. Their shape is folded into the content hash
+ * (via a per-row area/length/point-count/envelope fingerprint) so a graduation
+ * that writes the WRONG geometry -- same row count, same non-geometry columns --
+ * is still caught. Geometry is the payload of a parcel fabric; hashing only the
+ * attributes would miss a wrong-shape graduation. */
+async function geomColumns(conn: IDatabaseConnection, driver: Driver, table: TableInfo, cache: Map<string, string[]>): Promise<string[]> {
+  const key = `geom:${table.schema}.${table.name}`;
+  const hit = cache.get(key); if (hit) return hit;
+  const sql = driver === 'sqlserver'
+    ? `SELECT COLUMN_NAME AS name FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA=@p0 AND TABLE_NAME=@p1 AND DATA_TYPE IN ('geometry','geography') ORDER BY ORDINAL_POSITION`
+    : `SELECT column_name AS name FROM information_schema.columns
+        WHERE table_schema=$1 AND table_name=$2 AND udt_name IN ('geometry','geography') ORDER BY ordinal_position`;
+  const rows = await conn.query<{ name: string }>(sql, [table.schema, table.name]);
+  const cols = rows.map(r => r.name);
+  cache.set(key, cols);
+  return cols;
+}
+
+/** Per-row scalar geometry fingerprint (area, length, point count, bbox perimeter)
+ * for the geometry columns, appended to the row content hash. Cheap (no WKB/WKT
+ * serialization), universal across point/line/polygon, and NULL/EMPTY-stable. A
+ * different shape changes at least one with overwhelming probability. Returns the
+ * SQL Server fragment prefixed with ', ' (for BINARY_CHECKSUM), or '' when none. */
+function geomFingerprintSql(gcols: string[]): string {
+  if (gcols.length === 0) return '';
+  return ', ' + gcols.flatMap(g => {
+    const q = qid('sqlserver', g);
+    return [
+      `CONVERT(BIGINT, ROUND(${q}.STArea(), 0))`,
+      `CONVERT(BIGINT, ROUND(${q}.STLength(), 0))`,
+      `${q}.STNumPoints()`,
+      `CONVERT(BIGINT, ROUND(${q}.STEnvelope().STLength(), 0))`,
+    ];
+  }).join(', ');
+}
+
 async function versionTips(conn: IDatabaseConnection, driver: Driver): Promise<Array<{ key: string; tip: number; lineageName: number }>> {
   const v = sys(driver, 'SDE_versions');
   const s = sys(driver, 'SDE_states');
@@ -113,7 +150,7 @@ async function dropMem(conn: IDatabaseConnection, driver: Driver): Promise<void>
 
 /** count + CHECKSUM_AGG over the rows visible to a version, using the pre-materialised
  * ancestor-state staging table `mem(s)`. */
-async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableInfo, cols: string[], memRef: string, mode: ReadMode): Promise<TableSig> {
+async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableInfo, cols: string[], gcols: string[], memRef: string, mode: ReadMode): Promise<TableSig> {
   const reg = table.registrationId!;
   const qSchema = qid(driver, table.schema);
   const base = `${qSchema}.${qid(driver, table.name)}`;
@@ -130,16 +167,23 @@ async function tableSig(conn: IDatabaseConnection, driver: Driver, table: TableI
   // 'walk' mode keeps egdb's own resolution (mirrors enterprise-table.ts).
   const baseHideState = mode === 'closure' ? ` AND dz.${sidc} = 0` : '';
   const colList = cols.map(c => qid(driver, c)).join(', ');
+  // Include the geometry columns in the row set so the outer hash can fingerprint
+  // their shape (a wrong-geometry graduation is otherwise invisible -- see
+  // geomColumns/geomFingerprintSql).
+  const visCols = [...cols, ...gcols];
+  const pgGeomFp = gcols.length
+    ? "||'|'||" + gcols.map(g => `coalesce(ST_Area(${qid(driver, g)})::bigint::text,'')||'|'||coalesce(ST_Length(${qid(driver, g)})::bigint::text,'')||'|'||coalesce(ST_NPoints(${qid(driver, g)})::text,'')`).join("||'|'||")
+    : '';
   const chk = driver === 'sqlserver'
-    ? `CHECKSUM_AGG(BINARY_CHECKSUM(${colList}))`
-    : `SUM(('x'||substr(md5(${cols.map(c => `coalesce(${qid(driver, c)}::text,'')`).join("||'|'||")}),1,8))::bit(32)::bigint)`;
+    ? `CHECKSUM_AGG(BINARY_CHECKSUM(${colList}${geomFingerprintSql(gcols)}))`
+    : `SUM(('x'||substr(md5(${cols.map(c => `coalesce(${qid(driver, c)}::text,'')`).join("||'|'||")}${pgGeomFp}),1,8))::bit(32)::bigint)`;
   const sql = `WITH mem AS (SELECT s FROM ${memRef})
     , vis AS (
-      SELECT ${cols.map(c => `b.${qid(driver, c)}`).join(', ')} FROM ${base} b
+      SELECT ${visCols.map(c => `b.${qid(driver, c)}`).join(', ')} FROM ${base} b
       WHERE NOT EXISTS (SELECT 1 FROM ${dd} dz JOIN mem ON mem.s = dz.${delAt} WHERE dz.${drow} = b.${oid}${baseHideState})
         AND NOT EXISTS (SELECT 1 FROM ${a} az JOIN mem ON mem.s = az.${sidc} WHERE az.${oid} = b.${oid})
       UNION ALL
-      SELECT ${cols.map(c => `x.${qid(driver, c)}`).join(', ')} FROM ${a} x
+      SELECT ${visCols.map(c => `x.${qid(driver, c)}`).join(', ')} FROM ${a} x
       JOIN mem mx ON mx.s = x.${sidc}
       INNER JOIN (SELECT xx.${oid} AS moid, MAX(xx.${sidc}) AS ms FROM ${a} xx JOIN mem mm ON mm.s = xx.${sidc} GROUP BY xx.${oid}) m
         ON m.moid = x.${oid} AND m.ms = x.${sidc}
@@ -168,7 +212,8 @@ export async function captureVisibleSnapshot(conn: IDatabaseConnection, versione
       const perTable: Record<number, TableSig> = {};
       for (const t of tables) {
         const cols = await hashColumns(conn, driver, t, cache);
-        perTable[t.registrationId!] = await tableSig(conn, driver, t, cols, memRef, mode);
+        const gcols = await geomColumns(conn, driver, t, cache);
+        perTable[t.registrationId!] = await tableSig(conn, driver, t, cols, gcols, memRef, mode);
       }
       out[v.key] = perTable;
     }
@@ -193,6 +238,29 @@ export function compareSnapshots(before: CompressSnapshot, after: CompressSnapsh
       if (!as) { diffs.push(`${ver}/reg${reg}: table missing after`); continue; }
       if (bs.count !== as.count) diffs.push(`${ver}/reg${reg}: count ${bs.count} -> ${as.count}`);
       else if (bs.hash !== as.hash) diffs.push(`${ver}/reg${reg}: content hash changed (${bs.hash} -> ${as.hash})`);
+    }
+  }
+  return { passed: diffs.length === 0, diffs };
+}
+
+/** Compare the CLOSURE (Esri `_evw` / publish-ETL) read before vs after compress.
+ * Unlike the parent-walk read, the closure legitimately changes during
+ * collapse/graduate (they rewrite SDE_state_lineages), so an exact match is wrong.
+ * The one thing that must NEVER happen is a LOSS: a row that was visible to the
+ * public read before must still be visible after. A count DECREASE means a parcel
+ * vanished from the public FeatureServer (the C0 data-loss vector). Gains (from an
+ * UNDER-repair) are allowed; only losses fail. */
+export function compareClosureNoLoss(before: CompressSnapshot, after: CompressSnapshot): SelfCheckResult {
+  const diffs: string[] = [];
+  for (const ver of Object.keys(before)) {
+    const b = before[ver] ?? {}; const a = after[ver];
+    if (!a) { diffs.push(`${ver}: version disappeared from the closure read`); continue; }
+    for (const reg of Object.keys(b)) {
+      const bs = b[Number(reg)]!; const as = a[Number(reg)];
+      if (!as) { diffs.push(`${ver}/reg${reg}: table missing from closure read after`); continue; }
+      if (as.count < bs.count) {
+        diffs.push(`${ver}/reg${reg}: CLOSURE LOSS ${bs.count} -> ${as.count} (${bs.count - as.count} row(s) vanished from the public read)`);
+      }
     }
   }
   return { passed: diffs.length === 0, diffs };
