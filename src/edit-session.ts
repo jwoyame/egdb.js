@@ -298,7 +298,13 @@ export class EditSession {
         OUTPUT DELETED.base_id
         WHERE id_type = 2
       `;
+      // Time this: SDE_object_ids is a single hot row that serializes ALL id
+      // allocation across the geodatabase, so it's a prime suspect if writes
+      // stall. Log only when a single allocation is unusually slow (low noise).
+      const t = Date.now();
       const result = await this.connection.query<{ base_id: number }>(sql);
+      const took = Date.now() - t;
+      if (took >= 1000) console.warn(`[egdb] slow OBJECTID allocation from ${iTable}: ${took}ms (SDE_object_ids contention?)`);
       if (result.length === 0 || result[0]?.base_id === undefined) {
         throw new Error(`Failed to allocate OBJECTID from ${iTable}`);
       }

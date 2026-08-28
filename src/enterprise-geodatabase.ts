@@ -2213,36 +2213,74 @@ export class EnterpriseGeodatabase {
     return fn();
   }
 
+  // Log a per-phase timing breakdown of an editTransaction when it runs slow or
+  // fails, so an intermittent write-path stall (e.g. a merge timing out at the
+  // pool/edit timeout) reveals WHICH phase hung -- createChildState, the writes,
+  // save, or commit. Tune or silence via the static threshold below.
+  static SLOW_EDIT_LOG_MS = 3000;
+
   async editTransaction<T>(
     versionName: string,
     fn: (session: EditSession) => Promise<T>
   ): Promise<T> {
     const alreadyInTransaction = this.connection.inTransaction();
+    // Phase timing. Date.now() (ms) is plenty to catch a multi-second stall.
+    const t0 = Date.now();
+    let tBegin = t0, tSessionStart = t0, tWrites = t0, tSave = t0;
+    let phase = 'begin';
+    let phaseStart = t0; // when the current phase began, for the error log
 
     if (!alreadyInTransaction) {
       await this.connection.beginTransaction();
     }
+    tBegin = Date.now();
+    phaseStart = tBegin;
 
     try {
       // Create edit session (writes directly to A/D tables)
       // Note: We don't call startEditing/stopEditing here because:
       // 1. EditSession writes directly to A/D tables without needing sde.edit_version
       // 2. sde.edit_version may interfere with our explicit transaction management
+      phase = 'session-start'; phaseStart = Date.now(); // createChildState (SDE_state_new_edit)
       const session = await EditSession.start(this, versionName);
+      tSessionStart = Date.now();
 
       // Execute user code
+      phase = 'writes'; phaseStart = tSessionStart;
       const result = await fn(session);
+      tWrites = Date.now();
 
       // Save and close session
+      phase = 'save'; phaseStart = tWrites;
       await session.save();
       await session.close();
+      tSave = Date.now();
 
+      phase = 'commit'; phaseStart = tSave;
       if (!alreadyInTransaction) {
         await this.connection.commitTransaction();
+      }
+      const tCommit = Date.now();
+
+      const total = tCommit - t0;
+      if (total >= EnterpriseGeodatabase.SLOW_EDIT_LOG_MS) {
+        console.warn(
+          `[egdb] slow editTransaction version=${versionName} total=${total}ms ` +
+          `begin=${tBegin - t0} sessionStart=${tSessionStart - tBegin} ` +
+          `writes=${tWrites - tSessionStart} save=${tSave - tWrites} commit=${tCommit - tSave}`
+        );
       }
 
       return result;
     } catch (error) {
+      // Log where it got to before failing, with partial phase timings, so a
+      // fail-fast/timeout stall names the hung phase.
+      const now = Date.now();
+      console.warn(
+        `[egdb] editTransaction FAILED version=${versionName} phase=${phase} ` +
+        `inPhase=${now - phaseStart}ms total=${now - t0}ms ` +
+        `err=${(error as Error)?.message?.slice(0, 80) ?? String(error)}`
+      );
       // Roll back only if a transaction is still open. A request-timeout on the
       // COMMIT statement leaves commitTransaction having already cleared its
       // transaction slot, so a blind rollbackTransaction() would throw "No
