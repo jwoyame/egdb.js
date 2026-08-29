@@ -79,22 +79,17 @@ async function geomColumns(conn: IDatabaseConnection, driver: Driver, table: Tab
   return cols;
 }
 
-/** Per-row scalar geometry fingerprint (area, length, point count, bbox perimeter)
- * for the geometry columns, appended to the row content hash. Cheap (no WKB/WKT
- * serialization), universal across point/line/polygon, and NULL/EMPTY-stable. A
- * different shape changes at least one with overwhelming probability. Returns the
- * SQL Server fragment prefixed with ', ' (for BINARY_CHECKSUM), or '' when none. */
+/** Per-row geometry fingerprint for the geometry columns, appended to the row
+ * content hash. Uses DATALENGTH(shape) -- the stored binary length, read from
+ * metadata with NO geometry computation (the spatial STArea/STLength/STEnvelope
+ * functions are ~1000x more expensive per row and hung the self-check on a 245k
+ * parcel table). A graduation that writes a DIFFERENT geometry almost always
+ * changes the stored byte length; combined with the exact row count and the
+ * attribute hash, that catches a wrong-geometry graduation. NULL/EMPTY-stable.
+ * Returns the SQL Server fragment prefixed with ', ' (for BINARY_CHECKSUM). */
 function geomFingerprintSql(gcols: string[]): string {
   if (gcols.length === 0) return '';
-  return ', ' + gcols.flatMap(g => {
-    const q = qid('sqlserver', g);
-    return [
-      `CONVERT(BIGINT, ROUND(${q}.STArea(), 0))`,
-      `CONVERT(BIGINT, ROUND(${q}.STLength(), 0))`,
-      `${q}.STNumPoints()`,
-      `CONVERT(BIGINT, ROUND(${q}.STEnvelope().STLength(), 0))`,
-    ];
-  }).join(', ');
+  return ', ' + gcols.map(g => `DATALENGTH(${qid('sqlserver', g)})`).join(', ');
 }
 
 async function versionTips(conn: IDatabaseConnection, driver: Driver): Promise<Array<{ key: string; tip: number; lineageName: number }>> {
