@@ -40,7 +40,7 @@
     "prepack": "node scripts/check-dist-fresh.mjs"
   },
   "dependencies": {
-    "mssql": "^12.2.0",
+    "mssql": "12.7.2",
     "pg": "^8.18.0"
   },
   "peerDependencies": {
