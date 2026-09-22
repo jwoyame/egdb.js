@@ -10,3 +10,5 @@ export {
 } from './sql-helpers';
 
 export { requireRegistrationId, requireDefined, requireVersioned, requireValidStateId } from './guards';
+
+export { rollbackQuietly } from './rollback';

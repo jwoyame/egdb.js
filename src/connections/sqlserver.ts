@@ -8,6 +8,131 @@ import { RwLock } from '../utils/rw-lock';
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Wait for `p` to settle, giving up after `ms`. Rejections are absorbed, and
+ * the give-up timer is cleared so it can't hold the event loop open. */
+const settleWithin = (p: Promise<unknown>, ms: number): Promise<void> =>
+  new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    (timer as { unref?: () => void }).unref?.();
+    p.then(() => undefined, () => undefined).then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+
+/** How long to wait for a canceled statement to finish unwinding. Longer than
+ * the driver's own cancelTimeout (3000, set in the constructor) so the driver
+ * always gets to tear the connection down first, which ends the request cleanly;
+ * only a connection that ignores both is left for the drop path below. */
+export const CANCEL_DRAIN_MS = 7000;
+
+/** How long endTransaction keeps retrying while the driver still reports a
+ * request in progress, before dropping the connection. */
+const TX_END_RETRY_MS = 100;
+const TX_END_RETRIES = 10;
+
+/**
+ * True when mssql refused a commit/rollback because a request is still active on
+ * the transaction. In that state it sends nothing to the server and does not
+ * release the pooled connection, so the transaction stays open until something
+ * else ends it.
+ */
+function isRequestInProgress(err: unknown): boolean {
+  return (err as { code?: unknown } | null | undefined)?.code === 'EREQINPROG';
+}
+
+/** The tedious connection a transaction borrows, as far as the drop path uses it. */
+interface BorrowedConnection {
+  close?: () => void;
+  removeListener?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+}
+
+/** The private mssql Transaction fields the drop path needs. */
+interface TransactionInternals {
+  _acquiredConnection?: BorrowedConnection | null;
+  _acquiredConfig?: unknown;
+  _aborted?: boolean;
+  /** Listener the driver attaches to the connection's 'rollbackTransaction'
+   * event, to notice the server rolling the transaction back on its own. */
+  _abort?: (...args: unknown[]) => void;
+  parent?: { release?: (c: unknown) => void };
+}
+
+/** Driver-side refusals: mssql raised these without sending anything to the
+ * server, because the transaction was already over or never started. */
+const NOT_SENT_CODES = new Set(['EABORT', 'ENOTBEGUN']);
+
+let warnedAboutInternals = false;
+
+/**
+ * The connection this transaction borrowed from the pool, or null.
+ *
+ * mssql exposes no public accessor, so this reads a private field, pinned by the
+ * exact driver version in package.json. If a driver upgrade renames the field the
+ * drop path below silently becomes a no-op and open transactions start leaking
+ * again, so say so loudly the first time instead.
+ */
+function borrowedConnection(tx: sql.Transaction): BorrowedConnection | null {
+  const t = tx as unknown as TransactionInternals;
+  if (!('_acquiredConnection' in t)) {
+    if (!warnedAboutInternals) {
+      warnedAboutInternals = true;
+      console.error(
+        '[egdb] mssql internals changed: Transaction has no _acquiredConnection field. ' +
+        'A transaction the driver will not end can no longer be cleaned up, so open ' +
+        'transactions may be left holding locks. Update dropTransactionConnection in ' +
+        'src/connections/sqlserver.ts for this driver version.',
+      );
+    }
+    return null;
+  }
+  return t._acquiredConnection ?? null;
+}
+
+/**
+ * End a transaction the driver could not, by closing the connection it ran on:
+ * SQL Server rolls the transaction back and frees its locks, and the pool
+ * validates the dead connection, destroys it and opens a replacement.
+ *
+ * `conn` is captured before the attempt, because by the time the failure reaches
+ * us the driver may have let go of it, and how it let go decides what is safe:
+ *
+ * - Still borrowed: the driver refused outright (a request still in progress),
+ *   sent nothing and kept the connection. Close it and hand it back ourselves.
+ * - Released after reaching the server: the commit or rollback was sent and
+ *   failed, and the driver returned the connection to the pool regardless,
+ *   possibly with the transaction still open. Close it, but do not release it
+ *   again - that would corrupt the pool's accounting.
+ * - Released because the server already rolled back: the driver's abort handler
+ *   returned the connection, clean, and the pool may already have handed it to
+ *   another caller. Closing it then would kill that caller's live query, for
+ *   nothing, so leave it alone.
+ *
+ * Every step is best-effort.
+ */
+function dropTransactionConnection(tx: sql.Transaction, conn: BorrowedConnection | null, err: unknown): void {
+  if (!conn) return;
+  const t = tx as unknown as TransactionInternals;
+  const stillBorrowed = t._acquiredConnection === conn;
+  if (!stillBorrowed) {
+    const code = (err as { code?: unknown } | null | undefined)?.code;
+    if (t._aborted || (typeof code === 'string' && NOT_SENT_CODES.has(code))) return;
+    try { conn.close?.(); } catch { /* already gone */ }
+    return;
+  }
+  // Detach the driver's abort listener first. Once the transaction lets go of the
+  // connection, a late rollback notice from the half-read response would run that
+  // listener against a missing connection and throw inside the driver's token
+  // handler, which it rethrows and which crashes the process.
+  if (t._abort) {
+    try { conn.removeListener?.('rollbackTransaction', t._abort); } catch { /* not attached */ }
+  }
+  try { conn.close?.(); } catch { /* already gone */ }
+  try { t.parent?.release?.(conn); } catch { /* pool no longer tracks it */ }
+  t._acquiredConnection = null;
+  t._acquiredConfig = null;
+}
+
 /**
  * Classify a driver error so we can retry transient connection blips (a brief
  * RDS/network hiccup). Note there is NO driver signal that proves a statement
@@ -60,7 +185,7 @@ export class SqlServerConnection implements IDatabaseConnection {
   private lock = new RwLock();
 
   // Optional per-statement timeout (ms) applied to execute/executeInsert/query
-  // requests when set (enforced by cancelling the request, since mssql has no
+  // requests when set (enforced by canceling the request, since mssql has no
   // per-request timeout). Lets an edit operation fail fast on a transient DB
   // stall (e.g. a merge, which is normally sub-second) instead of waiting the
   // full pool requestTimeout. Note: it does NOT cover streaming reads or the
@@ -93,7 +218,7 @@ export class SqlServerConnection implements IDatabaseConnection {
   }
 
   // Run a request with the active per-statement timeout, if one is set. mssql has
-  // no per-request timeout, so we enforce it by cancelling the request (an
+  // no per-request timeout, so we enforce it by canceling the request (an
   // attention token) when the timer fires; that rejects `exec()` with a
   // cancellation error, which classifyConnError treats as a request-timeout.
   private async runWithTimeout<T>(request: sql.Request, exec: () => Promise<T>): Promise<T> {
@@ -108,15 +233,31 @@ export class SqlServerConnection implements IDatabaseConnection {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
-        try { request.cancel(); } catch { /* already done */ }
         const err = new Error(`Statement canceled after ${ms}ms (edit fast-fail timeout)`) as Error & { code: string; name: string };
         err.code = 'ETIMEOUT';
         err.name = 'RequestError';
+        // Reject before canceling, so the caller always sees this error and can
+        // classify it, rather than whatever shape the driver's own cancellation
+        // error takes when it happens to land first.
         reject(err);
+        try { request.cancel(); } catch { /* already done */ }
       }, ms);
     });
+    const running = exec();
+    // The race below can leave `running` rejecting with nobody attached, which
+    // Node reports as an unhandled rejection. Attach a no-op handler now.
+    running.catch(() => { /* reported via the race or the drain below */ });
     try {
-      return await Promise.race([exec(), timeout]);
+      return await Promise.race([running, timeout]);
+    } catch (err) {
+      // A cancel is only a request to the server; the driver keeps the request
+      // marked active until the server acknowledges it, and mssql refuses to
+      // COMMIT or ROLLBACK a transaction while a request is active. That refusal
+      // sends nothing to the server and never hands the pooled connection back,
+      // so the caller's rollback would leave BEGIN TRAN open, holding locks for
+      // the life of the process. Wait for the request to finish unwinding first.
+      await settleWithin(running, CANCEL_DRAIN_MS);
+      throw err;
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -132,6 +273,12 @@ export class SqlServerConnection implements IDatabaseConnection {
       options: {
         encrypt: config.options?.encrypt ?? true,
         trustServerCertificate: config.options?.trustServerCertificate ?? true,
+        // How long the driver waits for the server to acknowledge a cancel
+        // before tearing the connection down itself. Held below CANCEL_DRAIN_MS
+        // so the driver's own teardown always wins the race: it ends the request
+        // properly, which lets the caller's rollback go through, rather than
+        // leaving us to drop the connection by hand.
+        cancelTimeout: config.options?.cancelTimeout ?? 3000,
       },
       connectionTimeout: config.options?.connectionTimeout ?? 30000,
       requestTimeout: config.options?.requestTimeout ?? 30000,
@@ -441,7 +588,7 @@ export class SqlServerConnection implements IDatabaseConnection {
     if (!this.transaction) throw new Error('No transaction in progress');
     const tx = this.transaction;
     try {
-      await tx.commit();
+      await this.endTransaction(tx, 'commit');
     } finally {
       // Clear the slot BEFORE releasing so a freshly-woken reader never routes
       // into a finished transaction; release even if commit threw so a driver
@@ -458,11 +605,51 @@ export class SqlServerConnection implements IDatabaseConnection {
     if (!this.transaction) throw new Error('No transaction in progress');
     const tx = this.transaction;
     try {
-      await tx.rollback();
+      await this.endTransaction(tx, 'rollback');
     } finally {
       this.transaction = null;
       this.lock.releaseWrite();
     }
+  }
+
+  /**
+   * Commit or roll back `tx`, making sure the server-side transaction really
+   * ends, and that the connection it ran on never goes back into the pool with
+   * that transaction still open. A pooled session holding locks blocks every
+   * other session that needs those rows.
+   *
+   * Two ways the driver leaves that behind. It refuses both commit and rollback
+   * while a request is still active on the transaction (EREQINPROG - what a
+   * just-canceled statement looks like for a moment), sending nothing to the
+   * server and keeping the connection borrowed; retrying clears that once the
+   * request unwinds. And when an attempt does reach the server and fails, it
+   * releases the connection to the pool regardless, open transaction and all.
+   *
+   * So a failure to end the transaction closes the connection, which makes the
+   * server roll back and frees the locks. That is safe whichever way the failure
+   * went: a commit that never reached the server committed nothing, and one that
+   * did land is already durable, so closing the socket afterward loses no write.
+   * The one exception is a transaction the server already rolled back itself;
+   * see dropTransactionConnection.
+   */
+  private async endTransaction(tx: sql.Transaction, kind: 'commit' | 'rollback'): Promise<void> {
+    // Captured up front: the driver nulls its own reference before the failure
+    // reaches us, so after the fact there would be nothing left to close.
+    const borrowed = borrowedConnection(tx);
+    let lastErr: unknown;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (kind === 'commit') await tx.commit();
+        else await tx.rollback();
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (!isRequestInProgress(err) || attempt >= TX_END_RETRIES) break;
+        await delay(TX_END_RETRY_MS);
+      }
+    }
+    dropTransactionConnection(tx, borrowed, lastErr);
+    throw lastErr;
   }
 
   /**

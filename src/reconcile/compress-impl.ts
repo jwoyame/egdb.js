@@ -16,6 +16,7 @@
 import type { IDatabaseConnection } from '../connections/connection';
 import type { TableInfo } from '../types';
 import { buildIntegerList } from '../utils/sql-helpers';
+import { rollbackQuietly } from '../utils/rollback';
 
 type Driver = 'sqlserver' | 'postgresql';
 
@@ -382,7 +383,7 @@ export async function graduateTable(
     await graduateTableBody(connection, table, graduableSnapshot, cache, result);
     if (ownTx) await connection.commitTransaction();
   } catch (e) {
-    if (ownTx && connection.inTransaction()) await connection.rollbackTransaction();
+    if (ownTx) await rollbackQuietly(connection, 'compress/graduateTable');
     throw e;
   }
   return result;
@@ -800,7 +801,7 @@ export async function pruneStates(
     }
     if (!wasTx) await connection.commitTransaction();
   } catch (e) {
-    if (!wasTx && connection.inTransaction()) await connection.rollbackTransaction();
+    if (!wasTx) await rollbackQuietly(connection, 'compress/pruneStates');
     throw e;
   }
   return result;
@@ -1136,7 +1137,7 @@ export async function collapseLineages(
         await connection.commitTransaction();
         result.collapses += 1;
       } catch (e) {
-        if (connection.inTransaction()) await connection.rollbackTransaction();
+        await rollbackQuietly(connection, 'compress/collapseLineages');
         throw e;
       }
     }

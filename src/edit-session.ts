@@ -15,6 +15,7 @@ import { FieldType } from './types';
 import type { Feature, Geometry, VersionInfo, TableInfo } from './types';
 import { validatePositiveInteger } from './utils/sql-helpers';
 import { requireRegistrationId } from './utils/guards';
+import { rollbackQuietly } from './utils/rollback';
 import {
   createChildState,
   deleteChildState,
@@ -155,7 +156,7 @@ export class EditSession {
       sdeId = await acquireStateLock(connection, childStateId);
       if (!wasInTx) await connection.commitTransaction();
     } catch (error) {
-      if (!wasInTx) await connection.rollbackTransaction();
+      if (!wasInTx) await rollbackQuietly(connection, 'EditSession.start');
       throw error;
     }
 
@@ -895,7 +896,7 @@ export class EditSession {
       if (!wasInTransaction) await this.connection.commitTransaction();
       this.stateLockSdeId = null;
     } catch (error) {
-      if (!wasInTransaction) await this.connection.rollbackTransaction();
+      if (!wasInTransaction) await rollbackQuietly(this.connection, 'EditSession.discard');
       // Leave session 'open' so the caller can retry. Preserve the cause.
       throw new Error(
         `Failed to discard changes: ${error instanceof Error ? error.message : String(error)}`,
