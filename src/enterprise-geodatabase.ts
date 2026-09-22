@@ -68,6 +68,7 @@ import {
   assessClosureSafety,
   ClosureUnsafeError,
 } from './reconcile';
+import { rollbackQuietly } from './utils/rollback';
 import type { SelfCheckResult, ClosureSafety } from './reconcile';
 import type { GraduateTableResult } from './reconcile';
 import type { StaleLockCleanupResult } from './reconcile';
@@ -77,10 +78,42 @@ import type { StaleLockCleanupResult } from './reconcile';
  * Indicates another operation is in progress on the target version.
  */
 export class LockTimeoutError extends Error {
-  constructor(resource: string) {
-    super(`Lock timeout on resource: ${resource}`);
+  /**
+   * @param resource What could not be locked.
+   * @param message Overrides the default message, for a refusal that happens
+   *   before any lock is requested but means the same thing to a caller: another
+   *   operation holds what this one needs, nothing was changed, retry later.
+   */
+  constructor(resource: string, message?: string) {
+    super(message ?? `Lock timeout on resource: ${resource}`);
     this.name = 'LockTimeoutError';
   }
+}
+
+/**
+ * True for SQL Server error 1222, "Lock request time out period exceeded" -
+ * raised when a statement gives up waiting for a lock under SET LOCK_TIMEOUT.
+ * Checks the whole error chain because a batch can report the timeout as a
+ * preceding error alongside the one THROW re-raises.
+ */
+export function isSqlServerLockTimeout(err: unknown): boolean {
+  const e = err as { number?: unknown; message?: unknown; precedingErrors?: unknown[] } | null | undefined;
+  if (!e || typeof e !== 'object') return false;
+  if (e.number === 1222) return true;
+  if (typeof e.message === 'string' && /lock request time out period exceeded/i.test(e.message)) return true;
+  if (Array.isArray(e.precedingErrors)) return e.precedingErrors.some(isSqlServerLockTimeout);
+  return false;
+}
+
+/**
+ * True for PostgreSQL 55P03 (lock_not_available), which is what `lock_timeout`
+ * raises when a statement gives up waiting for a lock.
+ */
+export function isPostgresLockTimeout(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null | undefined;
+  if (!e || typeof e !== 'object') return false;
+  if (e.code === '55P03') return true;
+  return typeof e.message === 'string' && /canceling statement due to lock timeout/i.test(e.message);
 }
 
 /**
@@ -106,6 +139,11 @@ export class EnterpriseGeodatabase {
    * this only ever waits out an in-flight edit; if it can't get the lock in this
    * window another compress is running or an editor is stuck → defer. */
   private static readonly COMPRESS_LOCK_TIMEOUT_MS = 30000;
+  /** How long `sde.create_version` waits for a lock before giving up. A healthy
+   * call takes tens of milliseconds, so this is ample headroom while still
+   * failing an editor fast enough to retry -- matching the editor-facing bounce
+   * of EDITOR_SHARED_LOCK_TIMEOUT_MS rather than the 30s server-side waits. */
+  private static readonly CREATE_VERSION_LOCK_TIMEOUT_MS = 5000;
 
   private connection: IDatabaseConnection;
   private config: ConnectionConfig;
@@ -689,7 +727,7 @@ export class EnterpriseGeodatabase {
       if (!wasInTx) await conn.commitTransaction();
       return { reverted: features.length, states: childOnlyStates };
     } catch (e) {
-      if (!wasInTx) await conn.rollbackTransaction();
+      if (!wasInTx) await rollbackQuietly(conn, 'revertFeatures');
       throw e;
     }
   }
@@ -828,21 +866,103 @@ export class EnterpriseGeodatabase {
     const description = options?.description ?? '';
     const nameRule = options?.nameRule ?? EnterpriseGeodatabase.VersionNameRule.EXACT;
 
+    const lockWait = EnterpriseGeodatabase.CREATE_VERSION_LOCK_TIMEOUT_MS;
+
     if (this.config.driver === 'sqlserver') {
-      // SQL Server uses stored procedure with INOUT parameter for name
-      // The procedure may modify the name if nameRule is UNIQUE
-      await this.connection.query(
-        `EXEC sde.create_version @p0, @p1, @p2, @p3, @p4`,
-        [parent, name, nameRule, access, description],
-        { mutating: true }
-      );
+      // Esri's proc ends with `WHILE @@TRANCOUNT > 0 COMMIT`. Every statement on
+      // this connection runs inside whatever transaction is open on it, whoever
+      // opened it, so running the proc now would commit that transaction halfway
+      // through - on a shared connection, another user's edit. Refuse before
+      // sending anything, so the caller can truthfully report that nothing
+      // changed. There must be no await between this check and the query() call.
+      if (this.connection.inTransaction()) {
+        throw new LockTimeoutError(
+          'sde.create_version',
+          'Cannot create a version while another edit is in progress on this ' +
+          'connection; nothing was changed. Try again once it finishes.',
+        );
+      }
+
+      // The proc may return a different name when name_rule is 1 (Esri: generate
+      // a unique name).
+      //
+      // The proc takes locks on the SDE system tables, so anything else holding
+      // them makes it wait; unbounded, that wait runs to the pool's request
+      // timeout and surfaces as an opaque failure. SET LOCK_TIMEOUT bounds it, and
+      // SET XACT_ABORT ON makes sure that if the client gives up anyway and
+      // cancels mid-proc, SQL Server rolls back whatever transaction the proc had
+      // open - without it, the cancel leaves that transaction open on the pooled
+      // session, holding its locks for every later caller.
+      //
+      // Trade-off: the TRY block and XACT_ABORT both stop the proc at its first
+      // error. The proc's own @@error handling after that point - retrying a
+      // duplicate name with a suffix, or cleaning up the process and state-lock
+      // rows it inserted - does not run. A duplicate name surfaces as error 2627
+      // ("Cannot insert duplicate key") with nothing created. Leftover process
+      // and state-lock rows belong to this session, and the proc clears them on
+      // its next run from the same session; its global temp table lasts until
+      // the session closes.
+      //
+      // Both settings are session state. SQL Server restores them when a
+      // parameterized batch like this one returns, and the batch also restores
+      // them itself on both paths, so the pooled session keeps neither. The
+      // timeout is a class constant, not user input, so inlining it is safe -
+      // SET LOCK_TIMEOUT takes a literal. -1 is SQL Server's default (wait
+      // forever); 16384 is the XACT_ABORT bit of @@OPTIONS.
+      const sql = `
+        DECLARE @entryTranCount int = @@TRANCOUNT;
+        DECLARE @entryXactAbort bit = CASE WHEN (@@OPTIONS & 16384) = 16384 THEN 1 ELSE 0 END;
+        SET XACT_ABORT ON;
+        SET LOCK_TIMEOUT ${lockWait};
+        BEGIN TRY
+          EXEC sde.create_version @p0, @p1, @p2, @p3, @p4;
+          SET LOCK_TIMEOUT -1;
+          IF @entryXactAbort = 0 SET XACT_ABORT OFF;
+        END TRY
+        BEGIN CATCH
+          SET LOCK_TIMEOUT -1;
+          -- The proc can stop partway with one of its own transactions open.
+          -- Only roll back a transaction this batch is responsible for.
+          IF @entryTranCount = 0 AND @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+          IF @entryXactAbort = 0 SET XACT_ABORT OFF;
+          THROW;
+        END CATCH`;
+      try {
+        await this.connection.query(
+          sql,
+          [parent, name, nameRule, access, description],
+          { mutating: true }
+        );
+      } catch (error) {
+        if (isSqlServerLockTimeout(error)) {
+          throw new LockTimeoutError(`sde.create_version (parent ${parent})`);
+        }
+        throw error;
+      }
     } else {
-      // PostgreSQL
-      await this.connection.query(
-        `SELECT sde.create_version($1, $2, $3, $4, $5)`,
-        [parent, name, nameRule, access, description],
-        { mutating: true }
-      );
+      // PostgreSQL: lock_timeout is session state too, and SET LOCAL only applies
+      // inside a transaction, so bound the wait in one. That also resets it: SET
+      // LOCAL ends with the transaction, so no pooled session keeps the bound.
+      const wasInTx = this.connection.inTransaction();
+      if (!wasInTx) await this.connection.beginTransaction();
+      try {
+        await this.connection.query(`SET LOCAL lock_timeout = ${lockWait}`);
+        await this.connection.query(
+          `SELECT sde.create_version($1, $2, $3, $4, $5)`,
+          [parent, name, nameRule, access, description],
+          { mutating: true }
+        );
+        // Clear the bound for the rest of a caller-owned transaction, which would
+        // otherwise inherit it.
+        await this.connection.query(`SET LOCAL lock_timeout = 0`);
+        if (!wasInTx) await this.connection.commitTransaction();
+      } catch (error) {
+        if (!wasInTx) await rollbackQuietly(this.connection, 'createVersion');
+        if (isPostgresLockTimeout(error)) {
+          throw new LockTimeoutError(`sde.create_version (parent ${parent})`);
+        }
+        throw error;
+      }
     }
 
     // Fetch the created version info
@@ -1115,12 +1235,7 @@ export class EnterpriseGeodatabase {
         mergedCount = r.mergedCount;
         await this.connection.commitTransaction();
       } catch (error) {
-        try {
-          await this.connection.rollbackTransaction();
-        } catch (rollbackError) {
-          // Surface the original cause but log the rollback failure too.
-          console.error('reconcile rollback failed:', rollbackError);
-        }
+        await rollbackQuietly(this.connection, 'reconcileVersion');
         throw error;
       }
     }
@@ -1389,7 +1504,7 @@ export class EnterpriseGeodatabase {
         newParentStateId: postTargetState,
       };
     } catch (error) {
-      await this.connection.rollbackTransaction();
+      await rollbackQuietly(this.connection, 'postVersion');
       throw error;
     }
   }
@@ -1835,7 +1950,7 @@ export class EnterpriseGeodatabase {
         dryRun: false,
       };
     } catch (error) {
-      if (!wasInTx) await this.connection.rollbackTransaction();
+      if (!wasInTx) await rollbackQuietly(this.connection, 'rebaseVersion');
       throw error;
     }
   }
@@ -2009,9 +2124,7 @@ export class EnterpriseGeodatabase {
           totalAddsRemoved += r.aRowsRemoved;
           totalDeletesRemoved += r.dRowsRemoved;
         } catch (e) {
-          if (!wasInTx && this.connection.inTransaction()) {
-            await this.connection.rollbackTransaction();
-          }
+          if (!wasInTx) await rollbackQuietly(this.connection, 'compress/graduate');
           throw e;
         }
       }
@@ -2192,7 +2305,7 @@ export class EnterpriseGeodatabase {
       await this.connection.commitTransaction();
       return result;
     } catch (error) {
-      await this.connection.rollbackTransaction();
+      await rollbackQuietly(this.connection, 'transaction');
       throw error;
     }
   }
@@ -2297,20 +2410,11 @@ export class EnterpriseGeodatabase {
         `inPhase=${now - phaseStart}ms total=${now - t0}ms ` +
         `err=${(error as Error)?.message?.slice(0, 80) ?? String(error)}`
       );
-      // Roll back only if a transaction is still open. A request-timeout on the
-      // COMMIT statement leaves commitTransaction having already cleared its
-      // transaction slot, so a blind rollbackTransaction() would throw "No
-      // transaction in progress" and MASK the original timeout error (which the
-      // caller needs to classify as a connection blip). Guarding on
-      // inTransaction() lets the real error propagate; a failed rollback is
-      // likewise swallowed so it can't mask the original error either.
-      if (!alreadyInTransaction && this.connection.inTransaction()) {
-        try {
-          await this.connection.rollbackTransaction();
-        } catch {
-          // ignore - propagate the original error below
-        }
-      }
+      // A request-timeout on the COMMIT statement leaves commitTransaction
+      // having already cleared its transaction slot, so a blind rollback would
+      // throw "No transaction in progress" and MASK the original timeout error
+      // (which the caller needs to classify as a connection blip).
+      if (!alreadyInTransaction) await rollbackQuietly(this.connection, 'editTransaction');
       throw error;
     }
   }

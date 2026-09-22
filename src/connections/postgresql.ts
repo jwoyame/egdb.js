@@ -224,12 +224,18 @@ export class PostgreSQLConnection implements IDatabaseConnection {
   async commitTransaction(): Promise<void> {
     if (!this.transactionClient) throw new Error('No transaction in progress');
     const client = this.transactionClient;
+    let failed = false;
     try {
       await client.query('COMMIT');
+    } catch (err) {
+      failed = true;
+      throw err;
     } finally {
       // Clear the slot before releasing the lock; always release so a driver
-      // error can't strand the connection.
-      client.release();
+      // error can't strand the connection. A COMMIT that failed may leave the
+      // transaction open on that session, so destroy the client rather than hand
+      // a dirty one back to the pool where it would keep holding its locks.
+      client.release(failed);
       this.transactionClient = null;
       this.lock.releaseWrite();
     }
@@ -241,10 +247,16 @@ export class PostgreSQLConnection implements IDatabaseConnection {
   async rollbackTransaction(): Promise<void> {
     if (!this.transactionClient) throw new Error('No transaction in progress');
     const client = this.transactionClient;
+    let failed = false;
     try {
       await client.query('ROLLBACK');
+    } catch (err) {
+      failed = true;
+      throw err;
     } finally {
-      client.release();
+      // Destroy the client if the ROLLBACK failed: the transaction may still be
+      // open on it, and a pooled session holding locks blocks everyone else.
+      client.release(failed);
       this.transactionClient = null;
       this.lock.releaseWrite();
     }

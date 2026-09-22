@@ -147,7 +147,17 @@ describe('withStatementTimeout (edit fast-fail)', () => {
   it('cancels a slow in-transaction statement and rejects ~timeout with ETIMEOUT', async () => {
     const conn = makeConn();
     let canceled = false;
-    const hangingReq = { input() { return this; }, query: () => new Promise(() => {}), cancel: () => { canceled = true; } };
+    // The cancel settles the request, as a server acknowledging the attention
+    // does. The caller is held until that happens: the driver refuses to send a
+    // commit or rollback while a request is still active, so returning any
+    // earlier would leave the caller's rollback unsent and the transaction open
+    // on the server, holding its locks.
+    let finish: () => void = () => {};
+    const hangingReq = {
+      input() { return this; },
+      query: () => new Promise((_, reject) => { finish = () => reject(new Error('Canceled.')); }),
+      cancel: () => { canceled = true; finish(); },
+    };
     injectTx(conn, hangingReq);
     const t = Date.now();
     const err = await conn.withStatementTimeout(150, () => conn.execute('UPDATE x SET y=1')).catch((e) => e);

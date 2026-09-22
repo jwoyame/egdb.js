@@ -61,6 +61,14 @@ export interface ConnectionConfig {
     connectionTimeout?: number;
     requestTimeout?: number;
     /**
+     * SQL Server only. How long the driver waits for the server to acknowledge a
+     * canceled request before tearing the connection down itself. Defaults to
+     * 3000, deliberately below the library's own wait for a canceled statement so
+     * the driver ends the request properly; raising it past that wait means the
+     * library has to drop the connection by hand instead.
+     */
+    cancelTimeout?: number;
+    /**
      * Override the connection pool sizing. Used by the compress exclusive-lock
      * holder, which wants a dedicated single connection ({max:1,min:1}) that is
      * never idle-reaped and never hands out a second session while it holds the
