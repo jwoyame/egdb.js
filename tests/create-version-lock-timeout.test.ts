@@ -97,7 +97,7 @@ describe('createVersion on SQL Server', () => {
     const batch = conn.statements.find((s) => /create_version/i.test(s))!;
     // One batch: a pooled session does not carry SET LOCK_TIMEOUT between calls.
     expect(batch).toMatch(/SET LOCK_TIMEOUT \d+/);
-    expect(batch).toMatch(/EXEC sde\.create_version/);
+    expect(batch).toMatch(/EXEC @rc = sde\.create_version/);
     expect(conn.statements.filter((s) => /SET LOCK_TIMEOUT/i.test(s))).toHaveLength(1);
   });
 
@@ -127,7 +127,7 @@ describe('createVersion on SQL Server', () => {
     // ON before the EXEC: a cancel mid-proc must not leave the proc's own
     // transaction open on the pooled session.
     expect(batch.indexOf('SET XACT_ABORT ON')).toBeGreaterThan(-1);
-    expect(batch.indexOf('SET XACT_ABORT ON')).toBeLessThan(batch.indexOf('EXEC sde.create_version'));
+    expect(batch.indexOf('SET XACT_ABORT ON')).toBeLessThan(batch.indexOf('EXEC @rc = sde.create_version'));
     // Put back to whatever the session had, in TRY and in CATCH.
     expect(batch).toMatch(/@entryXactAbort bit = CASE WHEN \(@@OPTIONS & 16384\) = 16384/);
     expect(batch.match(/IF @entryXactAbort = 0 SET XACT_ABORT OFF/g)).toHaveLength(2);
