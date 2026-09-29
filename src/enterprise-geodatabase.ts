@@ -90,6 +90,52 @@ export class LockTimeoutError extends Error {
   }
 }
 
+/** The row `createVersion` reads back after asking the database to create one. */
+interface CreateVersionResult {
+  /** `sde.create_version`'s own return code; 0 means it created the version. */
+  return_code?: unknown;
+  /** The name the database actually used, which can differ from the one asked for. */
+  name?: unknown;
+  /** The new version's owner, which is the current database user. */
+  owner?: unknown;
+}
+
+/** `sde.create_version`'s return codes, as its own header lists them. */
+const CREATE_VERSION_CODES: Record<number, string> = {
+  50025: 'no permission to use the parent version',
+  50049: 'the parent version\'s state is locked by another operation',
+  50066: 'invalid access level or name rule',
+  50126: 'the parent version does not exist',
+  50171: 'invalid version name',
+  50172: 'the parent version\'s state does not exist',
+  50177: 'a version with that name already exists',
+  50298: 'the database could not assign a version id',
+};
+
+/**
+ * Fail when `sde.create_version` reported a non-zero return code. The proc
+ * raises nothing on some of its failure paths, so the code is the only sign
+ * that it created nothing.
+ */
+function throwOnCreateVersionCode(code: unknown, parent: string): void {
+  const rc = typeof code === 'number' ? code : Number(code);
+  if (!Number.isFinite(rc) || rc === 0) return;
+  // A lock conflict is worth retrying, and callers already handle this error
+  // by telling the user the database was busy and nothing changed.
+  if (rc === 50049) {
+    throw new LockTimeoutError(
+      `sde.create_version (parent ${parent})`,
+      'Another operation is using the parent version right now, so the ' +
+      'version was not created; nothing was changed. Try again shortly.',
+    );
+  }
+  const reason = CREATE_VERSION_CODES[rc];
+  throw new Error(
+    `sde.create_version failed with code ${rc}${reason ? `: ${reason}` : ''}; ` +
+    'no version was created.',
+  );
+}
+
 /**
  * True for SQL Server error 1222, "Lock request time out period exceeded" -
  * raised when a statement gives up waiting for a lock under SET LOCK_TIMEOUT.
@@ -803,25 +849,32 @@ export class EnterpriseGeodatabase {
   // ============================================================
 
   /**
-   * Version access levels
+   * Version access levels, as `sde.create_version` defines its access
+   * argument and as the low two bits of `SDE_versions.status` store it.
+   * The SDE administrator (the `sde` login) has full access to every version.
    */
   static readonly VersionAccess = {
-    /** Anyone can read and write */
-    PUBLIC: 0,
-    /** Anyone can read, only owner can write */
-    PROTECTED: 1,
-    /** Only owner can read and write */
-    PRIVATE: 2,
+    /** Only the owner can see or edit the version */
+    PRIVATE: 0,
+    /** Anyone can see and edit the version */
+    PUBLIC: 1,
+    /** Anyone can see the version, only the owner can edit it */
+    PROTECTED: 2,
   } as const;
 
   /**
-   * Version naming rules
+   * Version naming rules, as `sde.create_version` defines its name_rule
+   * argument.
    */
   static readonly VersionNameRule = {
-    /** Use the exact name provided */
-    EXACT: 1,
-    /** Make name unique by appending a number if needed */
-    UNIQUE: 2,
+    /**
+     * If the name is taken, let the database append a number to make it unique.
+     * On SQL Server, createVersion stops at the first database error, so a
+     * taken name fails the call instead of getting a number.
+     */
+    UNIQUE: 1,
+    /** Use the exact name given, and fail if it is taken */
+    EXACT: 2,
   } as const;
 
   /**
@@ -867,6 +920,7 @@ export class EnterpriseGeodatabase {
     const nameRule = options?.nameRule ?? EnterpriseGeodatabase.VersionNameRule.EXACT;
 
     const lockWait = EnterpriseGeodatabase.CREATE_VERSION_LOCK_TIMEOUT_MS;
+    let created: CreateVersionResult | undefined;
 
     if (this.config.driver === 'sqlserver') {
       // Esri's proc ends with `WHILE @@TRANCOUNT > 0 COMMIT`. Every statement on
@@ -883,8 +937,18 @@ export class EnterpriseGeodatabase {
         );
       }
 
-      // The proc may return a different name when name_rule is 1 (Esri: generate
-      // a unique name).
+      // The proc hands back the name it actually used through its @name OUTPUT
+      // argument, which differs from the one asked for when name_rule is UNIQUE.
+      // The batch returns that name with the current database user, who is
+      // always the new version's owner, so the lookup below finds this version
+      // and not an older one with the same name.
+      //
+      // It also returns the proc's own return code. Some failures inside the
+      // proc report themselves that way and raise nothing: a lock conflict on
+      // the parent version's state gives back code 50049 with no error, and
+      // leaves @createdName holding the name that went in. Without the code, a
+      // create that did nothing looks like a create that succeeded, and the
+      // lookup below returns whatever version already had that name.
       //
       // The proc takes locks on the SDE system tables, so anything else holding
       // them makes it wait; unbounded, that wait runs to the pool's request
@@ -912,12 +976,15 @@ export class EnterpriseGeodatabase {
       const sql = `
         DECLARE @entryTranCount int = @@TRANCOUNT;
         DECLARE @entryXactAbort bit = CASE WHEN (@@OPTIONS & 16384) = 16384 THEN 1 ELSE 0 END;
+        DECLARE @createdName nvarchar(64) = @p1;
+        DECLARE @rc int = 0;
         SET XACT_ABORT ON;
         SET LOCK_TIMEOUT ${lockWait};
         BEGIN TRY
-          EXEC sde.create_version @p0, @p1, @p2, @p3, @p4;
+          EXEC @rc = sde.create_version @p0, @createdName OUTPUT, @p2, @p3, @p4;
           SET LOCK_TIMEOUT -1;
           IF @entryXactAbort = 0 SET XACT_ABORT OFF;
+          SELECT @rc AS return_code, @createdName AS name, USER_NAME() AS owner;
         END TRY
         BEGIN CATCH
           SET LOCK_TIMEOUT -1;
@@ -928,11 +995,13 @@ export class EnterpriseGeodatabase {
           THROW;
         END CATCH`;
       try {
-        await this.connection.query(
+        const rows = await this.connection.query<CreateVersionResult>(
           sql,
           [parent, name, nameRule, access, description],
           { mutating: true }
         );
+        created = rows[0];
+        throwOnCreateVersionCode(created?.return_code, parent);
       } catch (error) {
         if (isSqlServerLockTimeout(error)) {
           throw new LockTimeoutError(`sde.create_version (parent ${parent})`);
@@ -943,15 +1012,29 @@ export class EnterpriseGeodatabase {
       // PostgreSQL: lock_timeout is session state too, and SET LOCAL only applies
       // inside a transaction, so bound the wait in one. That also resets it: SET
       // LOCAL ends with the transaction, so no pooled session keeps the bound.
+      if (nameRule === EnterpriseGeodatabase.VersionNameRule.UNIQUE) {
+        throw new Error(
+          'createVersion: nameRule UNIQUE is not supported on PostgreSQL; ' +
+          'pass an unused name with nameRule EXACT instead.',
+        );
+      }
+
       const wasInTx = this.connection.inTransaction();
       if (!wasInTx) await this.connection.beginTransaction();
       try {
         await this.connection.query(`SET LOCAL lock_timeout = ${lockWait}`);
-        await this.connection.query(
-          `SELECT sde.create_version($1, $2, $3, $4, $5)`,
+        // The function is documented to hand back the name it used, but that
+        // return shape is not verified against a real PostgreSQL geodatabase.
+        // If it hands back something else, findCreatedVersion falls back to the
+        // requested name, which is only the right answer while the rule is
+        // EXACT - under UNIQUE the database may have used a different name. So
+        // UNIQUE is refused here until the return shape is checked.
+        const rows = await this.connection.query<CreateVersionResult>(
+          `SELECT sde.create_version($1, $2, $3, $4, $5) AS name, current_user AS owner`,
           [parent, name, nameRule, access, description],
           { mutating: true }
         );
+        created = rows[0];
         // Clear the bound for the rest of a caller-owned transaction, which would
         // otherwise inherit it.
         await this.connection.query(`SET LOCAL lock_timeout = 0`);
@@ -965,16 +1048,40 @@ export class EnterpriseGeodatabase {
       }
     }
 
-    // Fetch the created version info
-    // The version owner will be the current database user (which may differ from login user)
-    // We need to search by name across all owners
+    return this.findCreatedVersion(name, created);
+  }
+
+  /**
+   * Find the version createVersion just made. Uses the name and owner the
+   * database reported, falling back to the requested name when it reported
+   * none. Matching the owner matters because other users can have versions
+   * with the same name.
+   */
+  private async findCreatedVersion(
+    requestedName: string,
+    reported?: CreateVersionResult,
+  ): Promise<VersionInfo> {
+    const text = (v: unknown): string | undefined =>
+      typeof v === 'string' && v.trim() !== '' ? v.trim() : undefined;
+    // The database accepts an optional "owner." prefix on a version name but
+    // stores the name without it, so drop the prefix the same way it does. A
+    // version name itself cannot contain a dot.
+    const withoutOwner = (n: string): string => {
+      const quoted = n.indexOf('".');
+      return quoted >= 0 ? n.slice(quoted + 2) : n.slice(n.indexOf('.') + 1);
+    };
+    const createdName = withoutOwner(text(reported?.name) ?? requestedName).toLowerCase();
+    // Owner names can come back quoted when they hold unusual characters.
+    const createdOwner = text(reported?.owner)?.replace(/"/g, '').toLowerCase();
+
     const versions = await this.listVersions();
     const createdVersion = versions.find(
-      v => v.name.toLowerCase() === name.toLowerCase()
+      v => v.name.toLowerCase() === createdName
+        && (createdOwner === undefined || v.owner.replace(/"/g, '').toLowerCase() === createdOwner)
     );
 
     if (!createdVersion) {
-      throw new Error(`Version created but not found: ${name}`);
+      throw new Error(`Version created but not found: ${createdOwner ? `${createdOwner}.` : ''}${createdName}`);
     }
     return createdVersion;
   }
