@@ -347,6 +347,9 @@ d('postVersion({ trimPost: true }) closure invariants', () => {
     expect(await countAt(conn,
       `SELECT COUNT(*) AS n FROM dbo.a${REG_ID} WHERE OBJECTID = 500 AND SDE_STATE_ID = ${tip};`)).toBe(1);
     expect(await walkStatesMissingFromClosure(conn, tip)).toEqual([]);
+    // A lock left on the new tip after a multi-save post blocks later edits
+    // and makes compress skip the branch, same as a single-save post.
+    expect(await locksOn(conn, tip)).toBe(0);
   });
 
   it('a hard delete of a base row leaves a base-shadow marker inside DEFAULT closure', async () => {
@@ -367,6 +370,33 @@ d('postVersion({ trimPost: true }) closure invariants', () => {
     expect(esri.has(300)).toBe(false);
     expect(await dbVisible(conn, tip)).toEqual(esri);
     expect(await walkStatesMissingFromClosure(conn, tip)).toEqual([]);
+    // A hard delete must not leave the new tip locked either -- there is no
+    // A-row copy for a pure delete, so this exercises the lock release on
+    // its own, separate from the copy path above.
+    expect(await locksOn(conn, tip)).toBe(0);
+  });
+
+  it('a hard delete also hides the base row under the legacy repoint post (trimPost: false)', async () => {
+    // The legacy path advances DEFAULT straight onto the version's own tip
+    // instead of copying deltas onto a new DEFAULT-lineage state, but it runs
+    // through the same emitBaseShadowMarkers call. A version branched fresh off
+    // DEFAULT's current tip (as these fixtures are) already carries a full
+    // closure on its own lineage, so this pins that the shared marker logic
+    // hides the deleted base row for Esri readers under the legacy path too.
+    await load(buildHardDelete);
+    const res = await gdb.postVersion(VERSION, { trimPost: false });
+    const tip = res.newParentStateId;
+    expect(await tipOf(conn, DEFAULT)).toBe(tip);
+
+    expect(await countAt(conn,
+      `SELECT COUNT(*) AS n FROM dbo.base${REG_ID} WHERE OBJECTID = 300;`)).toBe(1);
+    expect(await countAt(conn, `
+      SELECT COUNT(*) AS n FROM dbo.D${REG_ID} d
+       WHERE d.SDE_DELETES_ROW_ID = 300 AND d.SDE_STATE_ID = 0
+         AND d.DELETED_AT IN (${closureSql(tip)});`)).toBe(1);
+
+    const esri = await esriVisible(conn, tip);
+    expect(esri.has(300)).toBe(false);
   });
 
   it('posting the same version twice is rejected and leaves DEFAULT unchanged', async () => {
