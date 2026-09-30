@@ -269,6 +269,8 @@ export class EnterpriseTable {
     const countResult = await this.connection.query<{ cnt: number }>(countSql);
     const featureCount = countResult[0]?.cnt ?? 0;
 
+    const srid = await this.lookupSrid();
+
     this._metadata = {
       name: this.tableInfo.name,
       physicalName: this.tableInfo.physicalName,
@@ -278,7 +280,48 @@ export class EnterpriseTable {
       isFeatureClass: this.tableInfo.isFeatureClass,
       geometryType,
       shapeFieldName: this.tableInfo.shapeFieldName,
+      spatialReference: srid !== undefined ? { srid } : undefined,
     };
+  }
+
+  /**
+   * Find the SRID the shape column is stored in, or undefined if it cannot
+   * be determined. Spatial predicates only match geometries with the same
+   * SRID, so callers need the real value rather than a guess.
+   *
+   * SQL Server: SDE keeps its own spatial reference ids, so the catalog id is
+   * translated to the real SRID through SDE_spatial_references. Views and
+   * tables with no catalog row fall back to reading one stored shape.
+   */
+  private async lookupSrid(): Promise<number | undefined> {
+    const shapeField = this.tableInfo.shapeFieldName;
+    if (!shapeField) return undefined;
+    const isSqlServer = this.connection.driver === 'sqlserver';
+
+    const catalogSql = isSqlServer
+      ? `SELECT TOP 1 sr.auth_srid AS srid
+         FROM sde.SDE_geometry_columns gc
+         JOIN sde.SDE_spatial_references sr ON sr.srid = gc.srid
+         WHERE UPPER(gc.f_table_schema) = UPPER(@p0) AND UPPER(gc.f_table_name) = UPPER(@p1)`
+      : `SELECT srid FROM geometry_columns WHERE f_table_schema = $1 AND f_table_name = $2 LIMIT 1`;
+    const sampleSql = isSqlServer
+      ? `SELECT TOP 1 ${this.quoteId(shapeField)}.STSrid AS srid FROM ${this.qualifiedTableName} WHERE ${this.quoteId(shapeField)} IS NOT NULL`
+      : `SELECT ST_SRID(${this.quoteId(shapeField)}) AS srid FROM ${this.qualifiedTableName} WHERE ${this.quoteId(shapeField)} IS NOT NULL LIMIT 1`;
+
+    const attempts: Array<[string, unknown[]?]> = [
+      [catalogSql, [this.tableInfo.schema, this.tableInfo.name]],
+      [sampleSql],
+    ];
+    for (const [sql, params] of attempts) {
+      try {
+        const rows = await this.connection.query<{ srid: number | string | null }>(sql, params);
+        const srid = Number(rows[0]?.srid);
+        if (Number.isInteger(srid) && srid > 0) return srid;
+      } catch {
+        // This source is not available here; try the next one.
+      }
+    }
+    return undefined;
   }
 
   /**
@@ -542,14 +585,41 @@ export class EnterpriseTable {
   // ============================================================
 
   /**
+   * Pick the SRID for a spatial query geometry. A geometry with a different
+   * SRID than the shape column never matches (SQL Server returns NULL, so the
+   * query returns nothing with no error), so a wrong or unknown SRID is an
+   * error instead of a silent empty result.
+   */
+  private resolveQuerySrid(requested: number | undefined): number {
+    const tableSrid = this._metadata?.spatialReference?.srid;
+    const srid = requested ?? tableSrid;
+    if (srid === undefined) {
+      throw new Error(
+        `Cannot perform spatial query on table ${this.name}: the table's SRID could not be determined. `
+        + 'Pass an srid with the query geometry.'
+      );
+    }
+    if (!Number.isInteger(srid) || srid <= 0) {
+      throw new Error(`Cannot perform spatial query on table ${this.name}: invalid srid ${srid}.`);
+    }
+    if (tableSrid !== undefined && srid !== tableSrid) {
+      throw new Error(
+        `Cannot perform spatial query on table ${this.name}: query geometry srid ${srid} `
+        + `does not match the table's srid ${tableSrid}.`
+      );
+    }
+    return srid;
+  }
+
+  /**
    * Convert a spatial query geometry to SQL expression
    */
   private geometryToSqlExpr(geom: SpatialQueryGeometry): string {
     const driver = this.connection.driver;
+    const srid = this.resolveQuerySrid(geom.srid);
 
     // Handle WKT input
     if ('wkt' in geom) {
-      const srid = geom.srid ?? 0;
       return driver === 'sqlserver'
         ? `geometry::STGeomFromText('${geom.wkt}', ${srid})`
         : `ST_GeomFromText('${geom.wkt}', ${srid})`;
@@ -558,7 +628,6 @@ export class EnterpriseTable {
     // Handle envelope (bounding box) input
     if ('envelope' in geom) {
       const [minX, minY, maxX, maxY] = geom.envelope;
-      const srid = geom.srid ?? 0;
       const wkt = `POLYGON((${minX} ${minY}, ${maxX} ${minY}, ${maxX} ${maxY}, ${minX} ${maxY}, ${minX} ${minY}))`;
       return driver === 'sqlserver'
         ? `geometry::STGeomFromText('${wkt}', ${srid})`
@@ -567,7 +636,6 @@ export class EnterpriseTable {
 
     // Handle WKB input
     if ('wkb' in geom) {
-      const srid = geom.srid ?? 0;
       const hex = geom.wkb.toString('hex');
       return driver === 'sqlserver'
         ? `geometry::STGeomFromWKB(0x${hex}, ${srid})`
@@ -577,7 +645,6 @@ export class EnterpriseTable {
     // Handle GeoJSON geometry
     // Note: WKT is safe to embed directly since geometryToWkt only outputs
     // numeric coordinates - no user strings that could contain SQL injection
-    const srid = geom.srid ?? 0;
     const wkt = geometryToWkt(geom);
     return driver === 'sqlserver'
       ? `geometry::STGeomFromText('${wkt}', ${srid})`
