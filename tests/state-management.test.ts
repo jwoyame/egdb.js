@@ -67,14 +67,14 @@ function makeMock(opts: MockOptions = {}): {
     async executeInsert() {
       return [];
     },
-    async beginTransaction() {
+    async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+      if (_inTransaction) return fn();
       _inTransaction = true;
-    },
-    async commitTransaction() {
-      _inTransaction = false;
-    },
-    async rollbackTransaction() {
-      _inTransaction = false;
+      try {
+        return await fn();
+      } finally {
+        _inTransaction = false;
+      }
     },
     inTransaction() {
       return _inTransaction;

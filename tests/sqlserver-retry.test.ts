@@ -1,5 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { classifyConnError, SqlServerConnection } from '../src/connections/sqlserver';
+import { FakeDb, attachFakePool, sleep } from './helpers/fake-mssql';
+
+// Transactions go through the real withTransaction code on a fake driver.
+vi.mock('mssql', async () => (await import('./helpers/fake-mssql')).mockModule);
 
 // A live pool/request is faked so we can exercise the retry routing without a
 // real SQL Server. `connected: true` keeps reestablishIfDown a no-op (it won't
@@ -115,15 +119,34 @@ describe('SqlServerConnection retry routing', () => {
     expect(calls).toBe(1);
   });
 
-  it('does NOT retry a read while a transaction is open', async () => {
+  it("does NOT retry the owner's read on its open transaction", async () => {
     const conn = makeConn();
-    injectPool(conn, async () => ({ recordset: [] }));
     let calls = 0;
-    (conn as unknown as { transaction: unknown }).transaction = {
-      request: () => makeRequest(async () => { calls++; throw connErr; }),
-    };
-    await expect(conn.query('SELECT 1')).rejects.toBeTruthy();
+    attachFakePool(conn, new FakeDb(async () => { calls++; throw connErr; }));
+    await expect(conn.withTransaction(() => conn.query('SELECT 1'))).rejects.toBeTruthy();
     expect(calls).toBe(1);
+  });
+
+  it("retries a non-owner's pooled read while another caller's transaction is open", async () => {
+    const conn = makeConn();
+    let pooledCalls = 0;
+    attachFakePool(conn, new FakeDb(async (sqlText, { tx }) => {
+      if (tx || sqlText !== 'SELECT pooled') return { recordset: [] };
+      pooledCalls++;
+      if (pooledCalls === 1) throw connErr;
+      return { recordset: [{ ok: 1 }] };
+    }));
+    let release!: () => void;
+    const open = conn.withTransaction(async () => {
+      await conn.query('SELECT in_tx');
+      await new Promise<void>((resolve) => { release = resolve; });
+    });
+    await sleep(5);
+    const rows = await conn.query('SELECT pooled');
+    release();
+    await open;
+    expect(rows).toEqual([{ ok: 1 }]);
+    expect(pooledCalls).toBe(2);
   });
 
   it('does NOT retry a read on a real SQL error', async () => {
@@ -136,40 +159,62 @@ describe('SqlServerConnection retry routing', () => {
 });
 
 describe('withStatementTimeout (edit fast-fail)', () => {
-  // The timeout only applies to IN-TRANSACTION statements (exclusively the
-  // lock-holding operation's own), so tests inject a transaction whose request()
-  // returns the controllable request -- matching how a merge runs its writes.
-  function injectTx(conn: SqlServerConnection, req: unknown) {
-    (conn as unknown as { pool: unknown }).pool = { connected: true, request: () => req, close: async () => {} };
-    (conn as unknown as { transaction: unknown }).transaction = { request: () => req };
+  // The timeout only applies to statements the caller runs on its OWN open
+  // transaction, so these tests run them inside withTransaction on the fake
+  // driver -- matching how a merge runs its writes.
+  function hangingDb(onRequest?: (canceled: () => boolean) => void): FakeDb {
+    return new FakeDb(async (sqlText, { request }) => {
+      onRequest?.(() => request.canceled);
+      if (sqlText.includes('HANG')) return request.cancelable(new Promise(() => {}));
+      return { recordset: [], rowsAffected: [1] };
+    });
   }
 
   it('cancels a slow in-transaction statement and rejects ~timeout with ETIMEOUT', async () => {
     const conn = makeConn();
-    let canceled = false;
-    const hangingReq = { input() { return this; }, query: () => new Promise(() => {}), cancel: () => { canceled = true; } };
-    injectTx(conn, hangingReq);
+    let canceled = () => false;
+    const db = hangingDb((c) => { canceled = c; });
+    attachFakePool(conn, db);
     const t = Date.now();
-    const err = await conn.withStatementTimeout(150, () => conn.execute('UPDATE x SET y=1')).catch((e) => e);
+    const err = await conn.withStatementTimeout(150, () =>
+      conn.withTransaction(() => conn.execute('UPDATE x SET y=1 HANG')),
+    ).catch((e) => e);
     const elapsed = Date.now() - t;
-    expect(canceled).toBe(true);
+    expect(canceled()).toBe(true);
     expect((err as { code?: string }).code).toBe('ETIMEOUT');
     expect(elapsed).toBeGreaterThanOrEqual(140);
     expect(elapsed).toBeLessThan(1000);
+    expect(db.transactions[0]!.state).toBe('rolledback');
   });
 
-  it('does NOT time out a fast statement, and clears the override after', async () => {
+  it('does NOT time out a fast statement, and applies only inside its callback', async () => {
     const conn = makeConn();
-    const fastReq = { input() { return this; }, query: async () => ({ rowsAffected: [1] }), cancel: () => {} };
-    injectTx(conn, fastReq);
-    const r = await conn.withStatementTimeout(150, () => conn.execute('UPDATE x SET y=1'));
+    let canceled = () => false;
+    attachFakePool(conn, hangingDb((c) => { canceled = c; }));
+    const r = await conn.withStatementTimeout(150, () =>
+      conn.withTransaction(() => conn.execute('UPDATE x SET y=1')),
+    );
     expect(r.rowsAffected).toBe(1);
-    // Override cleared: a later slow op is not canceled.
-    let canceled = false;
-    const laterReq = { input() { return this; }, query: async () => ({ rowsAffected: [0] }), cancel: () => { canceled = true; } };
-    injectTx(conn, laterReq);
-    await conn.execute('UPDATE x SET y=2');
-    expect(canceled).toBe(false);
+    // Outside the callback no timeout applies: a slower statement is not canceled.
+    attachFakePool(conn, new FakeDb(async () => { await sleep(200); return { rowsAffected: [0] }; }));
+    await conn.withTransaction(() => conn.execute('UPDATE x SET y=2'));
+    expect(canceled()).toBe(false);
+  });
+
+  it("does NOT arm another concurrent caller's statements", async () => {
+    const conn = makeConn();
+    attachFakePool(conn, new FakeDb(async (sqlText) => {
+      if (sqlText.includes('SLOW')) await sleep(120);
+      return { rowsAffected: [1] };
+    }));
+    // The timed caller's scope stays open while the other caller's slow
+    // in-transaction statement runs.
+    const timed = conn.withStatementTimeout(60, async () => { await sleep(250); });
+    const untimed = (async () => {
+      await sleep(5);
+      return conn.withTransaction(() => conn.execute('UPDATE b SET y=1 SLOW'));
+    })();
+    await expect(Promise.all([timed, untimed])).resolves.toHaveLength(2);
   });
 
   it('does NOT cancel a POOLED (concurrent) statement even while a timeout is set', async () => {
@@ -178,7 +223,7 @@ describe('withStatementTimeout (edit fast-fail)', () => {
     let canceled = false;
     const pooledReq = { input() { return this; }, query: async () => ({ recordset: [{ n: 1 }] }), cancel: () => { canceled = true; } };
     (conn as unknown as { pool: unknown }).pool = { connected: true, request: () => pooledReq, close: async () => {} };
-    // transaction is NULL -> pooled path; even with a short timeout set, no cancel.
+    // No transaction -> pooled path; even with a short timeout set, no cancel.
     const rows = await conn.withStatementTimeout(10, () => conn.query('SELECT 1'));
     expect(rows).toEqual([{ n: 1 }]);
     expect(canceled).toBe(false);

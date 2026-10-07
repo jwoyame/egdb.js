@@ -145,19 +145,12 @@ export class EditSession {
 
     // State creation + lock acquisition must be atomic. Otherwise a crash
     // between the two leaves an unlocked child state that compress can reap.
-    const wasInTx = connection.inTransaction();
-    if (!wasInTx) await connection.beginTransaction();
-
-    let childStateId: number;
-    let sdeId: number;
-    try {
-      childStateId = await createChildState(connection, parentStateId);
-      sdeId = await acquireStateLock(connection, childStateId);
-      if (!wasInTx) await connection.commitTransaction();
-    } catch (error) {
-      if (!wasInTx) await connection.rollbackTransaction();
-      throw error;
-    }
+    // Joins the caller's transaction if it already owns one.
+    const { childStateId, sdeId } = await connection.withTransaction(async () => {
+      const childStateId = await createChildState(connection, parentStateId);
+      const sdeId = await acquireStateLock(connection, childStateId);
+      return { childStateId, sdeId };
+    });
 
     const session = new EditSession(geodatabase, connection, version, childStateId, parentStateId);
     session.stateLockSdeId = sdeId;
@@ -876,26 +869,23 @@ export class EditSession {
   async discard(): Promise<void> {
     this.ensureOpen();
 
-    const wasInTransaction = this.connection.inTransaction();
-    if (!wasInTransaction) await this.connection.beginTransaction();
-
     try {
-      const registeredTables = await this.getModifiedTableInfo();
+      // Joins the caller's transaction if it already owns one.
+      await this.connection.withTransaction(async () => {
+        const registeredTables = await this.getModifiedTableInfo();
 
-      // Release the lock (still inside this transaction) before deleteChildState
-      // tries to remove the state row. deleteChildState also defends with its own
-      // DELETE on SDE_state_locks, but releasing here first keeps state ownership
-      // semantics clean and avoids leaving a stale row if cleanup fails partway.
-      if (this.stateLockSdeId !== null) {
-        await releaseStateLock(this.connection, this.stateId, this.stateLockSdeId);
-      }
+        // Release the lock (still inside this transaction) before deleteChildState
+        // tries to remove the state row. deleteChildState also defends with its own
+        // DELETE on SDE_state_locks, but releasing here first keeps state ownership
+        // semantics clean and avoids leaving a stale row if cleanup fails partway.
+        if (this.stateLockSdeId !== null) {
+          await releaseStateLock(this.connection, this.stateId, this.stateLockSdeId);
+        }
 
-      await deleteChildState(this.connection, this.stateId, registeredTables);
-
-      if (!wasInTransaction) await this.connection.commitTransaction();
+        await deleteChildState(this.connection, this.stateId, registeredTables);
+      });
       this.stateLockSdeId = null;
     } catch (error) {
-      if (!wasInTransaction) await this.connection.rollbackTransaction();
       // Leave session 'open' so the caller can retry. Preserve the cause.
       throw new Error(
         `Failed to discard changes: ${error instanceof Error ? error.message : String(error)}`,

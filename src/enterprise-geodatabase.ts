@@ -96,6 +96,18 @@ export class PostLandedNothingError extends Error {
   }
 }
 
+/**
+ * True only for the specific error a driver throws when the SDE versions
+ * table/view itself doesn't exist -- the one case listVersions() treats as
+ * "this geodatabase has no versioning enabled" rather than a real failure.
+ * SQL Server: error 208 ("Invalid object name ..."). PostgreSQL: 42P01
+ * (undefined_table).
+ */
+function isMissingVersionsTableError(err: unknown, driver: 'sqlserver' | 'postgresql'): boolean {
+  const e = err as { number?: unknown; code?: unknown } | null | undefined;
+  return driver === 'sqlserver' ? e?.number === 208 : e?.code === '42P01';
+}
+
 export class EnterpriseGeodatabase {
   /** Version-lock acquisition timeout (milliseconds) */
   private static readonly LOCK_TIMEOUT_MS = 30000;
@@ -516,9 +528,14 @@ export class EnterpriseGeodatabase {
         createTime: row.creation_time,
         stateId: row.state_id != null ? Number(row.state_id) : undefined,
       }));
-    } catch {
-      // Not all geodatabases have versioning enabled
-      return [];
+    } catch (err) {
+      // Only "not all geodatabases have versioning enabled" (SDE_versions
+      // itself doesn't exist) resolves to an empty list. Anything else --
+      // a dropped connection, a transaction-ownership collision, a permissions
+      // error -- must propagate: getVersion/getVersionStateLineage and their
+      // callers would otherwise read a real failure as "version not found".
+      if (isMissingVersionsTableError(err, this.config.driver)) return [];
+      throw err;
     }
   }
 
@@ -640,9 +657,8 @@ export class EnterpriseGeodatabase {
       tableInfoByName.set(key, ti);
     }
 
-    const wasInTx = conn.inTransaction();
-    if (!wasInTx) await conn.beginTransaction();
-    try {
+    // Joins the caller's transaction if it already owns one.
+    return conn.withTransaction(async () => {
       // Serialise against concurrent posts/reverts on this version; held to
       // commit/rollback. Then re-read the tip + parent INSIDE the lock (they may
       // have advanced since the pre-lock read) and validate before deleting.
@@ -655,10 +671,7 @@ export class EnterpriseGeodatabase {
 
       const ancestor = await findCommonAncestor(conn, version.stateId, parent.stateId);
       const childOnlyStates = await getStatesInRange(conn, version.stateId, ancestor);
-      if (childOnlyStates.length === 0) {
-        if (!wasInTx) await conn.commitTransaction();
-        return { reverted: 0, states: [] };
-      }
+      if (childOnlyStates.length === 0) return { reverted: 0, states: [] };
 
       // Refuse if any edit state is visible to another version (shared) or has a
       // fork off it. The fork branch also covers a concurrent edit session: a
@@ -684,12 +697,8 @@ export class EnterpriseGeodatabase {
           await removeFromDTable(conn, ti, f.objectId, stateId);
         }
       }
-      if (!wasInTx) await conn.commitTransaction();
       return { reverted: features.length, states: childOnlyStates };
-    } catch (e) {
-      if (!wasInTx) await conn.rollbackTransaction();
-      throw e;
-    }
+    });
   }
 
   /**
@@ -1085,7 +1094,7 @@ export class EnterpriseGeodatabase {
       // N9: reconcile writes A/D rows into the version's tip WITHOUT createChildState
       // and leaves no SDE_state_lock, so it would otherwise be invisible to compress's
       // pre-flight AND unblocked by the exclusive lock. Take the SHARED lock here
-      // (runApply always runs inside a transaction — caller's or the else-branch's).
+      // (runApply always runs inside a transaction — the caller's or its own).
       await acquireCompressLock(this.connection, 'Shared', EDITOR_SHARED_LOCK_TIMEOUT_MS);
       const result = await applyParentChanges(
         this.connection,
@@ -1099,29 +1108,8 @@ export class EnterpriseGeodatabase {
       return result;
     };
 
-    let appliedCount: number;
-    let mergedCount: number;
-    if (this.connection.inTransaction()) {
-      const r = await runApply();
-      appliedCount = r.appliedCount;
-      mergedCount = r.mergedCount;
-    } else {
-      await this.connection.beginTransaction();
-      try {
-        const r = await runApply();
-        appliedCount = r.appliedCount;
-        mergedCount = r.mergedCount;
-        await this.connection.commitTransaction();
-      } catch (error) {
-        try {
-          await this.connection.rollbackTransaction();
-        } catch (rollbackError) {
-          // Surface the original cause but log the rollback failure too.
-          console.error('reconcile rollback failed:', rollbackError);
-        }
-        throw error;
-      }
-    }
+    // Joins the caller's transaction if it already owns one.
+    const { appliedCount, mergedCount } = await this.connection.withTransaction(runApply);
 
     return {
       hasConflicts: summary.totalConflicts > 0,
@@ -1176,14 +1164,19 @@ export class EnterpriseGeodatabase {
     const parentFullName = version.parentName.includes('.')
       ? version.parentName
       : `sde.${version.parentName}`;
+    // Narrowed copy for use inside the transaction callback below.
+    const versionStateId = version.stateId;
 
     // Post is the only writer that mutates the parent's state pointer, so we
     // serialize concurrent posts to the same parent with an exclusive lock.
     // pg_advisory_xact_lock is transaction-scoped, so the lock + the work need
     // to share a transaction. sp_getapplock with @LockOwner='Transaction' has
-    // the same property, so the same shape works for both drivers.
-    await this.connection.beginTransaction();
-    try {
+    // the same property, so the same shape works for both drivers. Post always
+    // runs in its own transaction: it must commit before deleteVersionAfterPost.
+    if (this.connection.inTransaction()) {
+      throw new Error('postVersion() must not be called inside an open transaction.');
+    }
+    const { changesPosted, postTargetState } = await this.connection.withTransaction(async () => {
       // N9: SHARED compress lock first — post mutates the state tree (both the
       // trim-post createChildState path and the legacy repoint path), so it must
       // exclude a concurrent compress. Bounces if a compress is running.
@@ -1205,7 +1198,7 @@ export class EnterpriseGeodatabase {
       // longer a descendant of parent.stateId and we must abort.
       const reconciled = await isReconciled(
         this.connection,
-        version.stateId,
+        versionStateId,
         parent.stateId
       );
       if (!reconciled) {
@@ -1222,8 +1215,8 @@ export class EnterpriseGeodatabase {
       // ancestor and the version tip -- the same reliable range the reverse path
       // uses. (getChildUniqueStates was returning empty for some reconciled
       // versions, so changesPosted came back 0 even though the post landed.)
-      const ancestor = await findCommonAncestor(this.connection, version.stateId, parent.stateId);
-      const childStates = await getStatesInRange(this.connection, version.stateId, ancestor);
+      const ancestor = await findCommonAncestor(this.connection, versionStateId, parent.stateId);
+      const childStates = await getStatesInRange(this.connection, versionStateId, ancestor);
       const changesPosted = await countChangesInStates(this.connection, versionedTables, childStates);
 
       // Two post strategies:
@@ -1339,7 +1332,7 @@ export class EnterpriseGeodatabase {
         postTargetState = newTip;
       } else {
         const versionsAdvanced = await updateVersionState(
-          this.connection, parent.owner, parent.name, version.stateId
+          this.connection, parent.owner, parent.name, versionStateId
         );
         // The actual landing guarantee: DEFAULT must have advanced. If 0 rows
         // matched, the edit did NOT publish -- fail loudly (and roll back)
@@ -1350,7 +1343,7 @@ export class EnterpriseGeodatabase {
             `(expected 1). The edit was NOT published.`
           );
         }
-        postTargetState = version.stateId;
+        postTargetState = versionStateId;
       }
 
       // Emit Esri-standard base-shadow delete markers for the rows this post
@@ -1367,29 +1360,26 @@ export class EnterpriseGeodatabase {
 
       // Lock auto-releases on commit (Postgres pg_advisory_xact_lock; SQL Server
       // sp_getapplock @LockOwner='Transaction'). No explicit unlock needed.
-      await this.connection.commitTransaction();
+      return { changesPosted, postTargetState };
+    });
 
-      // deleteVersion is reference-aware (native sde.delete_version keeps states
-      // still referenced by a version). Legacy post: DEFAULT now shares the
-      // version's own states, so those are kept and become DEFAULT's history.
-      // trimPost: DEFAULT points at a NEW state (newTip) and the version's edit
-      // states are only COUSINS of newTip (never its ancestors -- newTip
-      // branches from parent.stateId, the pre-post DEFAULT tip), so deleting the
-      // version can collect them WITHOUT affecting newTip's resolution -- the
-      // deltas were copied into newTip. (Runs outside the post txn; covered by
-      // the trimPost + deleteVersionAfterPost training case.)
-      if (options?.deleteVersionAfterPost) {
-        await this.deleteVersion(versionName);
-      }
-
-      return {
-        changesPosted,
-        newParentStateId: postTargetState,
-      };
-    } catch (error) {
-      await this.connection.rollbackTransaction();
-      throw error;
+    // deleteVersion is reference-aware (native sde.delete_version keeps states
+    // still referenced by a version). Legacy post: DEFAULT now shares the
+    // version's own states, so those are kept and become DEFAULT's history.
+    // trimPost: DEFAULT points at a NEW state (newTip) and the version's edit
+    // states are only COUSINS of newTip (never its ancestors -- newTip
+    // branches from parent.stateId, the pre-post DEFAULT tip), so deleting the
+    // version can collect them WITHOUT affecting newTip's resolution -- the
+    // deltas were copied into newTip. (Runs outside the post txn; covered by
+    // the trimPost + deleteVersionAfterPost training case.)
+    if (options?.deleteVersionAfterPost) {
+      await this.deleteVersion(versionName);
     }
+
+    return {
+      changesPosted,
+      newParentStateId: postTargetState,
+    };
   }
 
   /**
@@ -1480,7 +1470,7 @@ export class EnterpriseGeodatabase {
    * spawning a parallel state); the parent + ancestor state sets are walked IN-SQL
    * from their tip ids (no 10k-id IN-list) and the closure is seeded the same way
    * (no giant VALUES); CHUNK is 1000 (SQL Server's table-value-constructor limit);
-   * begin/commit/rollback honour the `wasInTx` pattern; an open EditSession on the
+   * it joins a transaction the caller already owns; an open EditSession on the
    * version (locked edit state off its tip) is detected and refused; the dry-run
    * labels are consistent (updates = A-rows replayed, deletes = delete markers).
    *
@@ -1636,11 +1626,11 @@ export class EnterpriseGeodatabase {
       );
     }
 
-    // Match the wasInTx pattern every other write path here uses: only own the
-    // transaction if the caller has not already opened one.
-    const wasInTx = this.connection.inTransaction();
-    if (!wasInTx) await this.connection.beginTransaction();
-    try {
+    // Narrowed copies for use inside the transaction callback below.
+    const fromStateId = version.stateId;
+    const parentStateId = parent.stateId;
+    // Joins the caller's transaction if it already owns one.
+    return this.connection.withTransaction(async () => {
       // N9: SHARED compress lock first -- a rebase mutates the state tree
       // (createChildState), so it must exclude a concurrent compress, exactly as
       // postVersion does. Bounces if a compress is running.
@@ -1655,9 +1645,9 @@ export class EnterpriseGeodatabase {
       // parent BEFORE the child, a fixed order, so two rebases can't deadlock.
       await this.lockVersion(parentFullName);
       const freshParent = await this.getVersion(parentFullName);
-      if (!freshParent || freshParent.stateId !== parent.stateId) {
+      if (!freshParent || freshParent.stateId !== parentStateId) {
         throw new Error(
-          `Parent ${parentFullName} moved from state ${parent.stateId} to ` +
+          `Parent ${parentFullName} moved from state ${parentStateId} to ` +
           `${freshParent?.stateId ?? 'missing'} while the rebase was being planned. ` +
           `Nothing was changed; re-run to rebase onto the new parent tip.`,
         );
@@ -1668,9 +1658,9 @@ export class EnterpriseGeodatabase {
       // save landing in between would otherwise be silently orphaned.
       await this.lockVersion(versionName);
       const fresh = await this.getVersion(versionName);
-      if (!fresh || fresh.stateId !== version.stateId) {
+      if (!fresh || fresh.stateId !== fromStateId) {
         throw new Error(
-          `Version ${versionName} moved from state ${version.stateId} to ` +
+          `Version ${versionName} moved from state ${fromStateId} to ` +
           `${fresh?.stateId ?? 'missing'} while the rebase was being planned. ` +
           `Nothing was changed; re-run to pick up the new edits.`,
         );
@@ -1691,7 +1681,7 @@ export class EnterpriseGeodatabase {
           : `SELECT COUNT(*) AS n FROM sde.sde_state_locks l
                JOIN sde.sde_states s ON s.state_id = l.state_id
               WHERE s.parent_state_id = $1`,
-        [version.stateId],
+        [fromStateId],
       );
       if (Number(openEdits[0]?.n ?? 0) > 0) {
         throw new Error(
@@ -1700,7 +1690,7 @@ export class EnterpriseGeodatabase {
         );
       }
 
-      const newState = await createChildState(this.connection, parent.stateId);
+      const newState = await createChildState(this.connection, parentStateId);
       // SDE_state_new_edit locks the new state; this state becomes the version's
       // permanent tip, so clear the lock (same reasoning as trim post).
       await this.connection.execute(
@@ -1726,7 +1716,7 @@ export class EnterpriseGeodatabase {
       // seed the closure from the parent's PARENT-WALK ancestry (not its closure,
       // which may itself be divergent) plus base and the new state.
       const driver = this.connection.driver;
-      const parentLineage = await getLineageName(this.connection, parent.stateId);
+      const parentLineage = await getLineageName(this.connection, parentStateId);
       const procLineage = await getLineageName(this.connection, newState);
       const lineage = newState; // SDE convention: a lineage is named by its root state.
       if (procLineage !== lineage) {
@@ -1780,7 +1770,7 @@ export class EnterpriseGeodatabase {
              SELECT $1, src.s FROM (SELECT s FROM anc UNION SELECT 0 UNION SELECT $3) src
              WHERE NOT EXISTS (SELECT 1 FROM sde.sde_state_lineages sl
                                WHERE sl.lineage_name = $1 AND sl.lineage_id = src.s)`,
-        [lineage, parent.stateId, newState],
+        [lineage, parentStateId, newState],
       );
 
       const replayed: Array<{ table: string; updates: number; deletes: number }> = [];
@@ -1812,7 +1802,7 @@ export class EnterpriseGeodatabase {
       }
 
       const moved = await updateVersionState(
-        this.connection, version.owner, version.name, newState, version.stateId,
+        this.connection, version.owner, version.name, newState, fromStateId,
       );
       if (moved !== 1) {
         throw new Error(
@@ -1822,20 +1812,16 @@ export class EnterpriseGeodatabase {
       }
 
       // (Closure was seeded authoritatively above, before the replay.)
-      if (!wasInTx) await this.connection.commitTransaction();
       return {
         version: `${version.owner}.${version.name}`,
-        fromState: version.stateId,
+        fromState: fromStateId,
         toState: newState,
         replayed,
         droppedRedundant,
         conflicts: allConflicts,
         dryRun: false,
       };
-    } catch (error) {
-      if (!wasInTx) await this.connection.rollbackTransaction();
-      throw error;
-    }
+    });
   }
 
 
@@ -1993,22 +1979,15 @@ export class EnterpriseGeodatabase {
       const graduableSnapshot = await computeGraduablePrefix(this.connection);
       for (const t of tables) {
         holder.assertHeld(); // graduate writes BASE (irreversible) — confirm the exclusive lock per table
-        const wasInTx = this.connection.inTransaction();
-        if (!wasInTx) await this.connection.beginTransaction({ isolation: 'serializable' });
-        try {
-          const r = await graduateTable(this.connection, t, graduableSnapshot, columnCache);
-          if (!wasInTx) await this.connection.commitTransaction();
-          graduationByTable.push(r);
-          graduatedUpserts += r.upserts;
-          graduatedDeletes += r.deletes;
-          totalAddsRemoved += r.aRowsRemoved;
-          totalDeletesRemoved += r.dRowsRemoved;
-        } catch (e) {
-          if (!wasInTx && this.connection.inTransaction()) {
-            await this.connection.rollbackTransaction();
-          }
-          throw e;
-        }
+        const r = await this.connection.withTransaction(
+          () => graduateTable(this.connection, t, graduableSnapshot, columnCache),
+          { isolation: 'serializable' },
+        );
+        graduationByTable.push(r);
+        graduatedUpserts += r.upserts;
+        graduatedDeletes += r.deletes;
+        totalAddsRemoved += r.aRowsRemoved;
+        totalDeletesRemoved += r.dRowsRemoved;
       }
     }
 
@@ -2144,7 +2123,9 @@ export class EnterpriseGeodatabase {
   // ============================================================
 
   /**
-   * Check if currently in a transaction
+   * True when the caller is inside a transaction() or editTransaction()
+   * callback on this geodatabase. A transaction opened by another concurrent
+   * caller on the same connection reports false.
    */
   inTransaction(): boolean {
     return this.connection.inTransaction();
@@ -2152,7 +2133,9 @@ export class EnterpriseGeodatabase {
 
   /**
    * Execute operations within a database transaction.
-   * Auto-commits on success, rolls back on error.
+   * Auto-commits on success, rolls back on error. Only work done from inside
+   * `fn` (anything it awaits or starts) runs in the transaction; concurrent
+   * callers on the same connection keep running outside it.
    *
    * @example
    * ```typescript
@@ -2165,20 +2148,8 @@ export class EnterpriseGeodatabase {
    * ```
    */
   async transaction<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.connection.inTransaction()) {
-      // Already in a transaction, just execute the function
-      return fn();
-    }
-
-    await this.connection.beginTransaction();
-    try {
-      const result = await fn();
-      await this.connection.commitTransaction();
-      return result;
-    } catch (error) {
-      await this.connection.rollbackTransaction();
-      throw error;
-    }
+    // Joins the caller's transaction if it already owns one.
+    return this.connection.withTransaction(fn);
   }
 
   /**
@@ -2223,43 +2194,40 @@ export class EnterpriseGeodatabase {
     versionName: string,
     fn: (session: EditSession) => Promise<T>
   ): Promise<T> {
-    const alreadyInTransaction = this.connection.inTransaction();
     // Phase timing. Date.now() (ms) is plenty to catch a multi-second stall.
     const t0 = Date.now();
     let tBegin = t0, tSessionStart = t0, tWrites = t0, tSave = t0;
     let phase = 'begin';
     let phaseStart = t0; // when the current phase began, for the error log
 
-    if (!alreadyInTransaction) {
-      await this.connection.beginTransaction();
-    }
-    tBegin = Date.now();
-    phaseStart = tBegin;
-
     try {
-      // Create edit session (writes directly to A/D tables)
-      // Note: We don't call startEditing/stopEditing here because:
-      // 1. EditSession writes directly to A/D tables without needing sde.edit_version
-      // 2. sde.edit_version may interfere with our explicit transaction management
-      phase = 'session-start'; phaseStart = Date.now(); // createChildState (SDE_state_new_edit)
-      const session = await EditSession.start(this, versionName);
-      tSessionStart = Date.now();
+      // Joins the caller's transaction if it already owns one; that one then
+      // commits when the caller's own callback ends.
+      const result = await this.connection.withTransaction(async () => {
+        tBegin = Date.now();
 
-      // Execute user code
-      phase = 'writes'; phaseStart = tSessionStart;
-      const result = await fn(session);
-      tWrites = Date.now();
+        // Create edit session (writes directly to A/D tables)
+        // Note: We don't call startEditing/stopEditing here because:
+        // 1. EditSession writes directly to A/D tables without needing sde.edit_version
+        // 2. sde.edit_version may interfere with our explicit transaction management
+        phase = 'session-start'; phaseStart = tBegin; // createChildState (SDE_state_new_edit)
+        const session = await EditSession.start(this, versionName);
+        tSessionStart = Date.now();
 
-      // Save and close session
-      phase = 'save'; phaseStart = tWrites;
-      await session.save();
-      await session.close();
-      tSave = Date.now();
+        // Execute user code
+        phase = 'writes'; phaseStart = tSessionStart;
+        const result = await fn(session);
+        tWrites = Date.now();
 
-      phase = 'commit'; phaseStart = tSave;
-      if (!alreadyInTransaction) {
-        await this.connection.commitTransaction();
-      }
+        // Save and close session
+        phase = 'save'; phaseStart = tWrites;
+        await session.save();
+        await session.close();
+        tSave = Date.now();
+
+        phase = 'commit'; phaseStart = tSave;
+        return result;
+      });
       const tCommit = Date.now();
 
       const total = tCommit - t0;
@@ -2274,27 +2242,14 @@ export class EnterpriseGeodatabase {
       return result;
     } catch (error) {
       // Log where it got to before failing, with partial phase timings, so a
-      // fail-fast/timeout stall names the hung phase.
+      // fail-fast/timeout stall names the hung phase. withTransaction has
+      // already rolled back (or the commit itself failed).
       const now = Date.now();
       console.warn(
         `[egdb] editTransaction FAILED version=${versionName} phase=${phase} ` +
         `inPhase=${now - phaseStart}ms total=${now - t0}ms ` +
         `err=${(error as Error)?.message?.slice(0, 80) ?? String(error)}`
       );
-      // Roll back only if a transaction is still open. A request-timeout on the
-      // COMMIT statement leaves commitTransaction having already cleared its
-      // transaction slot, so a blind rollbackTransaction() would throw "No
-      // transaction in progress" and MASK the original timeout error (which the
-      // caller needs to classify as a connection blip). Guarding on
-      // inTransaction() lets the real error propagate; a failed rollback is
-      // likewise swallowed so it can't mask the original error either.
-      if (!alreadyInTransaction && this.connection.inTransaction()) {
-        try {
-          await this.connection.rollbackTransaction();
-        } catch {
-          // ignore - propagate the original error below
-        }
-      }
       throw error;
     }
   }

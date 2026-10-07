@@ -60,8 +60,8 @@ The lesser issues are now fixed and pinned too: re-run is idempotent (an
 already-rebased version no-ops instead of spawning a parallel state); the parent
 and ancestor state sets are walked IN-SQL from their tip ids and the closure is
 seeded the same way (no 10k-id IN-list, no giant VALUES — pinned by a 1500-state
-scale test); CHUNK is 1000 (SQL Server's TVC limit); begin/commit/rollback honour
-`wasInTx`; an open EditSession on the version is detected and refused.
+scale test); CHUNK is 1000 (SQL Server's TVC limit); it joins a transaction the caller
+already owns; an open EditSession on the version is detected and refused.
 
 Remaining before ungating: a **real-fabric (training-clone) run** of the whole
 chain (rebase → post → compress). This needs the parcel-DB port-forward up AND

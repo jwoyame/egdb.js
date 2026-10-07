@@ -45,9 +45,9 @@ function makeMockConnection(state: MockState): IDatabaseConnection {
     async scalar() { return null; },
     async execute(): Promise<ExecuteResult> { return { rowsAffected: 0 }; },
     async executeInsert() { return []; },
-    async beginTransaction() {},
-    async commitTransaction() {},
-    async rollbackTransaction() {},
+    async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+      return fn();
+    },
     inTransaction() { return false; },
   };
 }

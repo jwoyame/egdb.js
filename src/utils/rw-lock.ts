@@ -1,25 +1,18 @@
 /**
  * A small async readers-writer lock.
  *
- * Why this exists: a connection wraps ONE driver-level transaction slot (mssql
- * `this.transaction`, pg `this.transactionClient`). While a transaction is open,
- * every statement on that connection routes through it, so two overlapping
- * operations collide on a single physical request. A server that shares one
- * connection across many users (e.g. one SDE login for all app users) therefore
- * needs to guarantee that a transaction has the connection to itself.
- *
- * Reads can run together (they go to the pool, not the transaction), so they
- * take the lock in SHARED mode; a transaction takes it EXCLUSIVELY for its whole
- * lifetime (begin..commit/rollback). Streaming reads run on their own dedicated
- * pooled connection and don't take the lock at all.
+ * The connections use only the exclusive (write) mode, to allow one open
+ * transaction at a time in their single transaction slot (see
+ * SqlServerConnection.txLock). Statements that don't own the transaction run on
+ * the pool and don't take the lock.
  *
  * Fairness: a waiting writer blocks newly-arriving readers (no writer
  * starvation), while consecutive queued readers are granted together.
  *
- * Not reentrant: the transaction owner must NOT re-acquire while holding the
- * write lock (that would self-deadlock on the non-reentrant exclusive grant).
- * Callers already guard begin with an `inTransaction()` check, and the owner's
- * own statements bypass the lock because they detect the open transaction.
+ * Not reentrant: a holder must NOT re-acquire while holding the write lock
+ * (that would self-deadlock on the non-reentrant exclusive grant).
+ * withTransaction() avoids this by joining a transaction the caller already
+ * owns instead of acquiring again.
  */
 
 interface Waiter {

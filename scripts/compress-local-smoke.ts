@@ -137,10 +137,8 @@ async function danglingCount(conn: IDatabaseConnection): Promise<number> {
   console.log(`graduable prefix size: ${prefix.size}`);
   let gUps = 0, gDel = 0, gA = 0;
   for (const t of versioned) {
-    const wasTx = conn.inTransaction();
-    if (!wasTx) await conn.beginTransaction({ isolation: 'serializable' });
-    try { const r = await graduateTable(conn, t, prefix); if (!wasTx) await conn.commitTransaction(); gUps += r.upserts; gDel += r.deletes; gA += r.aRowsRemoved; }
-    catch (e) { if (!wasTx && conn.inTransaction()) await conn.rollbackTransaction(); throw e; }
+    const r = await conn.withTransaction(() => graduateTable(conn, t, prefix), { isolation: 'serializable' });
+    gUps += r.upserts; gDel += r.deletes; gA += r.aRowsRemoved;
   }
   console.log(`graduate: ${gUps} base upserts, ${gDel} base deletes, ${gA} a-rows graduated [${secs(t)}]`);
   await check('after graduate', baseline);

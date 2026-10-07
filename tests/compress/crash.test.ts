@@ -73,8 +73,8 @@ d('compress crash-safety (DB-backed)', () => {
         threw = true;
       }
       expect(threw, `expected an injected crash at step ${k}`).toBe(true);
-      // The client "died": abort whatever transaction it left open (the DB would).
-      if (conn.inTransaction()) await conn.rollbackTransaction();
+      // The client "died": withTransaction already rolled back any transaction
+      // the crash interrupted, as the DB would on disconnect.
 
       // Recovery: a fresh compress run must complete and lose/gain nothing.
       await dbCompress(conn);

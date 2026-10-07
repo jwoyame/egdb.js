@@ -84,6 +84,9 @@ export async function acquireCompressLock(
   }
 }
 
+// Thrown inside the holder's transaction callback to end it with a rollback.
+const END_HOLD = Symbol('end compress lock hold');
+
 /**
  * Holds the compress EXCLUSIVE lock for the WHOLE compress run on a DEDICATED
  * connection, via an open (empty) transaction — because compress is many separate
@@ -94,12 +97,21 @@ export async function acquireCompressLock(
  * ~50 min can be dropped by an RDS/TCP idle timeout, which auto-releases the lock;
  * `assertHeld()` (called between phases) then aborts the run rather than letting it
  * proceed with no lock. The tx-scoped lock also auto-releases on crash (self-heal).
+ *
+ * The transaction lives inside one withTransaction() callback that runs from
+ * acquire() until release(). The ping runs inside that callback, so it is the
+ * transaction's owner and runs on the held session. release() ends the
+ * callback, which rolls the transaction back, and only then closes the
+ * connection.
  */
 export class CompressLockHolder {
-  private timer: ReturnType<typeof setInterval> | null = null;
   private lost = false;
   private lostReason = '';
   private released = false;
+  // Ends the keep-alive wait early (set while it waits).
+  private wake: (() => void) | null = null;
+  // Settles when the holding transaction has ended.
+  private session: Promise<void> = Promise.resolve();
 
   private constructor(private readonly conn: IDatabaseConnection) {}
 
@@ -107,22 +119,43 @@ export class CompressLockHolder {
    * session pool). Throws ApplockTimeoutError if it can't be acquired within
    * `timeoutMs` (→ caller defers); closes the connection on any failure. */
   static async acquire(dedicatedConn: IDatabaseConnection, timeoutMs: number, keepAliveMs = 10000): Promise<CompressLockHolder> {
-    await dedicatedConn.beginTransaction();
+    const holder = new CompressLockHolder(dedicatedConn);
+    let signalHeld!: () => void;
+    const held = new Promise<void>((resolve) => { signalHeld = resolve; });
+    holder.session = dedicatedConn
+      .withTransaction(async () => {
+        await acquireCompressLock(dedicatedConn, 'Exclusive', timeoutMs);
+        signalHeld();
+        await holder.keepAlive(keepAliveMs);
+        throw END_HOLD;
+      })
+      .catch((e: unknown) => {
+        if (e !== END_HOLD) throw e;
+      });
     try {
-      await acquireCompressLock(dedicatedConn, 'Exclusive', timeoutMs);
+      // The session only settles before `held` if acquiring the lock failed.
+      await Promise.race([held, holder.session]);
     } catch (e) {
-      try { if (dedicatedConn.inTransaction()) await dedicatedConn.rollbackTransaction(); } catch { /* ignore */ }
       try { await dedicatedConn.close(); } catch { /* ignore */ }
       throw e;
     }
-    const holder = new CompressLockHolder(dedicatedConn);
-    holder.timer = setInterval(() => { void holder.ping(); }, keepAliveMs);
-    (holder.timer as { unref?: () => void }).unref?.(); // don't keep the process alive
     return holder;
   }
 
+  // Ping every `intervalMs` until released or the connection is found dead.
+  private async keepAlive(intervalMs: number): Promise<void> {
+    while (!this.released && !this.lost) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, intervalMs);
+        (timer as { unref?: () => void }).unref?.(); // don't keep the process alive
+        this.wake = () => { clearTimeout(timer); resolve(); };
+      });
+      this.wake = null;
+      if (!this.released) await this.ping();
+    }
+  }
+
   private async ping(): Promise<void> {
-    if (this.lost || this.released) return;
     try {
       await this.conn.query('SELECT 1 AS ka'); // runs on the tx-pinned session; keeps TCP warm + detects death
     } catch (e) {
@@ -137,10 +170,12 @@ export class CompressLockHolder {
     if (this.lost) throw new Error(`compress exclusive lock lost mid-run (dedicated connection died: ${this.lostReason}); aborting to avoid running unlocked.`);
   }
 
+  /** End the holding transaction (releasing the lock), then close the
+   * dedicated connection. */
   async release(): Promise<void> {
     this.released = true;
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
-    try { if (this.conn.inTransaction()) await this.conn.rollbackTransaction(); } catch { /* connection may be dead */ }
+    this.wake?.();
+    try { await this.session; } catch { /* connection may be dead */ }
     try { await this.conn.close(); } catch { /* ignore */ }
   }
 }

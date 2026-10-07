@@ -54,9 +54,9 @@ function makeMockConnection(opts: {
     async executeInsert() {
       return [];
     },
-    async beginTransaction() {},
-    async commitTransaction() {},
-    async rollbackTransaction() {},
+    async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+      return fn();
+    },
     inTransaction() {
       return false;
     },

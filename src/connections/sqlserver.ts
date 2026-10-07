@@ -2,11 +2,20 @@
  * SQL Server connection implementation
  */
 import sql from 'mssql';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { IDatabaseConnection, ExecuteResult } from './connection';
 import type { SqlServerConfig } from '../types';
 import { RwLock } from '../utils/rw-lock';
+import { ownsToken, runAsOwner } from './tx-ownership';
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const ignore = (): void => {};
+
+// Per-statement timeouts set by withStatementTimeout(), keyed by connection and
+// scoped to the call tree of the callback passed to it. Scoping by call tree
+// (not a field on the connection) keeps one caller's timeout from arming, or
+// being cleared by, another concurrent caller on the same connection.
+const statementTimeouts = new AsyncLocalStorage<ReadonlyMap<SqlServerConnection, number>>();
 
 /**
  * Classify a driver error so we can retry transient connection blips (a brief
@@ -45,66 +54,54 @@ export function classifyConnError(err: unknown): 'connection' | 'request-timeout
 export class SqlServerConnection implements IDatabaseConnection {
   private pool: sql.ConnectionPool | null = null;
   private config: sql.config;
+  // The open transaction, if any, and the token of the call tree that owns it
+  // (see tx-ownership.ts). Both are set together and cleared together.
   private transaction: sql.Transaction | null = null;
+  private txToken: object | null = null;
   // When true, this connection owns a PRIVATE ConnectionPool instead of mssql's
   // process-global one — so closing it doesn't close every other egdb connection.
   // Required for the compress exclusive-lock holder, which opens/closes its own
   // dedicated connection while the main connection stays live.
   private readonly dedicatedPool: boolean;
 
-  // Serialises the single `this.transaction` slot against concurrent
-  // statements: a transaction holds this exclusively for its whole lifetime,
-  // plain statements take it shared. The owner's own in-transaction statements
-  // bypass it (they detect `this.transaction`). Streaming reads use a dedicated
-  // pooled request and don't touch the lock. See utils/rw-lock.ts.
-  private lock = new RwLock();
+  // Allows one transaction at a time on this connection (used in write mode
+  // only). A second withTransaction() waits here until the first one ends.
+  // Statements from callers that don't own the transaction never wait on it:
+  // they run on their own pooled connection. That matters because an owner can
+  // await work a non-owner started (for example a shared openTable() load); if
+  // that work waited for the owner to finish, neither would ever finish.
+  private txLock = new RwLock();
 
-  // Optional per-statement timeout (ms) applied to execute/executeInsert/query
-  // requests when set (enforced by cancelling the request, since mssql has no
-  // per-request timeout). Lets an edit operation fail fast on a transient DB
-  // stall (e.g. a merge, which is normally sub-second) instead of waiting the
-  // full pool requestTimeout. Note: it does NOT cover streaming reads or the
-  // COMMIT statement (mssql builds its own request for tx.commit()), so a stall
-  // there still rides the pool default. Set via withStatementTimeout().
-  private statementTimeoutMs: number | null = null;
+  // Tail of the queue of statements on the open transaction. mssql allows one
+  // request at a time on a transaction and throws EREQINPROG otherwise, so the
+  // owner's own concurrent statements (e.g. a Promise.all inside the callback)
+  // and the final commit/rollback run one after another. Each entry settles
+  // only when its driver request settles, even if a statement timeout already
+  // rejected it, so a rollback never starts while a canceled request is still
+  // active.
+  private txTail: Promise<void> = Promise.resolve();
 
   readonly driver = 'sqlserver' as const;
 
   /**
    * Run `fn` with a per-statement timeout applied to this connection's
-   * IN-TRANSACTION execute/executeInsert/query requests (see runWithTimeout).
-   * Restores the previous value after.
-   *
-   * The timeout field is shared on the connection and this save/restore is NOT
-   * safe across concurrent callers that use DIFFERENT timeout values -- it
-   * assumes a single caller (today: the merge, always 12s). Because the timeout
-   * only arms for in-transaction statements and those run under the exclusive
-   * write lock, wrap ONLY the transaction (not preceding reads) so the armed
-   * window is exactly when this op owns the write path.
+   * IN-TRANSACTION execute/executeInsert/query requests made from `fn`'s call
+   * tree (see runWithTimeout). It does not cover streaming reads or the COMMIT
+   * statement, and it has no effect on pooled statements or on other callers.
    */
   async withStatementTimeout<T>(ms: number, fn: () => Promise<T>): Promise<T> {
-    const prev = this.statementTimeoutMs;
-    this.statementTimeoutMs = ms;
-    try {
-      return await fn();
-    } finally {
-      this.statementTimeoutMs = prev;
-    }
+    const next = new Map(statementTimeouts.getStore());
+    next.set(this, ms);
+    return statementTimeouts.run(next, fn);
   }
 
-  // Run a request with the active per-statement timeout, if one is set. mssql has
-  // no per-request timeout, so we enforce it by cancelling the request (an
-  // attention token) when the timer fires; that rejects `exec()` with a
-  // cancellation error, which classifyConnError treats as a request-timeout.
-  private async runWithTimeout<T>(request: sql.Request, exec: () => Promise<T>): Promise<T> {
-    const ms = this.statementTimeoutMs;
-    // Only enforce the timeout on statements running INSIDE our own transaction.
-    // The connection is shared per-connection-id across concurrent requests, and
-    // statementTimeoutMs is a shared field; if we also applied it to pooled
-    // statements, a merge's fast-fail timer could cancel an unrelated concurrent
-    // read. In-transaction statements run only while this operation holds the
-    // exclusive write lock, so they are exclusively ours -- safe to cancel.
-    if (ms == null || this.transaction == null) return exec();
+  // Race a driver request against the caller's statement timeout, if one is
+  // set. mssql has no per-request timeout, so we enforce it by cancelling the
+  // request (an attention token) when the timer fires and rejecting with an
+  // ETIMEOUT RequestError, which classifyConnError treats as a request-timeout.
+  private async runWithTimeout<T>(request: sql.Request, driverCall: Promise<T>): Promise<T> {
+    const ms = statementTimeouts.getStore()?.get(this);
+    if (ms == null) return driverCall;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
@@ -116,10 +113,31 @@ export class SqlServerConnection implements IDatabaseConnection {
       }, ms);
     });
     try {
-      return await Promise.race([exec(), timeout]);
+      return await Promise.race([driverCall, timeout]);
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  // Run one statement on the open transaction, after any earlier ones settle.
+  private runOnTransaction<T>(
+    tx: sql.Transaction,
+    params: unknown[] | undefined,
+    exec: (request: sql.Request) => Promise<T>,
+  ): Promise<T> {
+    const started = this.txTail.then(() => {
+      const request = tx.request();
+      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
+      const driverCall = exec(request);
+      return { driverCall, result: this.runWithTimeout(request, driverCall) };
+    });
+    this.txTail = started.then(({ driverCall }) => driverCall.then(ignore, ignore), ignore);
+    return started.then(({ result }) => result);
+  }
+
+  // The open transaction if the caller owns it, else null.
+  private ownedTransaction(): sql.Transaction | null {
+    return this.transaction !== null && ownsToken(this.txToken) ? this.transaction : null;
   }
 
   constructor(config: SqlServerConfig) {
@@ -182,17 +200,17 @@ export class SqlServerConnection implements IDatabaseConnection {
     }
   }
 
-  // Run an idempotent READ op, retrying ONCE through a transient connection blip.
-  // Only reads use this -- writes never auto-retry (a commit's ack can be lost,
-  // making a retry a double-apply). `retryRequestTimeout` is true for reads so a
-  // slow-then-timed-out read also retries. Never retries while a transaction is
-  // open: a lost connection there dooms the whole transaction and the caller must
-  // roll back and re-run it.
+  // Run an idempotent READ op on the pool, retrying ONCE through a transient
+  // connection blip. Only pooled reads use this -- writes never auto-retry (a
+  // commit's ack can be lost, making a retry a double-apply), and statements on
+  // a transaction never retry (a lost connection there dooms the whole
+  // transaction, and the caller must roll back and re-run it).
+  // `retryRequestTimeout` is true for reads so a slow-then-timed-out read also
+  // retries.
   private async withConnRetry<T>(op: () => Promise<T>, retryRequestTimeout: boolean): Promise<T> {
     try {
       return await op();
     } catch (err) {
-      if (this.transaction) throw err;
       const kind = classifyConnError(err);
       const retriable = kind === 'connection' || (retryRequestTimeout && kind === 'request-timeout');
       if (!retriable) throw err;
@@ -205,25 +223,24 @@ export class SqlServerConnection implements IDatabaseConnection {
   async query<T>(sqlQuery: string, params?: unknown[], opts?: { mutating?: boolean }): Promise<T[]> {
     if (!this.pool) throw new Error('Not connected');
 
-    // Inside our own transaction: run on it directly (we hold the write lock).
-    if (this.transaction) {
-      const request = this.transaction.request();
-      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await this.runWithTimeout(request, () => request.query(sqlQuery));
+    // Only the transaction's owner runs on it. Everyone else uses the pool.
+    const tx = this.ownedTransaction();
+    if (tx) {
+      const result = await this.runOnTransaction(tx, params, (request) => request.query(sqlQuery));
       return result.recordset as T[];
     }
     const op = async (): Promise<T[]> => {
       const request = this.pool!.request();
       if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await this.runWithTimeout(request, () => request.query(sqlQuery));
+      const result = await request.query(sqlQuery);
       return result.recordset as T[];
     };
     // A mutating call routed through query() -- an SDE stored proc like
     // create_version/delete_version/edit_version -- is not idempotent, so it must
     // NOT auto-retry (same reasoning as execute()). Callers pass mutating:true.
     // A plain read has no side effect and is safe to retry through a blip.
-    if (opts?.mutating) return this.lock.read(op);
-    return this.lock.read(() => this.withConnRetry(op, true));
+    if (opts?.mutating) return op();
+    return this.withConnRetry(op, true);
   }
 
   async *stream(
@@ -232,12 +249,11 @@ export class SqlServerConnection implements IDatabaseConnection {
   ): AsyncIterable<Record<string, unknown>> {
     if (!this.pool) throw new Error('Not connected');
 
-    // Always stream on a fresh pooled request, independent of any open
-    // transaction. A long generator driven by network backpressure must not
-    // sit on the transaction slot (it would collide with the owner) or on the
-    // RW lock (it would block writers for the stream's whole lifetime). Reads
-    // see committed data under READ COMMITTED; that's the same isolation the
-    // postgres driver's cursor stream uses.
+    // Always stream on a fresh pooled request, even for the transaction's
+    // owner. A long generator driven by network backpressure must not sit on
+    // the transaction (it would block the owner's other statements for the
+    // stream's whole lifetime). Reads see committed data under READ COMMITTED;
+    // that's the same isolation the postgres driver's cursor stream uses.
     const request = this.pool.request();
     request.stream = true;
 
@@ -345,19 +361,20 @@ export class SqlServerConnection implements IDatabaseConnection {
   async execute(sqlStatement: string, params?: unknown[]): Promise<ExecuteResult> {
     if (!this.pool) throw new Error('Not connected');
 
-    const run = async (request: sql.Request): Promise<ExecuteResult> => {
-      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await this.runWithTimeout(request, () => request.query(sqlStatement));
-      return { rowsAffected: result.rowsAffected.reduce((sum, n) => sum + n, 0) };
-    };
+    const toResult = (result: sql.IResult<unknown>): ExecuteResult => ({
+      rowsAffected: result.rowsAffected.reduce((sum, n) => sum + n, 0),
+    });
 
-    if (this.transaction) return run(this.transaction.request());
+    const tx = this.ownedTransaction();
+    if (tx) return toResult(await this.runOnTransaction(tx, params, (request) => request.query(sqlStatement)));
     // No auto-retry for a write. An autocommit INSERT/UPDATE/DELETE can commit on
     // the server and then have its ack lost (a socket reset arrives after the
     // commit), which is indistinguishable from "never ran" at the driver level -
     // so retrying could double-apply. The caller must decide whether re-running
     // is safe.
-    return this.lock.read(() => run(this.pool!.request()));
+    const request = this.pool.request();
+    if (params) params.forEach((p, i) => request.input(`p${i}`, p));
+    return toResult(await request.query(sqlStatement));
   }
 
   /**
@@ -367,10 +384,8 @@ export class SqlServerConnection implements IDatabaseConnection {
   async executeInsert(sqlStatement: string, params?: unknown[]): Promise<number[]> {
     if (!this.pool) throw new Error('Not connected');
 
-    const run = async (request: sql.Request): Promise<number[]> => {
-      if (params) params.forEach((p, i) => request.input(`p${i}`, p));
-      const result = await this.runWithTimeout(request, () => request.query(sqlStatement));
-      // Extract OBJECTID from recordset (OUTPUT INSERTED.OBJECTID)
+    // Extract OBJECTID from recordset (OUTPUT INSERTED.OBJECTID)
+    const toIds = (result: sql.IResult<Record<string, unknown>>): number[] => {
       if (result.recordset && result.recordset.length > 0) {
         return result.recordset.map((row: Record<string, unknown>) => {
           const id = row.OBJECTID ?? row.objectid ?? row.id ?? row.ID;
@@ -380,33 +395,70 @@ export class SqlServerConnection implements IDatabaseConnection {
       return [];
     };
 
-    if (this.transaction) return run(this.transaction.request());
+    const tx = this.ownedTransaction();
+    if (tx) return toIds(await this.runOnTransaction(tx, params, (request) => request.query<Record<string, unknown>>(sqlStatement)));
     // No auto-retry for a write (see execute()).
-    return this.lock.read(() => run(this.pool!.request()));
+    const request = this.pool.request();
+    if (params) params.forEach((p, i) => request.input(`p${i}`, p));
+    return toIds(await request.query<Record<string, unknown>>(sqlStatement));
   }
 
   /**
-   * Begin a transaction
+   * Run `fn` inside a transaction on this connection. Commits when `fn`
+   * resolves and rolls back when it rejects; the rejection is passed on and a
+   * rollback failure is ignored so it can't hide it.
+   *
+   * Only `fn`'s call tree owns the transaction (see tx-ownership.ts): its
+   * statements run on the transaction, while statements from any other caller
+   * on this connection keep using the pool. If the caller already owns an open
+   * transaction here, `fn` simply runs inside it (`options` is then ignored).
+   * Otherwise this waits until no other transaction is open on this connection.
    */
-  async beginTransaction(options?: { isolation?: 'serializable' }): Promise<void> {
+  async withTransaction<T>(fn: () => Promise<T>, options?: { isolation?: 'serializable' }): Promise<T> {
     if (!this.pool) throw new Error('Not connected');
-    // Guard re-entrant begin BEFORE taking the lock: the write lock is not
-    // reentrant, so an owner that re-begins would self-deadlock. Callers guard
-    // with inTransaction(); this is the last-resort check.
-    if (this.transaction) throw new Error('Transaction already in progress');
+    if (this.ownedTransaction()) return fn();
 
-    // Hold the connection exclusively for the whole transaction. Acquire the
-    // lock before assigning `this.transaction` so no reader observes it mid-open.
-    await this.lock.acquireWrite();
+    await this.txLock.acquireWrite();
+    let tx: sql.Transaction;
     try {
       const isoLevel = options?.isolation === 'serializable'
         ? sql.ISOLATION_LEVEL.SERIALIZABLE
         : undefined;
-      this.transaction = await this.beginWithRetry(isoLevel);
+      tx = await this.beginWithRetry(isoLevel);
     } catch (err) {
       // begin() failed — release the lock so the connection isn't stranded.
-      this.lock.releaseWrite();
+      this.txLock.releaseWrite();
       throw err;
+    }
+    const token = {};
+    this.transaction = tx;
+    this.txToken = token;
+    this.txTail = Promise.resolve();
+
+    let result: T;
+    try {
+      result = await runAsOwner(token, fn);
+    } catch (err) {
+      try { await this.endTransaction(tx, 'rollback'); } catch { /* pass on the original error */ }
+      throw err;
+    }
+    await this.endTransaction(tx, 'commit');
+    return result;
+  }
+
+  // Commit or roll back `tx` once its queued statements settle, then free the
+  // slot. The slot is cleared before the lock is released so a waiting
+  // transaction never sees the finished one, and both happen even if the
+  // driver call throws so a driver error can't freeze the connection.
+  private async endTransaction(tx: sql.Transaction, how: 'commit' | 'rollback'): Promise<void> {
+    const ending = this.txTail.then(() => (how === 'commit' ? tx.commit() : tx.rollback()));
+    this.txTail = ending.then(ignore, ignore);
+    try {
+      await ending;
+    } finally {
+      this.transaction = null;
+      this.txToken = null;
+      this.txLock.releaseWrite();
     }
   }
 
@@ -435,40 +487,11 @@ export class SqlServerConnection implements IDatabaseConnection {
   }
 
   /**
-   * Commit the current transaction
-   */
-  async commitTransaction(): Promise<void> {
-    if (!this.transaction) throw new Error('No transaction in progress');
-    const tx = this.transaction;
-    try {
-      await tx.commit();
-    } finally {
-      // Clear the slot BEFORE releasing so a freshly-woken reader never routes
-      // into a finished transaction; release even if commit threw so a driver
-      // error can't freeze the connection forever.
-      this.transaction = null;
-      this.lock.releaseWrite();
-    }
-  }
-
-  /**
-   * Rollback the current transaction
-   */
-  async rollbackTransaction(): Promise<void> {
-    if (!this.transaction) throw new Error('No transaction in progress');
-    const tx = this.transaction;
-    try {
-      await tx.rollback();
-    } finally {
-      this.transaction = null;
-      this.lock.releaseWrite();
-    }
-  }
-
-  /**
-   * Check if currently in a transaction
+   * True when a transaction is open on this connection AND the caller's call
+   * tree owns it (it runs inside that transaction's withTransaction callback).
+   * A transaction opened by another concurrent caller reports false.
    */
   inTransaction(): boolean {
-    return this.transaction !== null;
+    return this.ownedTransaction() !== null;
   }
 }
