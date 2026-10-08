@@ -16,7 +16,6 @@
 import type { IDatabaseConnection } from '../connections/connection';
 import type { TableInfo } from '../types';
 import { buildIntegerList } from '../utils/sql-helpers';
-import { rollbackQuietly } from '../utils/rollback';
 
 type Driver = 'sqlserver' | 'postgresql';
 
@@ -375,17 +374,12 @@ export async function graduateTable(
 
   // Graduation needs a transaction: the SDE_versions fence lock (below) only holds
   // inside one, and the graduable-prefix temp table (materializeStateSet) must
-  // survive across the follow-up statements on one pooled session. Manage our own
-  // when the caller (compress) has not already opened one.
-  const ownTx = !connection.inTransaction();
-  if (ownTx) await connection.beginTransaction({ isolation: 'serializable' });
-  try {
-    await graduateTableBody(connection, table, graduableSnapshot, cache, result);
-    if (ownTx) await connection.commitTransaction();
-  } catch (e) {
-    if (ownTx) await rollbackQuietly(connection, 'compress/graduateTable');
-    throw e;
-  }
+  // survive across the follow-up statements on one pooled session. Joins the
+  // caller's (compress's) transaction if it already owns one.
+  await connection.withTransaction(
+    () => graduateTableBody(connection, table, graduableSnapshot, cache, result),
+    { isolation: 'serializable' },
+  );
   return result;
 }
 
@@ -753,16 +747,12 @@ export async function pruneStates(
   const mvExists = await hasMvtablesModified(connection);
   const versionedTables = tables.filter(t => t.isVersioned && t.registrationId);
 
-  const wasTx = connection.inTransaction();
-  if (!wasTx) await connection.beginTransaction({ isolation: 'serializable' });
-  try {
+  // Joins the caller's transaction if it already owns one.
+  await connection.withTransaction(async () => {
     const lockedExpanded = await readLockedBranches(connection);
     const unreachable = await findUnreachableStates(connection);
     const toPrune = unreachable.filter(s => !lockedExpanded.has(s));
-    if (toPrune.length === 0) {
-      if (!wasTx) await connection.commitTransaction();
-      return result;
-    }
+    if (toPrune.length === 0) return;
 
     const lineages = sysTable(driver, 'SDE_state_lineages');
     const states = sysTable(driver, 'SDE_states');
@@ -799,11 +789,7 @@ export async function pruneStates(
       const delS = await connection.execute(`DELETE FROM ${states} WHERE ${sidM} IN (${list})`);
       result.statesRemoved += delS.rowsAffected;
     }
-    if (!wasTx) await connection.commitTransaction();
-  } catch (e) {
-    if (!wasTx) await rollbackQuietly(connection, 'compress/pruneStates');
-    throw e;
-  }
+  }, { isolation: 'serializable' });
   return result;
 }
 
@@ -940,6 +926,11 @@ export async function collapseLineages(
   tables: TableInfo[],
   opts?: { assertHeld?: () => void },
 ): Promise<CollapseResult> {
+  // Each pair must commit on its own; inside a caller's transaction the pairs
+  // would join it instead.
+  if (connection.inTransaction()) {
+    throw new Error('collapseLineages() must not be called inside an open transaction.');
+  }
   const result: CollapseResult = { collapses: 0, rowsRewritten: 0 };
   const driver = connection.driver;
   const versionedTables = tables.filter(t => t.isVersioned && t.registrationId);
@@ -964,8 +955,7 @@ export async function collapseLineages(
       // failure (e.g. the states_cuk dance below) rolls back atomically instead
       // of leaving the child's edits committed at the parent with the state tree
       // unchanged (N3). A collapse touches few rows, so a single tx is cheap.
-      try {
-        await connection.beginTransaction();
+      await connection.withTransaction(async () => {
 
         // Per-table delta-row rewrites.
         for (const table of versionedTables) {
@@ -1134,12 +1124,8 @@ export async function collapseLineages(
           `DELETE FROM ${states} WHERE ${sid} = ${paramRef(driver, 0)}`,
           [child],
         );
-        await connection.commitTransaction();
-        result.collapses += 1;
-      } catch (e) {
-        await rollbackQuietly(connection, 'compress/collapseLineages');
-        throw e;
-      }
+      });
+      result.collapses += 1;
     }
   }
 

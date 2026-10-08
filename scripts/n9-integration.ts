@@ -12,7 +12,7 @@
 import { EnterpriseGeodatabase } from '../src/enterprise-geodatabase';
 import { EditSession } from '../src/edit-session';
 import { SqlServerConnection } from '../src/connections/sqlserver';
-import { acquireCompressLock, ApplockTimeoutError } from '../src/reconcile';
+import { ApplockTimeoutError, CompressLockHolder } from '../src/reconcile';
 import type { IDatabaseConnection } from '../src/connections/connection';
 
 const CFG = { driver: 'sqlserver' as const, server: '127.0.0.1', port: 11433, database: 'parcel_fabric', user: 'sa', password: 'YourStrong@Passw0rd', options: { trustServerCertificate: true, requestTimeout: 120000 } };
@@ -29,9 +29,9 @@ function dedicatedHolder() {
   const ok = (c: boolean, m: string) => { console.log((c ? '✅' : '❌') + ' ' + m); c ? pass++ : fail++; };
 
   // A. editor bounces while compress holds the exclusive lock.
-  const holdA = dedicatedHolder();
-  await holdA.connect(); await holdA.beginTransaction();
-  await acquireCompressLock(holdA, 'Exclusive', 5000);
+  const connA = dedicatedHolder();
+  await connA.connect();
+  const holdA = await CompressLockHolder.acquire(connA, 5000);
   try {
     const s = await EditSession.start(egdb, 'sde.DEFAULT');
     ok(false, 'A: EditSession.start should have BOUNCED under the compress lock');
@@ -39,7 +39,7 @@ function dedicatedHolder() {
   } catch (e) {
     ok(e instanceof ApplockTimeoutError, `A: editor bounced under compress lock (${(e as Error).name})`);
   }
-  await holdA.rollbackTransaction(); await holdA.close();
+  await holdA.release(); // ends the transaction and closes connA
   const s2 = await EditSession.start(egdb, 'sde.DEFAULT');
   ok(true, 'A: EditSession.start succeeds once the compress lock is released');
   await s2.close();
@@ -60,12 +60,12 @@ function dedicatedHolder() {
   await conn.execute('DELETE FROM sde.SDE_state_locks;');
 
   // C. compress defers when the exclusive lock is held elsewhere.
-  const holdC = dedicatedHolder();
-  await holdC.connect(); await holdC.beginTransaction();
-  await acquireCompressLock(holdC, 'Exclusive', 5000);
+  const connC = dedicatedHolder();
+  await connC.connect();
+  const holdC = await CompressLockHolder.acquire(connC, 5000);
   const rC = await egdb.compress({ acknowledgeExperimentalUnsafe: true });
   ok(rC.deferred === 'lock-contended', `C: compress deferred on held exclusive lock (deferred=${rC.deferred})`);
-  await holdC.rollbackTransaction(); await holdC.close();
+  await holdC.release();
 
   // D. compress runs when clear (prune-only default).
   const rD = await egdb.compress({ acknowledgeExperimentalUnsafe: true });

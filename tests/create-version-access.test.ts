@@ -35,9 +35,11 @@ class FakeConnection implements IDatabaseConnection {
   async scalar<T>(): Promise<T | null> { return null; }
   async execute(): Promise<{ rowsAffected: number }> { return { rowsAffected: 0 }; }
   async executeInsert(): Promise<number[]> { return []; }
-  async beginTransaction(): Promise<void> { this.tx = true; }
-  async commitTransaction(): Promise<void> { this.tx = false; }
-  async rollbackTransaction(): Promise<void> { this.tx = false; }
+  async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.tx) return fn();
+    this.tx = true;
+    try { return await fn(); } finally { this.tx = false; }
+  }
   inTransaction(): boolean { return this.tx; }
   async connect(): Promise<void> {}
   async close(): Promise<void> {}

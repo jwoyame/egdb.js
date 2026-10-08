@@ -50,7 +50,20 @@ export interface IDatabaseConnection {
   executeInsert(sql: string, params?: unknown[]): Promise<number[]>;
 
   /**
-   * Begin a transaction.
+   * Run `fn` inside a transaction. Commits when `fn` resolves; rolls back and
+   * rethrows when it rejects.
+   *
+   * The connection is shared by concurrent callers, so the transaction belongs
+   * to `fn`'s async call tree only: statements made from inside `fn` (including
+   * anything it awaits or starts) run on the transaction, and statements from
+   * any other caller keep running outside it. There is no separate begin or
+   * commit call, so only the code that opened a transaction can end it.
+   *
+   * If the caller already owns an open transaction on this connection, `fn`
+   * runs inside that one and `options` is ignored. Otherwise this waits until
+   * no other caller's transaction is open on this connection. So `fn` must not
+   * wait for a transaction that a different caller is opening on the same
+   * connection: that one cannot start until `fn` ends.
    *
    * @param options.isolation Optional isolation level. 'serializable' maps to
    *   SET TRANSACTION ISOLATION LEVEL SERIALIZABLE (SQL Server) or
@@ -59,15 +72,13 @@ export interface IDatabaseConnection {
    *   base-table writes form a single critical section against concurrent
    *   `createVersion`.
    */
-  beginTransaction(options?: { isolation?: 'serializable' }): Promise<void>;
+  withTransaction<T>(fn: () => Promise<T>, options?: { isolation?: 'serializable' }): Promise<T>;
 
-  /** Commit the current transaction */
-  commitTransaction(): Promise<void>;
-
-  /** Rollback the current transaction */
-  rollbackTransaction(): Promise<void>;
-
-  /** Check if currently in a transaction */
+  /**
+   * True when the caller is inside a withTransaction callback on this
+   * connection whose transaction is still open. A transaction opened by
+   * another concurrent caller reports false.
+   */
   inTransaction(): boolean;
 
   /** Close the connection */
