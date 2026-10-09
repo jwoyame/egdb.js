@@ -265,9 +265,9 @@ describe.skipIf(!HAVE_PG)('PostgreSQLConnection shared by concurrent callers (re
   it('a post-like transaction commits while tile reads hit the same connection', async () => {
     await reset();
     let done = false;
-    let ownerPid = -1;
+    let ownerTxid = '';
     const post = conn.withTransaction(async () => {
-      ownerPid = (await conn.query<{ p: number }>('SELECT pg_backend_pid() AS p'))[0]!.p;
+      ownerTxid = (await conn.query<{ t: string }>('SELECT txid_current()::text AS t'))[0]!.t;
       for (let i = 0; i < 80; i++) {
         if (i % 2) await conn.execute(`INSERT INTO egdb_shared_edits (who) SELECT 'post' FROM pg_sleep(0.004)`);
         else await conn.query(`SELECT COUNT(*) AS n FROM egdb_shared_edits, pg_sleep(0.004)`);
@@ -275,11 +275,13 @@ describe.skipIf(!HAVE_PG)('PostgreSQLConnection shared by concurrent callers (re
     }).finally(() => { done = true; });
 
     const tiles = tileTraffic(8, () => done, async () => {
-      // Inside the owner's transaction the read would run on the owner's
-      // backend and see its uncommitted rows.
-      const r = await conn.query<{ p: number; n: string }>(
-        `SELECT pg_backend_pid() AS p, (SELECT COUNT(*) FROM egdb_shared_edits) AS n`);
-      return { inTx: r[0]!.p === ownerPid || (!done && Number(r[0]!.n) > 0) };
+      // A read is inside the owner's transaction exactly when it shares the
+      // owner's transaction id. txid_current_if_assigned() is null for a
+      // read that is not inside any transaction that has written yet, so a
+      // match here can only mean it landed on the owner's open transaction.
+      const r = await conn.query<{ t: string | null; n: string }>(
+        `SELECT txid_current_if_assigned()::text AS t, (SELECT COUNT(*) FROM egdb_shared_edits) AS n`);
+      return { inTx: r[0]!.t === ownerTxid };
     });
 
     const [postResult, stats] = await Promise.allSettled([post, tiles]);
