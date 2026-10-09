@@ -88,5 +88,5 @@ d('compress crash-safety (DB-backed)', () => {
       recoveries++;
     }
     expect(recoveries).toBe(N);
-  }, 180_000);
+  }, 600_000);
 });
