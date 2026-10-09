@@ -43,6 +43,9 @@
     "mssql": "12.7.2",
     "pg": "^8.18.0"
   },
+  "resolutions": {
+    "tedious": "20.0.0"
+  },
   "peerDependencies": {
     "@etchgis/gdb.js": ">=0.2.0"
   },
