@@ -66,9 +66,9 @@ function makeMockConnection(childAlreadyHas: number[] = []): {
       return { rowsAffected: 1 };
     },
     async executeInsert() { return []; },
-    async beginTransaction() {},
-    async commitTransaction() {},
-    async rollbackTransaction() {},
+    async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+      return fn();
+    },
     inTransaction() { return false; },
   };
   return { conn, calls };

@@ -38,9 +38,11 @@ class FakeConnection implements IDatabaseConnection {
   async scalar<T>(): Promise<T | null> { return null; }
   async execute(): Promise<{ rowsAffected: number }> { return { rowsAffected: 0 }; }
   async executeInsert(): Promise<number[]> { return []; }
-  async beginTransaction(): Promise<void> { this.tx = true; }
-  async commitTransaction(): Promise<void> { this.tx = false; }
-  async rollbackTransaction(): Promise<void> { this.tx = false; }
+  async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.tx) return fn();
+    this.tx = true;
+    try { return await fn(); } finally { this.tx = false; }
+  }
   inTransaction(): boolean { return this.tx; }
   async connect(): Promise<void> {}
   async close(): Promise<void> {}
@@ -133,21 +135,22 @@ describe('createVersion on SQL Server', () => {
     expect(batch.match(/IF @entryXactAbort = 0 SET XACT_ABORT OFF/g)).toHaveLength(2);
   });
 
-  it('refuses to run inside an open transaction, before sending anything', async () => {
-    // The proc commits every open transaction on the connection, which on a
-    // shared connection can be another user's half-finished edit.
+  it('refuses to run inside the caller\'s own transaction, before sending anything', async () => {
+    // The proc ends with a COMMIT loop, so run on the caller's transaction it
+    // would commit that transaction halfway through.
     const conn = new FakeConnection('sqlserver');
-    await conn.beginTransaction();
 
-    const err = await makeGdb(conn).createVersion('my_edits').catch((e) => e);
+    const err = await conn.withTransaction(async () => {
+      const e = await makeGdb(conn).createVersion('my_edits').catch((x) => x);
+      expect(conn.inTransaction()).toBe(true); // the caller's transaction is untouched
+      return e;
+    });
 
-    expect(err).toBeInstanceOf(LockTimeoutError);
-    // Callers match on the name, so it must stay LockTimeoutError.
-    expect((err as Error).name).toBe('LockTimeoutError');
-    expect((err as Error).message).toMatch(/another edit is in progress/i);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(LockTimeoutError);
+    expect((err as Error).message).toMatch(/inside an open transaction/i);
     expect((err as Error).message).toMatch(/nothing was changed/i);
     expect(conn.statements).toEqual([]);
-    expect(conn.inTransaction()).toBe(true); // the other transaction is untouched
   });
 
   it('reports a blocked create as a LockTimeoutError', async () => {

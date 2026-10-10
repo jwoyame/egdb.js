@@ -38,7 +38,7 @@ new lineage's closure = base + parent's parent-walk ancestry + new state.
 **Done & harness-pinned** (`tests/rebase/`, 18 DB-backed tests + 197 unit):
 correctness defects A–H (closure seeding, three-way compare, conflict detection,
 delete-aware resolution, parent lock, native delete markers) and all "lesser"
-issues (in-SQL state walks, `CHUNK=1000`, `wasInTx`, idempotent no-op, open-session
+issues (in-SQL state walks, `CHUNK=1000`, joining a caller-owned transaction, idempotent no-op, open-session
 guard). Each substantial fix was independently vetted. See
 `docs/REBASE_TEST_HARNESS.md` and the method's own doc-comment.
 

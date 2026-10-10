@@ -5,18 +5,22 @@ import { Pool, PoolClient, PoolConfig } from 'pg';
 import type { IDatabaseConnection, ExecuteResult } from './connection';
 import type { PostgreSQLConfig } from '../types';
 import { RwLock } from '../utils/rw-lock';
+import { ownsToken, runAsOwner } from './tx-ownership';
 
 export class PostgreSQLConnection implements IDatabaseConnection {
   private pool: Pool | null = null;
   private config: PoolConfig;
   private _isConnected = false;
+  // The open transaction's client, if any, and the token of the call tree that
+  // owns it (see tx-ownership.ts). Both are set together and cleared together.
   private transactionClient: PoolClient | null = null;
+  private txToken: object | null = null;
 
-  // See SqlServerConnection / utils/rw-lock.ts: a transaction holds the single
-  // `transactionClient` slot exclusively; plain statements take a shared lock so
-  // they can't run on it concurrently. The owner's in-transaction statements
-  // bypass it. stream() uses its own dedicated client, so it isn't locked.
-  private lock = new RwLock();
+  // Allows one transaction at a time on this connection (write mode only). See
+  // SqlServerConnection.txLock: callers that don't own the transaction use the
+  // pool and never wait on it. pg queues a client's queries itself, so the
+  // owner's concurrent statements need no extra queue here.
+  private txLock = new RwLock();
 
   readonly driver = 'postgresql' as const;
 
@@ -58,14 +62,9 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     // Convert @p0, @p1 parameter syntax to $1, $2 for PostgreSQL
     const pgQuery = sqlQuery.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
 
-    if (this.transactionClient) {
-      const result = await this.transactionClient.query(pgQuery, params);
-      return result.rows as T[];
-    }
-    return this.lock.read(async () => {
-      const result = await this.pool!.query(pgQuery, params);
-      return result.rows as T[];
-    });
+    // Only the transaction's owner runs on it. Everyone else uses the pool.
+    const result = await (this.ownedClient() ?? this.pool).query(pgQuery, params);
+    return result.rows as T[];
   }
 
   async *stream(
@@ -150,14 +149,8 @@ export class PostgreSQLConnection implements IDatabaseConnection {
     // Convert @p0, @p1 parameter syntax to $1, $2 for PostgreSQL
     const pgQuery = sqlStatement.replace(/@p(\d+)/g, (_, num) => `$${parseInt(num, 10) + 1}`);
 
-    if (this.transactionClient) {
-      const result = await this.transactionClient.query(pgQuery, params);
-      return { rowsAffected: result.rowCount ?? 0 };
-    }
-    return this.lock.read(async () => {
-      const result = await this.pool!.query(pgQuery, params);
-      return { rowsAffected: result.rowCount ?? 0 };
-    });
+    const result = await (this.ownedClient() ?? this.pool).query(pgQuery, params);
+    return { rowsAffected: result.rowCount ?? 0 };
   }
 
   /**
@@ -180,92 +173,86 @@ export class PostgreSQLConnection implements IDatabaseConnection {
       return [];
     };
 
-    if (this.transactionClient) {
-      const result = await this.transactionClient.query(pgQuery, params);
-      return extract(result.rows);
-    }
-    return this.lock.read(async () => {
-      const result = await this.pool!.query(pgQuery, params);
-      return extract(result.rows);
-    });
+    const result = await (this.ownedClient() ?? this.pool).query(pgQuery, params);
+    return extract(result.rows);
+  }
+
+  // The open transaction's client if the caller owns it, else null.
+  private ownedClient(): PoolClient | null {
+    return this.transactionClient !== null && ownsToken(this.txToken) ? this.transactionClient : null;
   }
 
   /**
-   * Begin a transaction
+   * Run `fn` inside a transaction on this connection. Same contract as
+   * SqlServerConnection.withTransaction: commit on resolve, rollback on reject
+   * (a failed rollback is logged, and the original error is passed on),
+   * only `fn`'s call tree owns the transaction, and a caller that already owns
+   * one here just runs `fn` inside it.
    */
-  async beginTransaction(options?: { isolation?: 'serializable' }): Promise<void> {
+  async withTransaction<T>(fn: () => Promise<T>, options?: { isolation?: 'serializable' }): Promise<T> {
     if (!this.pool) throw new Error('Not connected');
-    // Guard re-entrant begin before taking the (non-reentrant) write lock.
-    if (this.transactionClient) throw new Error('Transaction already in progress');
+    if (this.ownedClient()) return fn();
 
-    await this.lock.acquireWrite();
+    await this.txLock.acquireWrite();
+    let client: PoolClient;
     try {
-      const client = await this.pool.connect();
+      client = await this.pool.connect();
       try {
-        if (options?.isolation === 'serializable') {
-          await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-        } else {
-          await client.query('BEGIN');
-        }
+        await client.query(options?.isolation === 'serializable' ? 'BEGIN ISOLATION LEVEL SERIALIZABLE' : 'BEGIN');
       } catch (err) {
         client.release();
         throw err;
       }
-      this.transactionClient = client;
     } catch (err) {
-      this.lock.releaseWrite();
+      this.txLock.releaseWrite();
       throw err;
     }
+    const token = {};
+    this.transactionClient = client;
+    this.txToken = token;
+
+    let result: T;
+    try {
+      result = await runAsOwner(token, fn);
+    } catch (err) {
+      try {
+        await this.endTransaction(client, 'ROLLBACK');
+      } catch (rollbackError) {
+        // The client is destroyed either way (see endTransaction), but report
+        // the failure without hiding `err`.
+        console.error('[egdb] rollback failed while handling an error:', rollbackError);
+      }
+      throw err;
+    }
+    await this.endTransaction(client, 'COMMIT');
+    return result;
   }
 
-  /**
-   * Commit the current transaction
-   */
-  async commitTransaction(): Promise<void> {
-    if (!this.transactionClient) throw new Error('No transaction in progress');
-    const client = this.transactionClient;
+  // Run COMMIT or ROLLBACK, then free the slot. The slot is cleared before the
+  // lock is released, and both happen even if the statement throws.
+  private async endTransaction(client: PoolClient, how: 'COMMIT' | 'ROLLBACK'): Promise<void> {
     let failed = false;
     try {
-      await client.query('COMMIT');
+      await client.query(how);
     } catch (err) {
       failed = true;
       throw err;
     } finally {
-      // Clear the slot before releasing the lock; always release so a driver
-      // error can't strand the connection. A COMMIT that failed may leave the
-      // transaction open on that session, so destroy the client rather than hand
-      // a dirty one back to the pool where it would keep holding its locks.
+      // A client whose COMMIT/ROLLBACK failed may still be inside a transaction;
+      // destroy it instead of returning it to the pool.
       client.release(failed);
       this.transactionClient = null;
-      this.lock.releaseWrite();
+      this.txToken = null;
+      this.txLock.releaseWrite();
     }
   }
 
   /**
-   * Rollback the current transaction
-   */
-  async rollbackTransaction(): Promise<void> {
-    if (!this.transactionClient) throw new Error('No transaction in progress');
-    const client = this.transactionClient;
-    let failed = false;
-    try {
-      await client.query('ROLLBACK');
-    } catch (err) {
-      failed = true;
-      throw err;
-    } finally {
-      // Destroy the client if the ROLLBACK failed: the transaction may still be
-      // open on it, and a pooled session holding locks blocks everyone else.
-      client.release(failed);
-      this.transactionClient = null;
-      this.lock.releaseWrite();
-    }
-  }
-
-  /**
-   * Check if currently in a transaction
+   * True when a transaction is open on this connection AND the caller's call
+   * tree owns it. A transaction opened by another concurrent caller reports
+   * false.
    */
   inTransaction(): boolean {
-    return this.transactionClient !== null;
+    return this.ownedClient() !== null;
   }
 }

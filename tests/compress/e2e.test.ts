@@ -50,12 +50,9 @@ d('compress end-to-end via EnterpriseGeodatabase.compress() (DB-backed)', () => 
   });
 
   it('refuses inside an open transaction', async () => {
-    await conn.beginTransaction();
-    try {
+    await conn.withTransaction(async () => {
       await expect(egdb.compress({ acknowledgeExperimentalUnsafe: true })).rejects.toThrow(/transaction/i);
-    } finally {
-      if (conn.inTransaction()) await conn.rollbackTransaction();
-    }
+    });
   });
 
   it('a full compress preserves every version on both tables', async () => {
