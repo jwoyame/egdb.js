@@ -225,6 +225,105 @@ export async function emitBaseShadowMarkers(
 }
 
 /**
+ * Emit the Esri-standard adds-shadow delete markers a post needs.
+ *
+ * Esri's `*_evw` views, ArcGIS, and the publish ETL resolve the adds half of a
+ * versioned table by returning EVERY a-row whose state is in the version's
+ * closure, shadowed one-for-one: an a-row at state S is hidden only by a marker
+ * whose `SDE_STATE_ID` is S itself (with `DELETED_AT` in the closure). They do
+ * no newest-state resolution. egdb's own reader instead keeps the a-row at
+ * MAX(state) per OBJECTID, so it needs no such marker and never wrote one.
+ * Without it, an OBJECTID that already had an a-row in the parent's closure and
+ * gets a fresh one from this post is returned TWICE by those readers -- once
+ * with the current values and once with the superseded ones, which is how a
+ * retired parcel keeps appearing on the published layer.
+ *
+ * This runs inside the post transaction, after the parent pointer advanced, and
+ * inserts `(OBJECTID, SDE_STATE_ID = superseded a-state, DELETED_AT = the state
+ * that superseded it)` so that at most the freshest a-row survives an Esri read.
+ * It is additive, changes no existing row, and is idempotent. Scoped to the
+ * OBJECTIDs this post touched (something above `sinceState`), so it never
+ * back-fills markers for earlier posts. SQL Server only (Putnam); the PG ArcSDE
+ * evw shape is not validated here.
+ *
+ * Counterpart of `emitBaseShadowMarkers`, which covers the base half, and must
+ * run after it: the base-half markers carry `SDE_STATE_ID = 0` and so are
+ * outside the `> sinceState` window the delete pass below looks at.
+ *
+ * This is additive only, so it cannot make the legacy repoint post
+ * (`trimPost: false`) Esri-safe: that path moves the parent onto the version's
+ * own states, which carries the version's edit-state markers into the parent's
+ * closure, and an Esri reader takes one of those as hiding the very row it was
+ * written with. Only `trimPost` keeps those markers out of the parent's closure.
+ *
+ * @returns number of markers inserted
+ */
+export async function emitAddsShadowMarkers(
+  connection: IDatabaseConnection,
+  tables: TableInfo[],
+  tipState: number,
+  sinceState: number
+): Promise<number> {
+  const driver = connection.driver;
+  if (driver !== 'sqlserver') return 0;
+  const tip = Number(tipState);
+  const since = Number(sinceState);
+  // Both land inside SQL text, so reject anything that is not a state id.
+  validateNonNegativeInteger(tip, 'emitAddsShadowMarkers.tipState');
+  validateNonNegativeInteger(since, 'emitAddsShadowMarkers.sinceState');
+  // The parent's closure at its new tip, as a subquery so a long ancestry is
+  // never materialised as an IN-list.
+  const closure =
+    `SELECT l.lineage_id FROM sde.SDE_states s ` +
+    `INNER JOIN sde.SDE_state_lineages l ON l.lineage_name = s.lineage_name ` +
+    `WHERE s.state_id = ${tip} AND l.lineage_id <= s.state_id`;
+  let total = 0;
+  for (const t of tables) {
+    if (!t.isVersioned || !t.registrationId) continue;
+    const schema = quoteId(driver, t.schema);
+    const aTable = `${schema}.${quoteId(driver, `a${t.registrationId}`)}`;
+    const dTable = `${schema}.${quoteId(driver, `D${t.registrationId}`)}`;
+    // Already carries a marker at its own state that this closure honours.
+    const unshadowed =
+      `NOT EXISTS (SELECT 1 FROM ${dTable} d WHERE d.SDE_DELETES_ROW_ID = a.OBJECTID ` +
+      `AND d.SDE_STATE_ID = a.SDE_STATE_ID AND d.DELETED_AT IN (${closure}))`;
+
+    // (1) Superseded by a fresher a-row (insert-over, update, split, retire):
+    // hide every older a-row in the closure in favour of the freshest one.
+    const sql =
+      `INSERT INTO ${dTable} (SDE_DELETES_ROW_ID, SDE_STATE_ID, DELETED_AT) ` +
+      `SELECT a.OBJECTID, a.SDE_STATE_ID, m.ms FROM ${aTable} a ` +
+      `INNER JOIN (` +
+      `  SELECT a2.OBJECTID, MAX(a2.SDE_STATE_ID) AS ms FROM ${aTable} a2 ` +
+      `  WHERE a2.SDE_STATE_ID IN (${closure}) GROUP BY a2.OBJECTID ` +
+      `  HAVING MAX(a2.SDE_STATE_ID) > ${since}` +
+      `) m ON m.OBJECTID = a.OBJECTID ` +
+      `WHERE a.SDE_STATE_ID IN (${closure}) AND a.SDE_STATE_ID < m.ms ` +
+      `AND ${unshadowed}`;
+    const r = await connection.execute(sql);
+    total += r.rowsAffected;
+
+    // (2) Removed outright by this post: a delete marker above `sinceState` and
+    // no fresher a-row, so every a-row below that delete must be hidden too.
+    // Pass (1) has already marked the ones an update superseded, and the
+    // unshadowed test skips them, so the two passes never write the same row.
+    const delSql =
+      `INSERT INTO ${dTable} (SDE_DELETES_ROW_ID, SDE_STATE_ID, DELETED_AT) ` +
+      `SELECT a.OBJECTID, a.SDE_STATE_ID, m.ds FROM ${aTable} a ` +
+      `INNER JOIN (` +
+      `  SELECT d2.SDE_DELETES_ROW_ID AS OBJECTID, MAX(d2.SDE_STATE_ID) AS ds FROM ${dTable} d2 ` +
+      `  WHERE d2.SDE_STATE_ID IN (${closure}) AND d2.SDE_STATE_ID > ${since} ` +
+      `  GROUP BY d2.SDE_DELETES_ROW_ID` +
+      `) m ON m.OBJECTID = a.OBJECTID ` +
+      `WHERE a.SDE_STATE_ID IN (${closure}) AND a.SDE_STATE_ID < m.ds ` +
+      `AND ${unshadowed}`;
+    const rd = await connection.execute(delSql);
+    total += rd.rowsAffected;
+  }
+  return total;
+}
+
+/**
  * Update a version's state_id in the versions table.
  *
  * @param connection Database connection

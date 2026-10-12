@@ -66,6 +66,7 @@ export {
   postChangesToParent,
   countChangesInStates,
   emitBaseShadowMarkers,
+  emitAddsShadowMarkers,
   updateVersionState,
   deleteStates,
   getChildUniqueStates,

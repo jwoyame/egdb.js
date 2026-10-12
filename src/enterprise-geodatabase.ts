@@ -46,6 +46,7 @@ import {
   isReconciled,
   countChangesInStates,
   emitBaseShadowMarkers,
+  emitAddsShadowMarkers,
   updateVersionState,
   classifyChildChanges,
   copyTipRows,
@@ -1516,14 +1517,13 @@ export class EnterpriseGeodatabase {
           const t = versionedTables.find(vt => vt.name === c.table);
           if (!t) continue;
           if (c.changeType === 'insert' || c.changeType === 'update') {
-            // Both just copy the version's TIP a-row to newTip. An UPDATE needs
-            // NO delete marker at newTip: the superseded BASE row is hidden by
-            // emitBaseShadowMarkers' state-0 marker (below), and a prior a-row is
-            // superseded by MAX-state resolution. Emitting a (newTip) marker here
-            // would collide with the copied a-row -- egdb's own reader tolerates
-            // it (it only suppresses a delete at a state > the add), but Esri's
-            // *_evw / the publish ETL suppress on SDE_STATE_ID = the add's state,
-            // so the retired row would vanish from the published layer.
+            // Both just copy the version's TIP a-row to newTip, with no delete
+            // marker at newTip: a marker there names the state of the row we
+            // just copied, and Esri's *_evw / the publish ETL hide an a-row on
+            // exactly that match, so the fresh row itself would vanish from the
+            // published layer. What the superseded rows need instead is a marker
+            // at THEIR own state -- emitBaseShadowMarkers for a base row,
+            // emitAddsShadowMarkers for an older a-row (both below).
             await copyOrThrow(t, c.objectId, c.stateId);
           } else {
             // Pure delete: the edit-state marker is what egdb's reader honors
@@ -1578,6 +1578,17 @@ export class EnterpriseGeodatabase {
       // pre-post parent tip); in trimPost mode the copied rows live at the new
       // tip, which is in DEFAULT's closure.
       await emitBaseShadowMarkers(
+        this.connection,
+        versionedTables,
+        postTargetState,
+        parent.stateId
+      );
+
+      // The same for the adds half: Esri readers hide an a-row only via a marker
+      // at that row's OWN state, so without these an OBJECTID that already had
+      // an a-row in the parent's closure comes back twice -- current values and
+      // stale ones side by side. Must follow the base pass (see the function).
+      await emitAddsShadowMarkers(
         this.connection,
         versionedTables,
         postTargetState,

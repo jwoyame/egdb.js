@@ -15,7 +15,8 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { EnterpriseGeodatabase } from '../../src/enterprise-geodatabase';
-import { connectScratch, resetFabric, HAVE_DB, REG_ID, e2eConfig } from '../compress/db';
+import { emitAddsShadowMarkers } from '../../src/reconcile/post';
+import { connectScratch, resetFabric, HAVE_DB, REG_ID, PARCELS, e2eConfig } from '../compress/db';
 import { installE2ESchema } from '../compress/db-e2e';
 import { materialize } from '../compress/fabric-builder';
 import { assertNoReferencesToDeadStates, dbVisible } from '../compress/invariants';
@@ -91,6 +92,30 @@ function buildTwoSaves(): Fabric {
   return f;
 }
 
+/**
+ * V updates OBJECTID 1, which DEFAULT already holds as an a-row at state 11
+ * rather than in the base table. After the post, DEFAULT's closure holds two
+ * a-rows for it -- state 11 and the post's new tip -- so only a marker at state
+ * 11 keeps an Esri reader from returning both.
+ */
+function buildEditOverPostedRow(): Fabric {
+  const f = baseFabric();
+  const t = f.table('parcels');
+  addVersion(f, [12]);
+  t.adds.set('1:12', { oid: 1, state: 12, values: { VAL: 'v-updated-again' } });
+  t.dels.push({ oid: 1, state: 12, deletedAt: 12 });
+  return f;
+}
+
+/** V hard-deletes OBJECTID 1, whose live row in DEFAULT is the a-row at state 11. */
+function buildDeleteOfPostedRow(): Fabric {
+  const f = baseFabric();
+  const t = f.table('parcels');
+  addVersion(f, [12]);
+  t.dels.push({ oid: 1, state: 12, deletedAt: 12 });
+  return f;
+}
+
 /** V hard-deletes base row 300 (a delete marker with no add row). */
 function buildHardDelete(): Fabric {
   const f = baseFabric();
@@ -139,35 +164,41 @@ async function walkStatesMissingFromClosure(conn: IDatabaseConnection, tip: numb
 }
 
 /**
- * Resolve a state the way Esri's *_evw views and the publish ETL do: the newest
- * add row inside the CLOSURE, and base rows that no SDE_STATE_ID = 0 marker in
- * the closure retires.
+ * Resolve a state the way Esri's *_evw views and the publish ETL do. This is the
+ * template Esri itself generates, taken from a versioned view on the Putnam
+ * fabric: two halves, each shadowed one row at a time.
+ *
+ *   base half - a base row is hidden only by a marker with SDE_STATE_ID = 0
+ *               whose DELETED_AT is in the closure.
+ *   adds half - EVERY a-row whose state is in the closure is returned, and one
+ *               is hidden only by a marker at that same state (SDE_STATE_ID =
+ *               the a-row's state) whose DELETED_AT is in the closure.
+ *
+ * There is deliberately no newest-state resolution here. egdb's own reader keeps
+ * MAX(state) per OBJECTID; an Esri reader does not, so modelling the read with a
+ * MAX would hide exactly the duplicates this suite exists to catch.
  *
  * An OBJECTID that comes back twice is a real defect, not a detail of the read:
- * a base row that keeps its own row alongside the add row that superseded it is
- * how a stale parcel leaks to the published layer. The Map build below refuses
- * to collapse that into one value, so it fails loudly instead.
+ * a superseded row returned alongside the row that replaced it is how a stale
+ * parcel leaks to the published layer. The Map build below refuses to collapse
+ * that into one value, so it fails loudly instead.
  */
 async function esriVisible(conn: IDatabaseConnection, tip: number): Promise<Map<number, string | null>> {
   const clo = closureSql(tip);
   const rows = await conn.query<{ oid: number; val: string | null }>(`
     SELECT b.OBJECTID AS oid, b.VAL AS val
       FROM dbo.base${REG_ID} b
-     WHERE NOT EXISTS (
-       SELECT 1 FROM dbo.D${REG_ID} d
-        WHERE d.SDE_DELETES_ROW_ID = b.OBJECTID AND d.SDE_STATE_ID = 0
-          AND d.DELETED_AT IN (${clo}))
+      LEFT JOIN (SELECT SDE_DELETES_ROW_ID, SDE_STATE_ID FROM dbo.D${REG_ID}
+                  WHERE SDE_STATE_ID = 0 AND DELETED_AT IN (${clo})) d
+        ON b.OBJECTID = d.SDE_DELETES_ROW_ID
+     WHERE d.SDE_STATE_ID IS NULL
     UNION ALL
     SELECT a.OBJECTID AS oid, a.VAL AS val
       FROM dbo.a${REG_ID} a
-     WHERE a.SDE_STATE_ID IN (${clo})
-       AND a.SDE_STATE_ID = (
-         SELECT MAX(a2.SDE_STATE_ID) FROM dbo.a${REG_ID} a2
-          WHERE a2.OBJECTID = a.OBJECTID AND a2.SDE_STATE_ID IN (${clo}))
-       AND NOT EXISTS (
-         SELECT 1 FROM dbo.D${REG_ID} dd
-          WHERE dd.SDE_DELETES_ROW_ID = a.OBJECTID AND dd.SDE_STATE_ID IN (${clo})
-            AND dd.SDE_STATE_ID > a.SDE_STATE_ID);`);
+      LEFT JOIN (SELECT SDE_DELETES_ROW_ID, SDE_STATE_ID FROM dbo.D${REG_ID}
+                  WHERE DELETED_AT IN (${clo})) d
+        ON a.OBJECTID = d.SDE_DELETES_ROW_ID AND a.SDE_STATE_ID = d.SDE_STATE_ID
+     WHERE a.SDE_STATE_ID IN (${clo}) AND d.SDE_STATE_ID IS NULL;`);
   const out = new Map<number, string | null>();
   for (const r of rows) {
     const oid = Number(r.oid);
@@ -426,11 +457,63 @@ d('postVersion({ trimPost: true }) closure invariants', () => {
     await materialize(conn, sparse);
     expect(await walkStatesMissingFromClosure(conn, 12)).toEqual([12]);
 
-    // Nothing has emitted a base-shadow marker for the version's update of base
-    // row 300 yet, so an Esri closure read resolves the stale base row next to
-    // the new add row. That double resolve is what leaks a retired parcel.
-    await load(buildSingleEdit);
-    await expect(esriVisible(conn, 12)).rejects.toThrow(/OBJECTID 300 twice/);
+    // An a-row superseding another a-row with no marker at the older row's own
+    // state: an Esri closure read then resolves the OBJECTID twice, once with
+    // each value. That double resolve is what leaks a retired parcel.
+    await resetFabric(conn);
+    const leaky = buildSingleEdit();
+    leaky.table('parcels').adds.set('1:12', { oid: 1, state: 12, values: { VAL: 'unshadowed' } });
+    await materialize(conn, leaky);
+    await expect(esriVisible(conn, 12)).rejects.toThrow(/OBJECTID 1 twice/);
+  });
+
+  it('an edit over a row DEFAULT holds as an a-row resolves once for an Esri reader', async () => {
+    await load(buildEditOverPostedRow);
+
+    const res = await gdb.postVersion(VERSION, { trimPost: true });
+    const tip = res.newParentStateId;
+
+    // esriVisible throws if an OBJECTID resolves twice, which is the leak.
+    const esri = await esriVisible(conn, tip);
+    expect(esri.get(1)).toBe('v-updated-again');
+    expect(await dbVisible(conn, tip)).toEqual(esri);
+
+    // The superseded a-row is hidden by a marker at ITS OWN state, not at the
+    // state that replaced it.
+    const shadow = await countAt(conn, `SELECT COUNT(*) AS n FROM dbo.D${REG_ID}
+       WHERE SDE_DELETES_ROW_ID = 1 AND SDE_STATE_ID = 11 AND DELETED_AT IN (${closureSql(tip)});`);
+    expect(shadow).toBe(1);
+    // ...and the a-row the post just wrote is NOT hidden.
+    const selfShadow = await countAt(conn, `SELECT COUNT(*) AS n FROM dbo.D${REG_ID}
+       WHERE SDE_DELETES_ROW_ID = 1 AND SDE_STATE_ID = ${tip} AND DELETED_AT IN (${closureSql(tip)});`);
+    expect(selfShadow).toBe(0);
+  });
+
+  it('deleting a row DEFAULT holds as an a-row hides it from an Esri reader', async () => {
+    await load(buildDeleteOfPostedRow);
+
+    const res = await gdb.postVersion(VERSION, { trimPost: true });
+    const tip = res.newParentStateId;
+
+    const esri = await esriVisible(conn, tip);
+    expect(esri.has(1)).toBe(false);
+    expect(await dbVisible(conn, tip)).toEqual(esri);
+  });
+
+  it('re-emitting the shadow markers for the same post writes nothing new', async () => {
+    await load(buildEditOverPostedRow);
+    const res = await gdb.postVersion(VERSION, { trimPost: true });
+    const tip = res.newParentStateId;
+    const before = await countAt(conn,
+      `SELECT COUNT(*) AS n FROM dbo.D${REG_ID} WHERE SDE_DELETES_ROW_ID = 1;`);
+
+    // A post that is retried, or one whose table list overlaps another's, must
+    // not stack duplicate markers on the same superseded row.
+    const again = await emitAddsShadowMarkers(conn, [PARCELS], tip, 11);
+    expect(again).toBe(0);
+    expect(await countAt(conn,
+      `SELECT COUNT(*) AS n FROM dbo.D${REG_ID} WHERE SDE_DELETES_ROW_ID = 1;`)).toBe(before);
+    expect((await esriVisible(conn, tip)).get(1)).toBe('v-updated-again');
   });
 
   it('trimPost with deleteVersionAfterPost lands the edit and leaves the closure clean', async () => {
